@@ -40,6 +40,30 @@ const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
+/// Size classes of the pieces of texture blocks: a block holds pieces of
+/// one class at a time, of up to 64 KiB, up to 1 MiB, or more
+/// (`VICTORY_POOL_CLASSES=0`: of any size together, as before).
+///
+/// Most host copies of the levels a view shows (`resource::held_only`)
+/// take one 64 KiB piece: 151,592 of them in run nbc-measure (2026-11-26),
+/// 10,700 MB, 72 KB each, and 39,605 were replaced by copies with more
+/// levels. Placed lowest first among larger textures, each one replaced
+/// left a hole between them that only another small texture fits, and a
+/// block emptied next to never: 1,769 MB of the blocks were free at the end,
+/// with the card at 96.6 % of its budget. In a block of small pieces every
+/// free piece fits the next small texture, and a block whose copies were
+/// all replaced or let go empties and goes back to the system.
+const CLASS_TOPS: [u64; 2] = [64 << 10, 1 << 20];
+
+fn class_of(len: u64) -> u8 {
+    CLASS_TOPS.iter().position(|&top| len <= top).unwrap_or(CLASS_TOPS.len()) as u8
+}
+
+pub(crate) fn classes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_CLASSES").is_none_or(|v| v != "0"))
+}
+
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
@@ -195,6 +219,16 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// The size class of its pieces ([`CLASS_TOPS`]); `None` while it is
+    /// empty, or without classes.
+    class: Option<u8>,
+}
+
+impl<B> Block<B> {
+    /// Whether a piece of `class` may be cut from it (`None`: any).
+    fn takes(&self, class: Option<u8>) -> bool {
+        class.is_none_or(|c| self.class.is_none_or(|own| own == c))
+    }
 }
 
 struct Pool<B> {
@@ -218,17 +252,19 @@ impl<B: Clone> Pool<B> {
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_ripe(len, align, now, Ripe::ALL, None, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
-    /// ahead too, when few are empty.
+    /// ahead too, when few are empty. With a size `class` ([`classes`]):
+    /// from a block of that class, else an empty one.
     fn take_ripe(
         &mut self,
         len: u64,
         align: u64,
         now: u64,
         ripe: Ripe,
+        class: Option<u8>,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -238,19 +274,30 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        // With classes, the blocks of its class first: an empty block is
+        // taken only when none of them has room, so empty ones stay empty.
+        let passes: &[bool] = if class.is_some() { &[true, false] } else { &[false] };
+        'look: for &own in passes {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && block.takes(class)
+                    && (!own || block.class.is_some())
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break 'look;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            let mut unripe: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| b.as_ref().filter(|b| b.takes(class)).map(|b| (b.made, i)))
+                .collect();
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
@@ -281,6 +328,9 @@ impl<B: Clone> Pool<B> {
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
+        if class.is_some() {
+            block.class = class;
+        }
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
@@ -306,7 +356,14 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            used_to: 0,
+            made,
+            since: crate::host::now_ms(),
+            class: None,
+        });
         i
     }
 
@@ -330,7 +387,11 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                if block.free.whole(BLOCK) {
+                    // Empty: any class may take it.
+                    block.class = None;
+                    any = true;
+                }
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -672,8 +733,9 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
+    let class = classes().then(|| class_of(info.SizeInBytes));
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), class, || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -801,6 +863,82 @@ mod tests {
         assert_eq!(spares(None, true), SPARE);
     }
 
+    /// The held levels' way: a copy of 64 KiB, a larger texture, and so on;
+    /// then each small copy is replaced by one with more levels. With size
+    /// classes the small copies' blocks empty and go back; mixed in with
+    /// the larger textures each left a hole no block could give back.
+    #[test]
+    fn small_copies_lie_in_blocks_of_their_own_that_empty_when_they_are_replaced() {
+        let run = |classes: bool| {
+            let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+            let made = std::cell::Cell::new(0);
+            let make = || {
+                made.set(made.get() + 1);
+                Some(made.get())
+            };
+            let class = |len: u64| classes.then(|| class_of(len));
+            let mut small = Vec::new();
+            for _ in 0..2000 {
+                small.push(pool.take_ripe(64 << 10, 65536, 0, Ripe::ALL, class(64 << 10), make).unwrap().0);
+                pool.take_ripe(2 << 20, 65536, 0, Ripe::ALL, class(2 << 20), make).unwrap();
+            }
+            let before = pool.blocks();
+            for piece in small {
+                pool.give(piece, 10);
+                pool.take_ripe(256 << 10, 65536, 10, Ripe::ALL, class(256 << 10), make).unwrap();
+            }
+            let grown = pool.blocks();
+            pool.reclaim(10 + REST, 0, false);
+            (before, grown, pool.blocks(), free(&pool))
+        };
+        // 2,000 copies of 64 KiB are two blocks; the copies of 256 KiB 500
+        // MiB, eight more.
+        let (before, grown, after, left) = run(true);
+        assert_eq!(grown, before + 8);
+        assert_eq!(after, grown - 2, "the two blocks of small copies went back");
+        assert!(left < 2 * BLOCK, "no holes left behind: {left}");
+        let (_, grown, after, left) = run(false);
+        assert_eq!(after, grown, "without classes no block empties");
+        assert!(left >= 2000 * (64 << 10), "every replaced copy left a hole: {left}");
+    }
+
+    /// Bytes free in a pool's blocks, and its empty blocks.
+    fn free<B: Clone>(pool: &Pool<B>) -> u64 {
+        pool.blocks.iter().flatten().map(|b| b.free.0.values().sum::<u64>()).sum()
+    }
+
+    fn empties<B: Clone>(pool: &Pool<B>) -> usize {
+        pool.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count()
+    }
+
+    /// A small texture goes where small ones are, not into an empty block
+    /// while one of its class has room; and no class shares a block.
+    #[test]
+    fn classes_keep_to_their_blocks_and_leave_empty_ones_empty() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let small = |pool: &mut Pool<u32>, now| pool.take_ripe(64 << 10, 65536, now, Ripe::ALL, Some(0), make).unwrap().0;
+        let large = |pool: &mut Pool<u32>, now| pool.take_ripe(4 << 20, 65536, now, Ripe::ALL, Some(2), make).unwrap().0;
+        let x = large(&mut pool, 0);
+        let a = small(&mut pool, 0);
+        assert_eq!((x.block, a.block), (0, 1), "a block of its own");
+        // The large one's block is empty now, below the small one's.
+        pool.give(x, 0);
+        pool.reclaim(REST, SPARE_KEPT, false);
+        assert_eq!(empties(&pool), 1);
+        let d = small(&mut pool, REST);
+        assert_eq!(d.block, a.block, "the small ones stay in theirs");
+        assert_eq!(empties(&pool), 1);
+        // And the empty one goes to whichever class needs a block.
+        let e = large(&mut pool, REST);
+        assert_eq!(e.block, x.block);
+        assert_eq!(pool.blocks(), 2);
+    }
+
     #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
         let mut pool: Pool<u32> = Pool::new(SPARE);
@@ -846,7 +984,7 @@ mod tests {
             Some(made.get())
         };
         let at = |started, finished| Ripe { started, finished, ahead: 2 };
-        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
+        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, None, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
         assert_eq!(made.get(), 2);
@@ -862,7 +1000,7 @@ mod tests {
         assert_eq!(take(&mut pool, at(7, 4)), 4);
         assert_eq!(take(&mut pool, at(7, 5)), 4);
         // A whole block's worth too.
-        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), make).unwrap().1, 5);
+        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), None, make).unwrap().1, 5);
         // Off: the first with room, whatever its age, none ahead.
         let n = made.get();
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
