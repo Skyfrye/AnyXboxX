@@ -28,7 +28,7 @@
 //! A line every five seconds counts both ([`line`]).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -486,6 +486,47 @@ pub(crate) fn stood(at: Stood) {
     STOOD[at as usize].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Title slots shown at once to a list that records the upload of the
+/// texture cut from a block they show, before that upload was sent: their
+/// heap, slot and record, and the host copy. A decoration bake that may read
+/// them by index uploads them itself first ([`take_early`]).
+static EARLY: Mutex<Vec<(usize, u32, u64, Weak<HostTexture>)>> = Mutex::new(Vec::new());
+
+/// Since the start: slots shown so ([`EARLY`]), and of them uploaded first
+/// by a bake.
+pub(crate) static EARLY_SHOWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Slot `index` of heap `heap`, made from the record `key`, shows host copy
+/// `copy` to a list that uploads it, before that upload was sent.
+pub(crate) fn shown_early(heap: usize, index: u32, key: u64, copy: &Arc<HostTexture>) {
+    EARLY_SHOWN[0].fetch_add(1, Ordering::Relaxed);
+    let mut early = lock(&EARLY);
+    if early.len() >= 4096 {
+        early.retain(|(_, _, _, copy)| copy.upgrade().is_some_and(|copy| !copy.fill.ready()));
+    }
+    early.push((heap, index, key, Arc::downgrade(copy)));
+}
+
+/// The slots of heap `heap` (and their records) shown early ([`shown_early`])
+/// whose upload has still not been sent; those of the heap are forgotten.
+pub(crate) fn take_early(heap: usize) -> Vec<(u32, u64)> {
+    let mut early = lock(&EARLY);
+    if early.is_empty() {
+        return Vec::new();
+    }
+    let mut taken = Vec::new();
+    early.retain(|(of, index, key, copy)| {
+        if *of != heap {
+            return true;
+        }
+        if copy.upgrade().is_some_and(|copy| !copy.fill.ready()) {
+            taken.push((*index, *key));
+        }
+        false
+    });
+    taken
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -496,6 +537,7 @@ pub(crate) fn line() -> String {
     static LAST: Mutex<(u64, [u64; 2])> = Mutex::new((0, [0; 2]));
     let z = ZEROS.each_ref().map(|n| n.load(Ordering::Relaxed));
     let s = STOOD.each_ref().map(|n| n.load(Ordering::Relaxed));
+    let e = EARLY_SHOWN.each_ref().map(|n| n.load(Ordering::Relaxed));
     let stood: u64 = s.iter().sum();
     let frame = crate::frame::current();
     let mut last = lock(&LAST);
@@ -508,7 +550,8 @@ pub(crate) fn line() -> String {
          {:.1} zeroed where another texture lay, {:.1} slots shown the stand-in as never filled; since the start: {} zeroed \
          ({} MB, {} not whole), {} left to their upload on the copy queue, {} gone before their zeros; {stood} stand-ins \
          ({} title slots made with no list, {} for a draw whose list did not upload them, {} fresh tables' slots, {} not \
-         made again or published), {} flips held at the last pass",
+         made again or published), {} flips held at the last pass; {} slots shown at once to the list that uploads them \
+         ({} of them uploaded first by a decoration bake)",
         u8::from(zero_on()),
         u8::from(filled_only()),
         lately[0],
@@ -523,6 +566,8 @@ pub(crate) fn line() -> String {
         s[2],
         s[3],
         FLIPS_HELD.load(Ordering::Relaxed),
+        e[0],
+        e[1],
     )
 }
 

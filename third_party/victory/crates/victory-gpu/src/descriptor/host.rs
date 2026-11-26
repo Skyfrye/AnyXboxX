@@ -3492,6 +3492,45 @@ impl HostHeap {
         }
     }
 
+    /// Title slot `index`, made from the record `key` and showing a texture
+    /// cut from a block whose upload was not sent, shows the stand-in until
+    /// it is made again (`crate::pool::fill`). Not if it was made from
+    /// another record since.
+    pub(crate) fn hold_unfilled(&self, index: u32, key: u64) {
+        if index >= self.count || self.sampler {
+            return;
+        }
+        let _made = self.made.lock(index);
+        if self.made.get(index) != Some(key) {
+            return;
+        }
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return;
+        };
+        self.quick_is(index, 0);
+        self.made.set(index, 0);
+        let shown = unfilled_stand_in(&view, self.at(index));
+        stood_in(shown.as_ref());
+        crate::pool::fill::stood(crate::pool::fill::Stood::Drawn);
+        self.put(index);
+        self.clear_twin(index);
+        self.keep(index, shown);
+        // The texture pass's again (a draw's table had taken it out).
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).written(index, crate::frame::current(), 0, false);
+    }
+
+    /// The title slots of this heap shown to a list that uploads the texture
+    /// cut from a block they show before that upload was sent, that still
+    /// show it and whose upload is still not sent: slot, record and view
+    /// (`crate::pool::fill::shown_early`). Each is given once.
+    pub(crate) fn shown_early(&self) -> Vec<(u32, u64, View)> {
+        crate::pool::fill::take_early(std::ptr::from_ref(self) as usize)
+            .into_iter()
+            .filter(|&(index, key)| self.made.get(index) == Some(key))
+            .filter_map(|(index, key)| Some((index, key, view_at(key as u32, (key >> 32) as u32)?)))
+            .collect()
+    }
+
     /// [`make_viewed`] of `view` for slot `index`, where any list may read it, if
     /// what it shows may be shown there; `None` (nothing put in the slot) if
     /// it is a texture cut from a block that no upload filled yet
@@ -4154,23 +4193,27 @@ impl HostHeap {
             // list that uploads it ahead of its draws, else the stand-in in
             // its place until an upload was sent. (Made in a slot the card
             // does not see, `staged`: not put there.)
-            if let Some(copy) = unfilled.filter(|_| !self.sampler)
-                && !list.is_some_and(|list| crate::pool::fill::ready_for(&copy, list))
-            {
-                self.made.set(index, 0);
-                let shown = unfilled_stand_in(&view, self.at(index));
-                stood_in(shown.as_ref());
-                crate::pool::fill::stood(if list.is_some() {
-                    crate::pool::fill::Stood::Drawn
+            if let Some(copy) = unfilled.filter(|_| !self.sampler) {
+                if let Some(list) = list
+                    && crate::pool::fill::ready_for(&copy, list)
+                {
+                    crate::pool::fill::shown_early(std::ptr::from_ref(self) as usize, index, key, &copy);
                 } else {
-                    crate::pool::fill::Stood::Written
-                });
-                self.put(index);
-                self.clear_twin(index);
-                self.keep(index, shown);
-                drop(held);
-                self.unmake_stale(index, stale);
-                return Some(view);
+                    self.made.set(index, 0);
+                    let shown = unfilled_stand_in(&view, self.at(index));
+                    stood_in(shown.as_ref());
+                    crate::pool::fill::stood(if list.is_some() {
+                        crate::pool::fill::Stood::Drawn
+                    } else {
+                        crate::pool::fill::Stood::Written
+                    });
+                    self.put(index);
+                    self.clear_twin(index);
+                    self.keep(index, shown);
+                    drop(held);
+                    self.unmake_stale(index, stale);
+                    return Some(view);
+                }
             }
             let twin = made.is_some() && twinned(&view);
             let kept = if stand_in {
@@ -5959,7 +6002,7 @@ mod anisotropic_sampler_tests;
 mod typed_uav_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A zero-sized (null) CBV makes no host view of its own: the slot is
@@ -6134,7 +6177,7 @@ mod tests {
 
     /// The record words of `view`, written at the start of `slot` (a
     /// title descriptor of 16 bytes): what the title's heap would hold.
-    fn write_record(slot: &mut [u32; 4], view: View) -> u64 {
+    pub(crate) fn write_record(slot: &mut [u32; 4], view: View) -> u64 {
         let [i, generation] = super::super::words_for(view);
         slot[..3].copy_from_slice(&[VIEW_TAG, i, generation]);
         slot.as_mut_ptr() as u64
@@ -6232,7 +6275,7 @@ mod tests {
     /// copy, if that was cut from a block, no upload filled it and no list
     /// sent before it may read it (`crate::pool::fill`); `None` with the
     /// pool off.
-    fn unfilled_texture() -> Option<(crate::object::This, std::sync::Arc<crate::resource::HostTexture>)> {
+    pub(crate) fn unfilled_texture() -> Option<(crate::object::This, std::sync::Arc<crate::resource::HostTexture>)> {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         host()?;
         let desc = [3u32, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
@@ -6257,7 +6300,8 @@ mod tests {
     /// blocks in a block-compressed format), but the stand-in, until an
     /// upload into it was sent: not when written, nor for a draw whose list
     /// does not upload it. A draw whose list uploads it ahead of its draws
-    /// is shown it at once. A fresh table's slot is made as its list says.
+    /// is shown it at once, and the slot is told to a bake that reads by
+    /// index. A fresh table's slot is made as its list says.
     #[test]
     fn a_slot_shows_a_pooled_texture_only_once_it_is_filled() {
         use windows::core::Interface;
@@ -6286,6 +6330,7 @@ mod tests {
         assert!(heap.mirror_listed(2, handle, &list).is_some());
         assert_eq!(heap.made.get(2), Some(key));
         assert_eq!(shown(2), Some(copy.texture.as_raw()));
+        assert!(heap.shown_early().iter().any(|&(index, k, _)| index == 2 && k == key), "told to a bake");
         assert!(!copy.fill.ready(), "not where any list reads it before the list is sent");
         // Sent: shown wherever written.
         copy.fill.sent();

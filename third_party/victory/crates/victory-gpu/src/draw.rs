@@ -2417,6 +2417,7 @@ impl State {
         let mut sync = BakeSync { publish: Vec::new(), keep: Vec::new() };
         crate::texture::BAKING.set(exact);
         self.flush_for_bake(bake_list, host, &mut sync);
+        Self::bake_shown_early(bake_list, host, &mut sync);
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let run_pass = left > 0
             && (first
@@ -2463,6 +2464,29 @@ impl State {
         }
         Self::bake_left(host, served);
         BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Before a draw of the title's bake: title slots of its heap that a
+    /// draw's table showed at once, to a list that records the upload of the
+    /// texture cut from a block they show, before that list was sent
+    /// (`crate::pool::fill::shown_early`). The bake reads slots by index and
+    /// may reach the card ahead of that list: what it bakes would be what
+    /// the block's last texture left, in the title's textures for the scene.
+    /// Their uploads go into the bake's own list, which is run before the
+    /// bake; a slot whose upload cannot be had shows the stand-in.
+    fn bake_shown_early(list: &HostList, host: &crate::descriptor::host::HostHeap, sync: &mut BakeSync) {
+        for (index, key, view) in host.shown_early() {
+            let _ = crate::residency::take_staging_deferred();
+            readable(list, ResourceType::Srv, &view);
+            let _ = crate::residency::take_staging_deferred();
+            match crate::descriptor::host::view_copy(&view) {
+                Some(copy) if crate::pool::fill::ready_for(&copy, list) => {
+                    crate::pool::fill::EARLY_SHOWN[1].fetch_add(1, Ordering::Relaxed);
+                    sync.keep.push(copy);
+                }
+                _ => host.hold_unfilled(index, key),
+            }
+        }
     }
 
     /// Counts a bake draw recorded while slots of its heap still showed a
@@ -5324,6 +5348,35 @@ mod bake_tests {
         assert_eq!(host.shown_resource(5).map(|r| r.as_raw()), Some(copy.as_raw()));
         assert_eq!(host.stand_ins_left(), [0, 0]);
         drop(other);
+    }
+
+    /// A title slot a draw's table showed at once to a list that uploads the
+    /// texture cut from a block it shows, before that list was sent, has its
+    /// upload in the bake's own list first: a bake reads slots by index and
+    /// may reach the card ahead of the other list (`crate::pool::fill`).
+    /// Then it is told to no later bake.
+    #[test]
+    fn a_bake_uploads_first_a_slot_shown_to_a_list_not_sent_yet() {
+        use crate::descriptor::host::tests::{unfilled_texture, write_record};
+        let Some((texture, copy)) = unfilled_texture() else { return };
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 8) else { return };
+        let gpu = crate::host::host().unwrap();
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, View::Shader(texture as usize, None));
+        let other = gpu.new_list().unwrap();
+        crate::pool::fill::uploading(&other, &copy);
+        assert!(heap.mirror_listed(1, handle, &other).is_some());
+        assert!(!heap.shows_none(1), "shown to the list that uploads it");
+        let bake = gpu.new_list().unwrap();
+        let mut sync = BakeSync { publish: Vec::new(), keep: Vec::new() };
+        State::bake_shown_early(&bake, &heap, &mut sync);
+        assert!(crate::pool::fill::ready_for(&copy, &bake), "the bake's list uploads it");
+        assert!(sync.keep.iter().any(|c| std::sync::Arc::ptr_eq(c, &copy)));
+        assert!(heap.shown_early().is_empty());
+        for list in [bake, other] {
+            list.close();
+            list.reset();
+        }
     }
 }
 
