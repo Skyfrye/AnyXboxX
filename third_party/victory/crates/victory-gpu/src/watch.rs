@@ -740,6 +740,9 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 _ => pages.push((page, part)),
             }
         }
+        // The title's CPU wrote them: every asking tells the slots that
+        // read them (`crate::pagegen`), whoever asked.
+        crate::pagegen::written_own(pages.iter().map(|p| p.0));
         Some(pages)
     })
 }
@@ -1178,6 +1181,8 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    // The slots that read it, at any view, whether an asking stands or not.
+    crate::pagegen::written(at, len);
     // Renderer port #7: with no asking standing there is nothing to note,
     // which is seen shared. (Standing, its number moves: alone, as before.)
     if port_journal() && (len == 0 || !journal().kept) {
@@ -1913,6 +1918,8 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
         return Beside::Cannot;
     };
     put(page.wrapping_sub(block * BLOCK));
+    // The block stays guarded and nothing faults again: told here.
+    crate::pagegen::written(block * BLOCK, BLOCK);
     count.fetch_add(weight, Relaxed);
     for view in shown.iter().filter(|&&view| view != 0) {
         BESIDE.set(view / BLOCK);
@@ -1945,7 +1952,20 @@ pub(crate) fn opened_for_writing(at: usize) {
 /// With renderer port #6 the lock is taken shared and the claims of the block
 /// and of its page's other views are waited for, in order: the block's state
 /// is changed by nobody else meanwhile, and other faults go on beside this.
+///
+/// A block opened is told at its physical page (`crate::pagegen::faulted`),
+/// with the guards' lock let go: every slot that reads the page, at any
+/// view, is due.
 fn open_faulted(at: usize) -> (usize, std::time::Duration) {
+    let (opened, waited) = open_faulted_held(at);
+    if opened != 0 {
+        crate::pagegen::faulted(at);
+    }
+    (opened, waited)
+}
+
+/// [`open_faulted`] but for the telling.
+fn open_faulted_held(at: usize) -> (usize, std::time::Duration) {
     let block = at / BLOCK;
     let began = std::time::Instant::now();
     if !port_guard() {
@@ -2083,6 +2103,8 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    // A slot that found it away (or read zeros there) reads it again.
+    crate::pagegen::readdressed(at, len);
     if len == 0 || !known_holes() {
         return;
     }
@@ -2317,7 +2339,7 @@ fn rest() -> std::time::Duration {
 #[cfg(test)]
 thread_local! {
     /// [`rest`], for what this thread asks.
-    static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    pub(crate) static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
 struct Guards {
@@ -2563,6 +2585,9 @@ impl std::hash::Hasher for PageHash {
 }
 
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
+/// The caller tells the slots that read it once it is in
+/// (`crate::pagegen::written`): told now, a texture pass between this and
+/// the write would take the bytes from before as up to date.
 pub(crate) fn landing(at: usize, len: usize) {
     {
         let frame = crate::frame::current();
@@ -2576,7 +2601,7 @@ pub(crate) fn landing(at: usize, len: usize) {
             }
         }
     }
-    writing(at, len);
+    opening(at, len);
 }
 
 
@@ -2651,7 +2676,9 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
         }
     }
     for &(at, len) in spans {
-        // A placed texture there changes with no descriptor written.
+        // A placed texture there changes with no descriptor written: at
+        // every view of the pages (`crate::pagegen`).
+        crate::pagegen::written(at, len);
         crate::descriptor::host::remapped(at, len);
     }
     for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
@@ -2688,6 +2715,45 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     let g = guards();
     (at / BLOCK..=(at + len - 1) / BLOCK)
         .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
+}
+
+/// How the blocks of view memory `[start, end)` stand after it was guarded
+/// ([`writes`]), for a texture slot that relies on the guards to tell it of
+/// the title's next write (`crate::pagegen::arm`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Armed {
+    /// Every block is read-only by our hand, or known unmapped (its mapping
+    /// is told): the title's next write to any of it faults.
+    Whole,
+    /// Some are left open for now (written just now and resting, or the
+    /// kernel or a change of mapping at work there): guarded at an asking
+    /// soon.
+    Soon,
+    /// Some are not guarded here at all (other memory, a protection that
+    /// failed).
+    Never,
+}
+
+/// See [`Armed`].
+pub(crate) fn armed(start: usize, end: usize) -> Armed {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    if first >= last {
+        return Armed::Whole;
+    }
+    let g = guards_timed_shared();
+    let rest = rest();
+    let mut soon = false;
+    for block in first..last {
+        if g.protected.contains(block) || g.absent.contains(block) {
+            continue;
+        }
+        if g.left_alone(block) || g.rests(block, rest) {
+            soon = true;
+            continue;
+        }
+        return Armed::Never;
+    }
+    if soon { Armed::Soon } else { Armed::Whole }
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -3188,6 +3254,21 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
     here
 }
 
+thread_local! {
+    /// This thread opens guards for a write of ours that tells the texture
+    /// slots of it once its bytes are in ([`unguard`]).
+    static TELLS_AFTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`open`] for a write of ours that tells the texture slots once its bytes
+/// are in.
+fn open_telling_after(g: &Guards, start: usize, end: usize) -> usize {
+    TELLS_AFTER.set(true);
+    let opened = open(g, start, end);
+    TELLS_AFTER.set(false);
+    opened
+}
+
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
@@ -3199,6 +3280,14 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         g.protected.remove(block);
         g.clean.remove(block);
         PUBLISHED.clear(block);
+    }
+    // A slot that read one of them relied on its guard for the title's next
+    // write: due, to guard it again (`crate::pagegen`). Not for a writer of
+    // ours that tells the slots once its bytes are in ([`opening`],
+    // [`kernel_writing`]): told now, a pass between could read the bytes
+    // from before, and upload again after.
+    if !TELLS_AFTER.get() {
+        crate::pagegen::unguarded(blocks.iter().map(|&block| block * BLOCK));
     }
     for &block in blocks {
         let mut old = 0;
@@ -3223,13 +3312,22 @@ fn unguard(g: &Guards, blocks: &[usize]) {
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
+/// reads into its own memory, and again once the bytes are there
+/// (`xmem::pages_written`, DirectStorage's reads to addresses): each time
+/// the slots that read the memory are told (`crate::pagegen::written`).
 pub fn writing(at: usize, len: usize) {
+    opening(at, len);
+    crate::pagegen::written(at, len);
+}
+
+/// [`writing`] but for telling the slots: for a writer that tells them once
+/// its bytes are in (`crate::pagegen::written`).
+pub(crate) fn opening(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
         let g = guards_timed();
-        let opened = open(&g, at, at.saturating_add(len));
+        let opened = open_telling_after(&g, at, at.saturating_add(len));
         #[cfg(feature = "diagnostics")]
         {
             tally(6, opened as u64);
@@ -3242,8 +3340,9 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
-/// is dropped ([`kernel_writing`]).
-pub struct KernelWrite(usize, usize);
+/// is dropped ([`kernel_writing`]): the blocks, and the bytes (address,
+/// length), which the slots that read them are told of when it is dropped.
+pub struct KernelWrite(usize, usize, usize, usize);
 
 /// The runtime is about to have the kernel write title memory
 /// `[at, at + len)` (a file read): its guarded blocks are opened, as by
@@ -3255,7 +3354,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
-        open(&g, at, at.saturating_add(len));
+        open_telling_after(&g, at, at.saturating_add(len));
         if len != 0 {
             // Nothing known of them stands while they are left alone.
             let absent: Vec<usize> = g.absent.range(first..last).collect();
@@ -3269,7 +3368,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         }
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(first, if len == 0 { first } else { last })
+    KernelWrite(first, if len == 0 { first } else { last }, at, len)
 }
 
 impl Drop for KernelWrite {
@@ -3277,6 +3376,8 @@ impl Drop for KernelWrite {
         if self.0 == self.1 {
             return;
         }
+        // The bytes are in (or what of them the read got).
+        crate::pagegen::written(self.2, self.3);
         let mut g = guards();
         if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
             g.kernel.swap_remove(i);
@@ -3402,6 +3503,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // The bytes are in: the slots that read them, at any view.
+    crate::pagegen::written(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -3729,6 +3832,10 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // What a slot read there is gone. (With no length, its first block: the
+    // kernel then refuses to be asked about the rest, which tells the slots
+    // there, `crate::descriptor::host::HostHeap::texture_slots_moved`.)
+    crate::pagegen::readdressed(at, len.max(1));
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
@@ -3799,7 +3906,8 @@ fn forget_views(first: usize, last: usize) {
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
     // A placed texture there arrives, goes or changes with no descriptor
-    // written.
+    // written: the slots that read it at these addresses.
+    crate::pagegen::readdressed(at, len);
     crate::descriptor::host::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
@@ -4062,7 +4170,7 @@ mod page_writes_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -4741,7 +4849,7 @@ mod tests {
     /// A pagefile section mapped twice: two views of the same physical
     /// pages, the second left for the test; the section handle, the two
     /// addresses.
-    fn two_views(bytes: usize) -> (usize, usize, usize) {
+    pub(crate) fn two_views(bytes: usize) -> (usize, usize, usize) {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
@@ -4770,7 +4878,7 @@ mod tests {
 
     /// The section of [`two_views`] is closed and its views unmapped; the
     /// guard is told they are gone first.
-    fn drop_views(section: usize, views: &[usize], bytes: usize) {
+    pub(crate) fn drop_views(section: usize, views: &[usize], bytes: usize) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
