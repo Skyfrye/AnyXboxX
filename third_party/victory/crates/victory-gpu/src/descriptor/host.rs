@@ -2578,10 +2578,7 @@ impl HostHeap {
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
-            let kept = old.is_some_and(|old| match kin(&old, &view) {
-                Kin::Same => true,
-                kin => kin.kept(keep_shown()),
-            });
+            let kept = old.is_some_and(|old| self.keeps(index, kin(&old, &view)));
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(index, shown, "neutral");
@@ -3712,8 +3709,8 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
-                    rewritten(kin, kept);
+                    let kept = self.keeps(index, kin);
+                    rewritten(kin, kept, is_texture_view(&view));
                     if kept {
                         drop(held);
                         self.unmake_stale(index, stale);
@@ -3740,10 +3737,7 @@ impl HostHeap {
                     return Some(view);
                 }
                 let old = view_at(shown as u32, (shown >> 32) as u32);
-                let kept = old.is_some_and(|old| match kin(&old, &view) {
-                    Kin::Same => true,
-                    kin => kin.kept(keep_shown()),
-                });
+                let kept = old.is_some_and(|old| self.keeps(index, kin(&old, &view)));
                 if shown == 0 || !kept {
                     #[cfg(feature = "diagnostics")]
                     note_before(index, shown, "neutral, new texture");
@@ -3805,6 +3799,14 @@ impl HostHeap {
             self.unmake_stale(index, stale);
         }
         Some(view)
+    }
+
+    /// Whether slot `index`, which shows a texture, goes on showing it when
+    /// written with a view of `kin` to it ([`Kin::kept`] by [`keep_shown`]):
+    /// a texture of another kind only while the slot holds that texture's
+    /// host copy, which it then goes on viewing until the new one is made.
+    fn keeps(&self, index: u32, kin: Kin) -> bool {
+        kin.kept(keep_shown()) && (kin != Kin::Other || self.kept_in(index).is_some())
     }
 
     /// Whether slot `index` was made from no record: what [`HostHeap::mirror`]
@@ -5081,12 +5083,9 @@ fn kin(old: &View, new: &View) -> Kin {
             Kin::Other
         };
     }
-    let dimension = |view: &View| match view {
-        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
-        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => desc[1],
-        _ => 0,
-    };
-    match (dimension(old), dimension(new)) {
+    // (A view of a texture object without a description has the
+    // texture's own dimension: [`view_dimension`].)
+    match (view_dimension(old), view_dimension(new)) {
         (0, _) | (_, 0) => Kin::None,
         (a, b) if a == b => Kin::Other,
         _ => Kin::None,
@@ -5095,42 +5094,57 @@ fn kin(old: &View, new: &View) -> Kin {
 
 /// Whether a slot that is written with a view of another texture goes on
 /// showing the one it shows until the new one is made and its upload has run
-/// (`VICTORY_KEEP_SHOWN`): 0: never, it reads as zeros, then as the neutral
-/// texture; 1: one of the same kind in another place or size; 2: any of the
-/// same dimension.
+/// (`VICTORY_KEEP_SHOWN`): 0: never, it shows the stand-in (or reads as
+/// zeros); 1: one of the same kind in another place or size, as before;
+/// 2 (the default): any of the same dimension, while the slot holds its
+/// host copy ([`HostHeap::keeps`]).
+///
+/// At 1, a slot the title rewrote with another texture of the same
+/// dimension went null until the texture pass had uploaded the new one:
+/// 8,663 such writes in run nb1 (none kept), where the old base kept every
+/// texture-to-texture write while the slot held a host copy (88,266 in run
+/// b6x, `VICTORY_KEEP_OTHER_VIEWS`): a torso, a wall, a building black, then
+/// back, as a material's texture streamed in at a new address.
 fn keep_shown() -> u8 {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
         return if on { 2 } else { 0 };
     }
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
 }
 
 /// Slots that showed a texture and were written with a view of another,
-/// since the start, by [`Kin`] (moved, sized, other, none), and those of
-/// them that kept what they showed.
-static REWRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// since the start, by [`Kin`] (moved, sized, other, none of a texture,
+/// none of a buffer: [`Kin::None`] is mostly a table's slot written with a
+/// buffer view, which is no texture lost), and those of them that kept
+/// what they showed.
+static REWRITTEN: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
-fn rewritten(kin: Kin, kept: bool) {
+/// Counts a slot that showed a texture written with a view of `kin` to it,
+/// of a texture (`texture`) or not, which kept what it showed or not.
+fn rewritten(kin: Kin, kept: bool, texture: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let class = match kin {
         Kin::Moved | Kin::Same => 0,
         Kin::Sized => 1,
         Kin::Other => 2,
-        Kin::None => 3,
+        Kin::None if texture => 3,
+        Kin::None => 4,
     };
     REWRITTEN[class].fetch_add(1, Relaxed);
-    REWRITTEN[4].fetch_add(u64::from(kept), Relaxed);
-    let n: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
+    REWRITTEN[5].fetch_add(u64::from(kept), Relaxed);
+    let n: u64 = REWRITTEN[..5].iter().map(|n| n.load(Relaxed)).sum();
     if n.is_multiple_of(5000) {
         tracing::info!(
-            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN)",
+            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension, {} with a buffer view; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN={})",
             REWRITTEN[0].load(Relaxed),
             REWRITTEN[1].load(Relaxed),
             REWRITTEN[2].load(Relaxed),
             REWRITTEN[3].load(Relaxed),
-            REWRITTEN[4].load(Relaxed)
+            REWRITTEN[4].load(Relaxed),
+            REWRITTEN[5].load(Relaxed),
+            keep_shown()
         );
     }
 }
@@ -5180,8 +5194,8 @@ fn same_bytes(old: u64, new: u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn pop_causes() -> [u64; 4] {
     use std::sync::atomic::Ordering::Relaxed;
-    let all: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
-    let kept = REWRITTEN[4].load(Relaxed);
+    let all: u64 = REWRITTEN[..5].iter().map(|n| n.load(Relaxed)).sum();
+    let kept = REWRITTEN[5].load(Relaxed);
     [all.saturating_sub(kept), kept, LATE[3].load(Relaxed), STALE[0].load(Relaxed)]
 }
 
@@ -5738,6 +5752,62 @@ mod tests {
         let handle = write_record(&mut words, buffer);
         heap.mirror(4, handle, false);
         assert!(heap.kept_in(4).is_none());
+    }
+
+    /// A view of a texture object made without a description is of the
+    /// texture's own dimension: a slot that showed a 2D texture and is
+    /// written with one can go on showing it, one of a 3D texture cannot.
+    #[test]
+    fn a_view_without_a_description_is_of_its_textures_dimension() {
+        let flat = crate::resource::test_texture(3, 64, 64, 1);
+        let volume = crate::resource::test_texture(4, 16, 16, 16);
+        let old = placed_2d(0x7fee_3100_0000, 98);
+        assert_eq!(kin(&old, &View::Shader(flat as usize, None)), Kin::Other);
+        assert_eq!(kin(&View::Shader(flat as usize, None), &old), Kin::Other);
+        assert_eq!(kin(&old, &View::Shader(volume as usize, None)), Kin::None);
+    }
+
+    /// A slot that shows a texture and is written with a view of another
+    /// texture of its dimension goes on showing the one it holds until the
+    /// new one is made (the old base's `VICTORY_KEEP_OTHER_VIEWS`); one that
+    /// holds no host copy of it shows the stand-in.
+    #[test]
+    fn a_slot_rewritten_with_another_texture_shows_the_old_one_meanwhile() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let Some(texture) = make_neutral(Neutral::Flat) else { return };
+        // Another texture of the same dimension: not of the old one's
+        // proportions, so neither moved nor sized.
+        let other = |address: u64| {
+            let mut view = placed_2d(address, 98);
+            if let View::Placed(_, resource, _) = &mut view {
+                (resource[4], resource[6]) = (128, 32);
+            }
+            view
+        };
+        for (index, holds) in [(5u32, true), (6, false)] {
+            let mut slot = [0u32; 4];
+            let address = 0x7fee_3200_0000 + u64::from(index) * 0x10_0000;
+            let handle = write_record(&mut slot, placed_2d(address, 98));
+            let shown = record_key(handle);
+            // The slot shows that texture (made from its record, holding
+            // its host copy, or nothing).
+            heap.made.set(index, shown);
+            heap.keep(index, holds.then(|| texture.clone()));
+            let old = view_at(shown as u32, (shown >> 32) as u32).unwrap();
+            let new = other(address + 0x8_0000);
+            assert_eq!(kin(&old, &new), Kin::Other);
+            write_record(&mut slot, new);
+            assert!(heap.mirror(index, handle, false).is_some());
+            if holds {
+                assert_eq!(heap.made.get(index), Some(shown), "goes on showing the old texture");
+                assert_eq!(heap.kept_in(index).map(|r| r.as_raw()), Some(texture.as_raw()));
+            } else {
+                assert!(heap.shows_none(index));
+                let stand_in = neutral(Neutral::Flat).unwrap();
+                assert_eq!(heap.kept_in(index).map(|r| r.as_raw()), Some(stand_in.as_raw()));
+            }
+        }
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.

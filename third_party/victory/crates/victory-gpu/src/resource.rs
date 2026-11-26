@@ -3556,6 +3556,47 @@ pub(crate) fn test_buffer(width: u64) -> This {
     out
 }
 
+/// A title texture object of `dimension` (`D3D12_RESOURCE_DIMENSION`),
+/// `width` x `height` with `slices` slices (or depth), one level of
+/// R8G8B8A8_UNORM, which the title fills.
+#[cfg(test)]
+pub(crate) fn test_texture(dimension: u32, width: u64, height: u32, slices: u16) -> This {
+    const R8G8B8A8_UNORM: u32 = 28;
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: slices,
+        mip_levels: 1,
+        format: R8G8B8A8_UNORM,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
