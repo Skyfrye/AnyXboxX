@@ -179,8 +179,9 @@ pub(crate) enum Teller {
 /// the title's own memory ([`Watchers::asks`]); looks by digest at slots of
 /// memory nothing tracks, and those that found it changed; slots made due
 /// by a physical page's change; slots whose guard was not all up when they
-/// were read ([`Kept::Open`]).
-pub(crate) static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+/// were read ([`Kept::Open`]); slots armed again, what views showed there
+/// having changed while [`watch`] armed them.
+pub(crate) static STATS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 const UNWATCHED: usize = 6;
 const DUE: usize = 7;
 const LOST: usize = 8;
@@ -191,6 +192,7 @@ const LOOKS_CHANGED: usize = 11;
 /// address, or memory of the title's own).
 const DUE_SHOWN: usize = 12;
 const OPEN: usize = 13;
+const REWATCHED: usize = 14;
 
 fn count(what: usize, n: u64) {
     if n != 0 {
@@ -410,16 +412,40 @@ fn let_go(pages: &[Page]) {
 /// order that loses no change: the pages are watched first
 /// ([`Watchers::begin`]), then the tick taken and the memory guarded or
 /// asked about ([`arm`]), then what views show there is looked up again: a
-/// mapping changed meanwhile is a change of the address's own page, told
-/// after the tick or seen here.
+/// mapping changed after the tick is a change of the address's own page,
+/// told after it.
+///
+/// A mapping changed between the first lookup and the tick is not: [`arm`]
+/// guarded what is shown now, whose physical pages nobody held yet, so the
+/// fault of a title store through another view of them was dropped (one at
+/// this address is told at the address too, as its guard comes off), and
+/// that view, opened by it, took the next stores with no fault. Then the
+/// pages shown now are
+/// held and armed again, with a tick of their own, up to [`REWATCHES`]
+/// times; still moving after that, the slot is read again at the next pass
+/// ([`Kept::Open`]).
 pub(crate) fn watch(slot: u32, at: usize, len: usize, mut with: impl FnMut(&mut dyn FnMut(&mut Watchers))) -> Kept {
-    let pages = pages_of(at, len);
-    with(&mut |w| w.begin(slot, &pages));
-    let (since, kept) = arm(at, len);
-    let mut again = Some(pages_of(at, len));
-    with(&mut |w| w.watch(slot, again.take().unwrap_or_default(), since, kept));
-    kept
+    let mut pages = pages_of(at, len);
+    let mut tries = 0;
+    loop {
+        with(&mut |w| w.begin(slot, &pages));
+        let (since, kept) = arm(at, len);
+        let again = pages_of(at, len);
+        if again == pages || tries == REWATCHES {
+            let kept = if again == pages { kept } else { Kept::Open };
+            let mut again = Some(again);
+            with(&mut |w| w.watch(slot, again.take().unwrap_or_default(), since, kept));
+            return kept;
+        }
+        count(REWATCHED, 1);
+        pages = again;
+        tries += 1;
+    }
 }
+
+/// How many times [`watch`] holds and arms a slot's pages again when what
+/// views show there changed while it did.
+const REWATCHES: usize = 2;
 
 /// The number the next change kept will have.
 fn head() -> u64 {
@@ -819,14 +845,14 @@ impl Drop for Watchers {
 
 /// The page generations line for the log.
 pub(crate) fn line() -> String {
-    let n: [u64; 14] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
+    let n: [u64; 15] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
     let kinds: [u64; 3] = std::array::from_fn(|i| KINDS[i].load(Ordering::Relaxed));
     format!(
         "page generations (VICTORY_PAGE_GENERATIONS=0: notices by address and fingerprint looks, as before), since the start: \
          changes of watched pages told by guard faults {}, by the kernel's write watch {}, by our writes {}, by DirectStorage \
          into physical pages {}, by mappings {}, by guards taken off {}; {} changes of memory no slot watches; {} slots made \
          due ({} by a physical page, whatever view it was written through; {} read while their guard was not all up), {} \
-         times a heap fell behind the changes kept; {} askings of the kernel for slots of the title's own memory, {} looks by \
+         armed again as what views showed there changed meanwhile, {} times a heap fell behind the changes kept; {} askings of the kernel for slots of the title's own memory, {} looks by \
          digest at memory nothing tracks ({} found it changed); now {} pages watched by {} slots guarded, {} asked, {} looked at",
         n[Teller::Fault as usize],
         n[Teller::Kernel as usize],
@@ -838,6 +864,7 @@ pub(crate) fn line() -> String {
         n[DUE],
         n[DUE_SHOWN],
         n[OPEN],
+        n[REWATCHED],
         n[LOST],
         n[ASKED],
         n[LOOKS],
@@ -927,6 +954,82 @@ mod tests {
         // SAFETY: as above.
         unsafe { ((two + 4096) as *mut u8).write(2) };
         assert_eq!(watchers.moved(), [1], "the writes after the slot's tick reach it");
+    }
+
+    /// The runtime shows other pages at a slot's address between the first
+    /// lookup of its pages and its tick: the pages shown now are held and
+    /// armed again, and the title's stores through them after the read
+    /// reach the slot. (Armed once, the guard went up over pages nobody
+    /// held: the fault of a store there was dropped, and the block it
+    /// opened took the next stores with no fault; the mapping's own change
+    /// came before the tick. Round 2's review.)
+    #[test]
+    fn a_mapping_changed_before_the_tick_is_armed_again() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
+            MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        TEST_ON.set(Some(true));
+        const SIZE: usize = PAGE;
+        // The pages shown at the slot's address after the change, and
+        // another view of them, which the title writes through.
+        let (second, _, other) = kept_views(SIZE);
+        // SAFETY (all): a placeholder of our own showing a section of its
+        // own, then the other; kept for the life of the process, as
+        // `kept_views`.
+        let at = unsafe {
+            let first = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!first.is_null());
+            let hole = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(hole, 0);
+            let view = MapViewOfFile3(first, GetCurrentProcess(), hole as _, 0, SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(view.Value as usize, hole);
+            crate::inplace::title_memory_view(hole, SIZE, first as usize, 0);
+            hole
+        };
+        let remap = || {
+            let _changing = crate::watch::title_memory_remapping();
+            crate::watch::title_memory_unmapping(at, SIZE);
+            // SAFETY: the view mapped above, and the placeholder it leaves.
+            unsafe {
+                let view = windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as _ };
+                assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
+                let view = MapViewOfFile3(second as _, GetCurrentProcess(), at as _, 0, SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert_eq!(view.Value as usize, at);
+            }
+            crate::watch::title_memory_remapped(at, SIZE);
+            crate::inplace::title_memory_view(at, SIZE, second, 0);
+        };
+        let mut watchers = Watchers::default();
+        let mut calls = 0;
+        let kept = super::watch(1, at, SIZE, |f| {
+            calls += 1;
+            if calls == 2 {
+                // A store of the title's through the other view of the pages
+                // shown now, after their guard went up.
+                // SAFETY: the view, read-write once the handler opened it.
+                unsafe { ((other + 8) as *mut u8).write_volatile(1) };
+            }
+            f(&mut watchers);
+            if calls == 1 {
+                remap();
+            }
+        });
+        assert_eq!(kept, Kept::Told);
+        assert_eq!(watchers.slots[&1].pages[..], pages_of(at, SIZE)[..], "the pages shown now");
+        // The upload has read the memory; the title stores again there.
+        // SAFETY: as above.
+        unsafe { ((other + 4096) as *mut u8).write_volatile(2) };
+        assert_eq!(watchers.moved(), [1], "the store after the read reaches the slot");
     }
 
     /// A slot whose pages change (its texture moved) holds the new ones
