@@ -214,12 +214,18 @@ impl Blob {
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
+        Blob::at(&path)
+    }
+
+    /// The file at `path`, mapped, or read where it cannot be; `None` if it
+    /// is not there or is empty.
+    fn at(path: &std::path::Path) -> Blob {
         if mapped()
-            && let Some(file) = Mapped::open(&path)
+            && let Some(file) = Mapped::open(path)
         {
             return Blob::Mapped(file);
         }
-        match std::fs::read(&path) {
+        match std::fs::read(path) {
             Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
             _ => Blob::None,
         }
@@ -441,6 +447,26 @@ const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
+/// The library of another setup of the host, kept beside [`LIBRARY_FILE`]
+/// ([`open_dir`]). Two setups that share the cache folder (runs with and
+/// without some device switches) reject each other's library, the host
+/// saying either that the blob "was created for a different version of the
+/// driver" or that "the parameter is incorrect". With one file, each start
+/// after the other setup's began with an empty library, and its first save
+/// replaced the other's: the opening cutscene then made every pipeline anew
+/// (1,750-2,700 being made, 0.1-1.5 fps for two minutes; the run before,
+/// with the library loaded, did not wait for them). `VICTORY_LIBRARY_OTHER=0`
+/// keeps one file, as before.
+const OTHER_FILE: &str = "host-pipelines.other";
+/// For the moment [`open_dir`] swaps the two files' names.
+const SWAP_FILE: &str = "host-pipelines.swap";
+
+/// Whether the library of another setup is kept ([`OTHER_FILE`]). On by
+/// default; `VICTORY_LIBRARY_OTHER=0` keeps one file, as before.
+fn keeps_other() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_OTHER").is_none_or(|v| v != "0"))
+}
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -448,8 +474,10 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let _opening = crate::timeline::span("pipeline: open the host pipeline library");
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
+            let library = match DIR.get() {
+                Some(dir) => open_dir(dir, keeps_other(), |blob| load(&device, blob)).or_else(|| empty(&device)),
+                None => open(&device, Blob::None),
+            };
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -458,48 +486,155 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
-/// The library in `blob`, or an empty one if the host rejects the blob (an
-/// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
-    let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
-        unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+/// The library of the cache folder `dir`, made by `load` (which hands back
+/// the bytes it rejects, with the host's reason), or `None` for an empty one.
+///
+/// From the library's file first. If the host rejects it and `other` is set,
+/// from [`OTHER_FILE`]: when the host takes that one, the two files swap
+/// names, so that this run's saves go on replacing its own library and the
+/// rejected one is kept for its setup. When the host takes neither, the
+/// rejected library's file becomes [`OTHER_FILE`] (in place of an older one
+/// this setup rejected too), and this run's first save makes a new library
+/// file: a library is no longer replaced by the empty one of a setup that
+/// could not use it.
+fn open_dir<L>(dir: &std::path::Path, other: bool, mut load: impl FnMut(Blob) -> Result<L, (Blob, String)>) -> Option<L> {
+    let path = dir.join(LIBRARY_FILE);
+    let blob = Blob::of(dir);
+    let rejected = if blob.bytes().is_empty() {
+        None
+    } else {
+        match load(blob) {
+            Ok(library) => return Some(library),
+            // The rejected bytes are let go (a mapped file is unmapped)
+            // before anything else is made: nothing reads them any more.
+            Err((blob, error)) => {
+                drop(blob);
+                Some(error)
+            }
         }
     };
-    if !blob.bytes().is_empty() {
-        match make(blob.bytes()) {
-            Ok(library) => {
-                let bytes = blob.bytes().len();
-                BLOB.store(bytes as u64, Ordering::Relaxed);
-                tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
-                if let Blob::Mapped(file) = &blob {
-                    VIEW[1].store(file.len, Ordering::Relaxed);
-                    VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
-                    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-                }
-                return Some(Library {
-                    library,
-                    _blob: blob,
-                    added: AtomicU64::new(0),
-                    saving: RwLock::new(()),
-                });
-            }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+    if !other {
+        match &rejected {
+            Some(error) => tracing::info!(error = %error, "host pipeline library rejected; starting an empty one"),
+            None => tracing::info!("no host pipeline library yet; starting an empty one"),
         }
-    } else {
-        tracing::info!("no host pipeline library yet; starting an empty one");
+        return None;
     }
-    // The rejected bytes are let go (a mapped file is unmapped) before the
-    // empty library is made: nothing reads them any more.
-    drop(blob);
-    let library = make(&[]).ok()?;
+    let other_path = dir.join(OTHER_FILE);
+    let blob = Blob::at(&other_path);
+    let other_rejected = if blob.bytes().is_empty() {
+        None
+    } else {
+        match load(blob) {
+            Ok(library) => {
+                // This setup's library takes the library's name (the file
+                // stays mapped and open under it, as a save's rename leaves
+                // it); the rejected one, if any, takes the other's.
+                let swapped = if rejected.is_some() {
+                    let swap = dir.join(SWAP_FILE);
+                    std::fs::rename(&path, &swap)
+                        .and_then(|()| std::fs::rename(&other_path, &path))
+                        .and_then(|()| std::fs::rename(&swap, &other_path))
+                } else {
+                    std::fs::rename(&other_path, &path)
+                };
+                match swapped {
+                    Ok(()) => tracing::info!(
+                        error = rejected.as_deref().unwrap_or("no library file"),
+                        "host pipeline library of this setup loaded from the other setup's file; the two files swapped names"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "host pipeline library of this setup loaded from the other setup's file, which could not take the library's name: this run's saves replace the library's file"
+                    ),
+                }
+                return Some(library);
+            }
+            Err((blob, error)) => {
+                drop(blob);
+                Some(error)
+            }
+        }
+    };
+    // Neither: the rejected library is kept for its setup.
+    if rejected.is_some()
+        && let Err(e) = std::fs::rename(&path, &other_path)
+    {
+        tracing::warn!(error = %e, "the rejected host pipeline library could not be kept beside the new one");
+    }
+    match (&rejected, &other_rejected) {
+        (Some(error), _) => tracing::info!(
+            error = %error,
+            other = other_rejected.as_deref().unwrap_or("none"),
+            "host pipeline library rejected; starting an empty one (the rejected one is kept for its setup)"
+        ),
+        (None, Some(error)) => tracing::info!(
+            other = %error,
+            "no host pipeline library yet, and the other setup's rejected; starting an empty one"
+        ),
+        (None, None) => tracing::info!("no host pipeline library yet; starting an empty one"),
+    }
+    None
+}
+
+/// The library the host makes from `blob` (not empty), or the blob back
+/// with the host's reason for rejecting it (an adapter or driver change,
+/// another setup of the device, damage).
+fn load(device: &ID3D12Device1, blob: Blob) -> Result<Library, (Blob, String)> {
+    match make(device, blob.bytes()) {
+        Ok(library) => {
+            let bytes = blob.bytes().len();
+            BLOB.store(bytes as u64, Ordering::Relaxed);
+            tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
+            if let Blob::Mapped(file) = &blob {
+                VIEW[1].store(file.len, Ordering::Relaxed);
+                VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
+                LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+            }
+            Ok(Library {
+                library,
+                _blob: blob,
+                added: AtomicU64::new(0),
+                saving: RwLock::new(()),
+            })
+        }
+        Err(e) => Err((blob, e.to_string())),
+    }
+}
+
+/// The host's library made from `bytes` (none: an empty one).
+fn make(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    // SAFETY: the bytes outlive the library (kept beside it).
+    unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast() }
+}
+
+/// An empty library.
+fn empty(device: &ID3D12Device1) -> Option<Library> {
+    let library = make(device, &[]).ok()?;
     Some(Library {
         library,
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
+}
+
+/// The library in `blob`, or an empty one if the host rejects the blob (an
+/// adapter or driver change, damage).
+fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+    if blob.bytes().is_empty() {
+        tracing::info!("no host pipeline library yet; starting an empty one");
+        return empty(device);
+    }
+    match load(device, blob) {
+        Ok(library) => Some(library),
+        Err((blob, error)) => {
+            tracing::info!(error = %error, "host pipeline library rejected; starting an empty one");
+            // Let go before the empty library is made.
+            drop(blob);
+            empty(device)
+        }
+    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -816,6 +951,114 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    /// A loader that takes only libraries of `setup` (their first byte),
+    /// and holds the bytes (a mapped file stays mapped and open) as the
+    /// host's library does.
+    fn setup(setup: u8) -> impl FnMut(Blob) -> Result<Blob, (Blob, String)> {
+        move |blob: Blob| {
+            if blob.bytes().first() == Some(&setup) {
+                Ok(blob)
+            } else {
+                Err((blob, "another setup".to_owned()))
+            }
+        }
+    }
+
+    fn read(dir: &std::path::Path, file: &str) -> Option<Vec<u8>> {
+        std::fs::read(dir.join(file)).ok()
+    }
+
+    /// `open_dir` with the setup's loader; what it loaded, and the two
+    /// files' contents while the loaded bytes are still held.
+    fn turn(dir: &std::path::Path, other: bool, s: u8) -> [Option<Vec<u8>>; 3] {
+        let loaded = open_dir(dir, other, setup(s));
+        let files = [read(dir, LIBRARY_FILE), read(dir, OTHER_FILE)];
+        assert!(!dir.join(SWAP_FILE).exists());
+        let [library, kept] = files;
+        [loaded.map(|b| b.bytes().to_vec()), library, kept]
+    }
+
+    /// Two setups taking turns keep each other's library: a start of one
+    /// after the other loads its own from the other setup's file, and a
+    /// setup the host takes neither file of keeps the rejected one.
+    #[test]
+    fn setups_taking_turns_keep_each_others_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let a = vec![b'A'; 64 << 10];
+        let b = vec![b'B'; 96 << 10];
+        let (some_a, some_b) = (Some(a.clone()), Some(b.clone()));
+        // No file yet.
+        assert_eq!(turn(d, true, b'A'), [None, None, None]);
+        // Setup A's own library loads, and nothing moves.
+        std::fs::write(d.join(LIBRARY_FILE), &a).unwrap();
+        assert_eq!(turn(d, true, b'A'), [some_a.clone(), some_a.clone(), None]);
+        // Setup B takes neither: an empty library (B's first save writes a
+        // new library file), and A's kept as the other.
+        assert_eq!(turn(d, true, b'B'), [None, None, some_a.clone()]);
+        std::fs::write(d.join(LIBRARY_FILE), &b).unwrap();
+        // A again: its library loads from the other file, and the two swap.
+        assert_eq!(turn(d, true, b'A'), [some_a.clone(), some_a.clone(), some_b.clone()]);
+        // B again: the same, the other way round.
+        assert_eq!(turn(d, true, b'B'), [some_b.clone(), some_b.clone(), some_a.clone()]);
+        // A third setup takes neither: the most recent (B's) is kept.
+        assert_eq!(turn(d, true, b'C'), [None, None, some_b.clone()]);
+        // With no library file, a setup whose library is the other's loads it.
+        assert_eq!(turn(d, true, b'B'), [some_b.clone(), some_b, None]);
+    }
+
+    /// With `VICTORY_LIBRARY_OTHER=0` (`other` false): one file, as before.
+    #[test]
+    fn one_file_without_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let a = vec![b'A'; 4096];
+        std::fs::write(d.join(LIBRARY_FILE), &a).unwrap();
+        // The rejected file stays where it is (the first save replaces it).
+        assert_eq!(turn(d, false, b'B'), [None, Some(a.clone()), None]);
+        // The other file is not looked at.
+        std::fs::write(d.join(OTHER_FILE), &a).unwrap();
+        assert_eq!(turn(d, false, b'A'), [Some(a.clone()), Some(a.clone()), Some(a.clone())]);
+        std::fs::remove_file(d.join(LIBRARY_FILE)).unwrap();
+        assert_eq!(turn(d, false, b'A'), [None, None, Some(a)]);
+    }
+
+    /// With the host's own loader: a library file it rejects and the other
+    /// setup's file holding a library it takes. That one is loaded (and held,
+    /// mapped where the files are) while the two files swap names, and it
+    /// still holds its pipelines' bytes after the swap.
+    #[test]
+    fn the_host_loads_this_setups_library_from_the_other_file() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // A library this host made: an empty one, serialised.
+        let made = empty(&device).expect("an empty library");
+        // SAFETY: a plain query on a live library.
+        let size = unsafe { made.library.GetSerializedSize() };
+        let mut mine = vec![0u8; size];
+        // SAFETY: a buffer of the size the library asks for.
+        unsafe { made.library.Serialize(&mut mine) }.expect("serialised");
+        drop(made);
+        let theirs = b"another setup's pipeline library".repeat(64);
+        std::fs::write(d.join(LIBRARY_FILE), &theirs).unwrap();
+        std::fs::write(d.join(OTHER_FILE), &mine).unwrap();
+        let library = open_dir(d, true, |blob| load(&device, blob)).expect("loaded from the other file");
+        assert_eq!(library._blob.bytes(), &mine[..]);
+        assert_eq!(read(d, LIBRARY_FILE).as_deref(), Some(&mine[..]), "this setup's library under the library's name");
+        assert_eq!(read(d, OTHER_FILE).as_deref(), Some(&theirs[..]), "the rejected one kept for its setup");
+        assert!(!d.join(SWAP_FILE).exists());
+        // SAFETY: a plain query on a live library.
+        assert!(unsafe { library.library.GetSerializedSize() } > 0);
+        drop(library);
+        // The next start of this setup loads its own file, and nothing moves.
+        let again = open_dir(d, true, |blob| load(&device, blob)).expect("loaded from the library's file");
+        assert_eq!(again._blob.bytes(), &mine[..]);
+        assert_eq!(read(d, OTHER_FILE).as_deref(), Some(&theirs[..]));
     }
 
     /// A mapped file reads as the file's bytes, a file written through a
