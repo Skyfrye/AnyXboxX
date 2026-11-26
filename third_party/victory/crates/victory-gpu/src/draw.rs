@@ -208,11 +208,16 @@ fn recheck_soon() -> bool {
 
 /// Frames and milliseconds ahead the pass before a bake takes slots from
 /// that are due only then ([`bake_exact`]): those of notices (due in a
-/// frame or two), and at the frame's first bake alone the first two looks
-/// again ([`RECHECK_MS`]; a look reads 48 KiB, and a frame bakes up to
-/// sixteen times). (It was 12 frames at the first bake and 2 after, counted
-/// in frames for the looks again too.)
-const BAKE_AHEAD: [(u64, u64); 2] = [(2, RECHECK_MS[0] + RECHECK_MS[1]), (2, 0)];
+/// frame or two), and at the frame's first bake alone the writes of tables'
+/// slots (due `TABLED_GRACE` frames on) and the first two looks again
+/// ([`RECHECK_MS`]; a look reads 48 KiB, and a frame bakes up to sixteen
+/// times). Slots whose memory a look found away are taken by their own
+/// look's time only (`HostHeap::texture_slots_ahead`). (It was 12 frames
+/// at the first bake and 2 after, counted in frames for the looks again
+/// too; then 2 frames at the first bake as well, which left the tables'
+/// writes to bake as the stand-in.)
+pub(crate) const BAKE_AHEAD: [(u64, u64); 2] =
+    [(crate::descriptor::host::TABLED_GRACE + 4, RECHECK_MS[0] + RECHECK_MS[1]), (2, 0)];
 
 /// What [`crate::descriptor::host::HostHeap::texture_news`] said when the
 /// pass before a bake last served all there was, plus one (0: it did not):
@@ -2662,8 +2667,8 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         // The longest wait between two looks at a slot whose memory is away:
-        // four of this heap's own passes once a frame, within 250 ms and a
-        // second (`TextureQueue::look_cap`; `VICTORY_TEXTURE_LOOK_MS` sets
+        // four of this heap's own passes once a frame, within one and two
+        // seconds (`TextureQueue::look_cap`; `VICTORY_TEXTURE_LOOK_MS` sets
         // it). It was up to 256 frames, from the time since the last pass of
         // any heap or kind (several a frame): 65-110 s at the 2-4 frames a
         // second of run nb1, where the memory had come long before.
@@ -2678,7 +2683,7 @@ impl State {
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
             let (frames, ms) = BAKE_AHEAD[usize::from(again)];
-            let (ahead, _) = host.texture_slots_due(frame + frames, now + ms, 1 << 16);
+            let ahead = host.texture_slots_ahead(frame, now, frames, ms, 1 << 16);
             due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
@@ -5167,7 +5172,7 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 
 /// The longest wait, in milliseconds, between two looks at a texture slot
 /// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: four of
-/// its heap's own passes, within 250 ms and a second:
+/// its heap's own passes, within one and two seconds:
 /// `descriptor::host::TextureQueue::look_cap`). The looks back off 16, 32,
 /// 64, ... ms up to it. Measured (run light-22, `crate::texlate`): from
 /// the last look that found a slot's memory away to its upload, half under

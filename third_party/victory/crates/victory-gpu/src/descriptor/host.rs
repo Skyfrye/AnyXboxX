@@ -1146,7 +1146,7 @@ const TABLED_FRAMES: u64 = 240;
 /// Frames as `crate::frame::current` counts them: in its opening cutscene
 /// The title begins two or three of them per frame it presents
 /// (435 begun in the 353 s of run 52's, for some 140 presented).
-const TABLED_GRACE: u64 = 8;
+pub(crate) const TABLED_GRACE: u64 = 8;
 
 /// Frames for which a record copied into a slot a draw read through a
 /// table is left to such a draw ([`HostHeap::copied_tabled`]).
@@ -1183,8 +1183,13 @@ const LOOK_FIRST_MS: u64 = 16;
 /// passes, within these bounds in milliseconds. Counted in frames it was
 /// up to 256 frames, 65-110 s at the 2-4 frames a second of run nb1, and
 /// the time it stood for came from the last pass of any heap or kind.
+/// At least a second: each look is a query of the memory's mapping, over
+/// 1,000-20,000 queued slots, and at 16 frames a second or more a floor of
+/// 250 ms looked at every one of them four times a second. The passes
+/// stretch it only at the lowest frame rates (two seconds at most, below
+/// two frames a second).
 const LOOK_CAP_PASSES: u64 = 4;
-const LOOK_CAP_MS: [u64; 2] = [250, 1000];
+const LOOK_CAP_MS: [u64; 2] = [1000, 2000];
 
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1227,6 +1232,13 @@ impl Waiting {
     /// Whether the slot is due at `frame` and time `now`.
     fn is_due(&self, frame: u64, now: u64) -> bool {
         self.due <= frame && self.at <= now
+    }
+
+    /// Whether it waits for its next look at its memory, which a look found
+    /// away (or no more of it than at the last upload): due by that look's
+    /// time ([`TextureQueue::later`]), unless a notice made it due since.
+    fn looking(&self) -> bool {
+        self.looks > 0 && self.checked.2 == 0 && !self.by_notice
     }
 
     /// Whether it waited for its memory: a look found that away, or it was
@@ -1363,8 +1375,21 @@ impl TextureQueue {
 
     /// The slots due at `frame` and time `now`, for [`TextureQueue::in_order`].
     fn all_due(&self, frame: u64, now: u64) -> Due {
+        self.all_due_by(|w| w.is_due(frame, now))
+    }
+
+    /// The slots a pass before a bake takes ([`HostHeap::texture_slots_ahead`]):
+    /// those due by frame `frame + frames`, and by `now + ms` for the clock;
+    /// a slot whose memory a look found away only by its own next look's
+    /// time (`now`), whatever `ms`: the window would take every one of them
+    /// at every first bake of a frame, past the looks' backoff.
+    fn all_due_ahead(&self, frame: u64, now: u64, frames: u64, ms: u64) -> Due {
+        self.all_due_by(|w| w.is_due(frame + frames, if w.looking() { now } else { now + ms }))
+    }
+
+    fn all_due_by(&self, due_now: impl Fn(&Waiting) -> bool) -> Due {
         let mut due = Due::default();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.is_due(frame, now)) {
+        for (&index, w) in self.slots.iter().filter(|(_, w)| due_now(w)) {
             due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
         }
         due
@@ -1430,10 +1455,10 @@ impl TextureQueue {
 
     /// The longest wait between two looks at a slot whose memory is away:
     /// [`LOOK_CAP_PASSES`] of this heap's own passes, within
-    /// [`LOOK_CAP_MS`] (the most until the time between them is known).
+    /// [`LOOK_CAP_MS`] (the least until the time between them is known).
     fn look_cap(&self) -> u64 {
         match self.pass.1 {
-            0 => LOOK_CAP_MS[1],
+            0 => LOOK_CAP_MS[0],
             each => (each * LOOK_CAP_PASSES).clamp(LOOK_CAP_MS[0], LOOK_CAP_MS[1]),
         }
     }
@@ -2250,6 +2275,15 @@ impl HostHeap {
             (if max == 0 { Due::default() } else { textures.all_due(frame, now) }, textures.census(frame, now))
         };
         (TextureQueue::in_order(due, max), census)
+    }
+
+    /// Up to `max` slots a pass before a bake takes at `frame` and `now`
+    /// beyond those due then ([`TextureQueue::all_due_ahead`]): due within
+    /// `frames` frames and `ms` milliseconds, those waiting for a look at
+    /// their memory by its own time.
+    pub(crate) fn texture_slots_ahead(&self, frame: u64, now: u64, frames: u64, ms: u64, max: usize) -> Vec<(u32, u64)> {
+        let due = self.textures.lock().unwrap_or_else(|e| e.into_inner()).all_due_ahead(frame, now, frames, ms);
+        TextureQueue::in_order(due, max)
     }
 
     /// A pass of the texture queue begins at `now`: one of this heap's
@@ -6723,38 +6757,77 @@ mod tests {
     }
 
     /// The longest wait between two looks at a slot whose memory is away
-    /// follows this heap's own passes: four of them, but no less than
-    /// 250 ms and no more than a second (the most until the time between
-    /// them is known). At 3 frames a second a slot waiting for its memory
-    /// is looked at again within a second, where up to 256 frames (85 s)
-    /// were counted before.
+    /// follows this heap's own passes: four of them, but no less than a
+    /// second (also until the time between them is known) and no more than
+    /// two. At 3 frames a second a slot waiting for its memory is looked at
+    /// again within 1.3 s, where up to 256 frames (85 s) were counted before.
     #[test]
     fn looks_wait_by_the_clock_up_to_four_of_the_heaps_passes() {
         let mut q = TextureQueue::default();
         assert_eq!(q.look_cap(), 1000);
+        // At 10 and 50 frames a second: a second, not four passes (250 ms
+        // at the most, before).
         for t in 0..20 {
             q.passed(10_000 + t * 100);
         }
-        assert_eq!(q.look_cap(), 400);
+        assert_eq!(q.look_cap(), 1000);
         for t in 0..40 {
             q.passed(20_000 + t * 20);
         }
-        assert_eq!(q.look_cap(), 250);
-        for t in 0..20 {
+        assert_eq!(q.look_cap(), 1000);
+        // Below four frames a second the passes stretch it, to two seconds.
+        for t in 0..80 {
             q.passed(30_000 + t * 333);
         }
-        assert_eq!(q.look_cap(), 1000);
+        assert_eq!(q.look_cap(), 1332);
+        for t in 0..80 {
+            q.passed(60_000 + t * 900);
+        }
+        assert_eq!(q.look_cap(), 2000);
+        for t in 0..80 {
+            q.passed(140_000 + t * 333);
+        }
+        assert_eq!(q.look_cap(), 1332);
         q.written(7, 1, 0, false);
         let w = q.due(1, 0, 10)[0].1;
-        let (mut frame, mut now) = (1, 100_000);
+        let (mut frame, mut now) = (1, 200_000);
         for _ in 0..12 {
             q.later(7, w, frame, now, q.look_cap());
             frame += 1;
             now += 333;
         }
         q.later(7, w, frame, now, q.look_cap());
-        assert!(q.due(frame + 1, now + 999, 10).is_empty());
-        assert_eq!(q.due(frame + 1, now + 1000, 10)[0].0, 7);
+        assert!(q.due(frame + 1, now + 1331, 10).is_empty());
+        assert_eq!(q.due(frame + 1, now + 1332, 10)[0].0, 7);
+    }
+
+    /// The pass before a frame's first bake takes the writes of tables'
+    /// slots, due [`TABLED_GRACE`] frames on (it took them when its window
+    /// was 12 frames; at 2 frames it left them, and a bake that picked one
+    /// by index baked the stand-in into the title's texture for good), and
+    /// the slots due within its milliseconds; but a slot whose memory a
+    /// look found away only by that look's own time, not every time.
+    #[test]
+    fn a_bake_takes_tables_writes_and_leaves_the_looks_to_their_time() {
+        let mut q = TextureQueue::default();
+        let (frame, now) = (100, 50_000);
+        // Written into a slot a table read lately: due after the grace.
+        q.written(1, frame, frame + TABLED_GRACE, false);
+        // A slot whose memory was away at a look just now.
+        q.written(2, frame - 1, frame - 1, false);
+        let w = q.due(frame, now, 10).iter().find(|d| d.0 == 2).unwrap().1;
+        q.later(2, w, frame, now, q.look_cap());
+        assert!(q.due(frame, now, 10).is_empty());
+        // (What the pass before a frame's first bake takes.)
+        let (frames, ms) = crate::draw::BAKE_AHEAD[0];
+        let ahead = |q: &TextureQueue, now: u64| -> Vec<u32> {
+            TextureQueue::in_order(q.all_due_ahead(frame, now, frames, ms), 10).iter().map(|d| d.0).collect()
+        };
+        assert_eq!(ahead(&q, now), [1], "the table's write, not the look before its time");
+        assert_eq!(ahead(&q, now + LOOK_FIRST_MS), [2, 1], "the look at its time");
+        // A notice of its memory since: by the window, as any other.
+        q.changed(2, frame, frame + 1);
+        assert_eq!(ahead(&q, now), [2, 1]);
     }
 
     /// A slot uploaded whole and waiting for another look at its memory
