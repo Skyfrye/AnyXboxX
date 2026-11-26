@@ -2272,6 +2272,9 @@ pub(crate) fn let_go_idle() {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    // (The look for idle ones counts too: with whole blocks it asks each
+    // idle texture's lock.)
+    let began = std::time::Instant::now();
     let all = textures();
     // With a limit, the longest idle first; as the system counts
     // (`crate::vram::system_room`), by what their going gives back to it:
@@ -2341,7 +2344,6 @@ pub(crate) fn let_go_idle() {
         crate::host::retire(host);
         Some(bytes)
     };
-    let began = std::time::Instant::now();
     if by_blocks {
         // The bytes given back to the system.
         let mut gave = 0u64;
