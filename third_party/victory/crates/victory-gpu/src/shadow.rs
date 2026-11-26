@@ -999,6 +999,12 @@ pub(crate) fn relay_fetched(number: u64) {
     RELAY_FETCHED.fetch_max(number, Ordering::AcqRel);
 }
 
+/// [`RELAY_FETCHED`] now: every send up to it ran on the card ahead of a
+/// fetch that has been merged.
+pub(crate) fn fetched_so_far() -> u64 {
+    RELAY_FETCHED.load(Ordering::Acquire)
+}
+
 /// With [`relay`]: how many submissions that are not copied back yet
 /// declared each range shaders may be writing (range, count, the last
 /// submission that declared it).
@@ -3682,6 +3688,13 @@ impl Shadow {
         for piece in self.pieces(from, to) {
             kept.0[piece] = false;
         }
+    }
+
+    /// Whether the copy holds a snapshot (of a copy in the PC's memory:
+    /// what its declared ranges held when shaders were given them, while a
+    /// submission that declared one is not landed).
+    pub(crate) fn snapshot_held(&self) -> bool {
+        self.before.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// Whether shaders of a submission not yet copied back may be writing
