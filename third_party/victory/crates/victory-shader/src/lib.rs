@@ -26,7 +26,7 @@ pub mod structure;
 /// translated before is kept across the rebuild. `victory shaders`
 /// translates again what an earlier build of the translator cached and says
 /// how many came out different: if any did, the bump was due.
-pub const TRANSLATOR_VERSION: u32 = 1;
+pub const TRANSLATOR_VERSION: u32 = 2;
 
 /// The revision of the forms only hosts of 32-lane waves (NVIDIA) get: the paired form of
 /// console wave64 compute programs and its precedence over approximate forms, the loose-LDS
