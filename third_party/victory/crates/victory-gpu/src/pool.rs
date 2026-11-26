@@ -26,6 +26,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 pub(crate) mod copies;
+pub(crate) mod fill;
 
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
@@ -429,6 +430,21 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// The texture's address ([`PLACED`]).
+    texture: usize,
+}
+
+/// The textures cut from a block that are alive, by address: whether the
+/// part of the block each lies in held another texture before
+/// (`crate::pool::fill`).
+static PLACED: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, bool>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether `texture` was cut from a block, and if so whether its part of
+/// the block held another texture before: what lies there then is that
+/// texture's bytes, not zeros.
+pub(crate) fn placed(texture: &ID3D12Resource) -> Option<bool> {
+    lock(&PLACED).get(&(texture.as_raw() as usize)).copied()
 }
 
 struct Methods([*const (); 3]);
@@ -465,6 +481,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
+            lock(&PLACED).remove(&gone.texture);
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
@@ -599,6 +616,19 @@ fn made_now(texture: &ID3D12Resource) {
     unseen.insert(raw, begun);
 }
 
+/// `texture`, cut from a block where another lay, has its zeros queued for
+/// the next submission only now (`fill::placed`, after its twin and host copy
+/// were made): a submission begun since [`made_now`] took its head list
+/// without them, so it counts as begun before the texture too.
+pub(crate) fn zeros_queued(texture: &ID3D12Resource) {
+    let raw = texture.as_raw() as usize;
+    let begun = crate::host::submissions().0;
+    NEWEST_BEGUN.fetch_max(begun, Ordering::Relaxed);
+    let mut unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let at = unseen.entry(raw).or_insert(begun);
+    *at = (*at).max(begun);
+}
+
 /// Pooled textures made while submissions begun before them may still run:
 /// the submissions begun when each was made.
 static UNSEEN: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u64>>> = std::sync::LazyLock::new(Default::default);
@@ -628,17 +658,23 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
     unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
-/// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+/// Makes `texture` give `piece` back when the last reference to it goes;
+/// `again`: the piece held another texture before ([`placed`]).
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, again: bool) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let raw = texture.as_raw() as usize;
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, texture: raw }));
+    // (Before the texture holds it: its last reference may go at once.)
+    lock(&PLACED).insert(raw, again);
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
         if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
-            // under a texture that may be alive.
+            // under a texture that may be alive. Nor told of: nothing says
+            // when its address is another resource's.
+            lock(&PLACED).remove(&raw);
             std::mem::forget(object);
         }
     }
@@ -672,7 +708,6 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
@@ -708,7 +743,7 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            give_back_with(&made, piece, again);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -911,7 +946,9 @@ mod tests {
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not
-    /// before; its staging piece begins as zeros.
+    /// before; while it lives it is told as cut from a block
+    /// (`crate::pool::fill`), and not after (its address may be another
+    /// resource's then); its staging piece begins as zeros.
     #[test]
     fn a_texture_gives_its_piece_back_when_it_goes() {
         let Some(host) = crate::host::host() else { return };
@@ -928,6 +965,8 @@ mod tests {
         // SAFETY: a valid description.
         let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
         assert_eq!(crate::host::references(&t), 1, "what the texture holds is no reference to it");
+        let raw = t.as_raw() as usize;
+        assert!(placed(&t).is_some());
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();
         let other = t.clone();
@@ -935,6 +974,7 @@ mod tests {
         assert_eq!(resting(), before);
         drop(other);
         assert_eq!(resting(), before + 1);
+        assert!(!lock(&PLACED).contains_key(&raw));
         // SAFETY: the piece's mapping, 4096 bytes of it ours.
         unsafe {
             let (piece, _, at, data) = staging(host, 4096).unwrap();

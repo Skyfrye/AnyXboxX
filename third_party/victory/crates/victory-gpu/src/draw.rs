@@ -2417,6 +2417,7 @@ impl State {
         let mut sync = BakeSync { publish: Vec::new(), keep: Vec::new() };
         crate::texture::BAKING.set(exact);
         self.flush_for_bake(bake_list, host, &mut sync);
+        Self::bake_shown_early(bake_list, host, &mut sync);
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let run_pass = left > 0
             && (first
@@ -2463,6 +2464,29 @@ impl State {
         }
         Self::bake_left(host, served);
         BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Before a draw of the title's bake: title slots of its heap that a
+    /// draw's table showed at once, to a list that records the upload of the
+    /// texture cut from a block they show, before that list was sent
+    /// (`crate::pool::fill::shown_early`). The bake reads slots by index and
+    /// may reach the card ahead of that list: what it bakes would be what
+    /// the block's last texture left, in the title's textures for the scene.
+    /// Their uploads go into the bake's own list, which is run before the
+    /// bake; a slot whose upload cannot be had shows the stand-in.
+    fn bake_shown_early(list: &HostList, host: &crate::descriptor::host::HostHeap, sync: &mut BakeSync) {
+        for (index, key, view) in host.shown_early() {
+            let _ = crate::residency::take_staging_deferred();
+            readable(list, ResourceType::Srv, &view);
+            let _ = crate::residency::take_staging_deferred();
+            match crate::descriptor::host::view_copy(&view) {
+                Some(copy) if crate::pool::fill::ready_for(&copy, list) => {
+                    crate::pool::fill::EARLY_SHOWN[1].fetch_add(1, Ordering::Relaxed);
+                    sync.keep.push(copy);
+                }
+                _ => host.hold_unfilled(index, key),
+            }
+        }
     }
 
     /// Counts a bake draw recorded while slots of its heap still showed a
@@ -3096,6 +3120,20 @@ impl State {
                 host.texture_slot_flip(list, index, handle);
             }
             if late && let Some(handle) = heap.handle(index) {
+                host.texture_slot_show_after(list, index, handle);
+            }
+            // A slot made above with the stand-in for a texture cut from a
+            // block that no upload had filled (`crate::pool::fill`): shown
+            // once this list, which uploads it now, has run.
+            if !late
+                && !shows_other
+                && !sync_bake
+                && ahead.is_none()
+                && let Some(handle) = heap.handle(index)
+                && !host.texture_slot_made_from(index, handle)
+                && crate::resource::made_copy(resource)
+                    .is_some_and(|copy| !copy.fill.ready() && crate::pool::fill::ready_for(&copy, list))
+            {
                 host.texture_slot_show_after(list, index, handle);
             }
             #[cfg(feature = "diagnostics")]
@@ -3875,11 +3913,36 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+        // What the slot shows is read first, so its upload is this list's
+        // before the slot is made: a texture cut from a block that no upload
+        // filled yet is then shown at once to a list that uploads it
+        // (`crate::pool::fill`), not the stand-in and then the texture (which
+        // made the descriptor twice, put a passing grey in the shared title
+        // slot, and counted every first read as stood in).
+        let read_first = crate::descriptor::host::HostHeap::view_in(handle);
+        if let Some(view) = &read_first {
+            readable(list, u.kind, view);
+        }
+        if let Some(view) = host.mirror_listed(index, handle, list) {
+            if read_first.is_none() {
+                readable(list, u.kind, &view);
+            }
+            // Still the stand-in, yet uploaded by this list: made again. One
+            // whose upload this list could not have stays the texture pass's.
+            let mut stays = false;
+            if host.shows_none(index)
+                && let Some(copy) = crate::descriptor::host::view_copy(&view)
+                && !copy.fill.ready()
+            {
+                if crate::pool::fill::ready_for(&copy, list) {
+                    host.mirror_listed(index, handle, list);
+                } else {
+                    stays = true;
+                }
+            }
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
+                host.texture_slot_tabled(index, !stays);
             } else {
                 host.slot_tabled(index);
             }
@@ -4092,6 +4155,10 @@ impl State {
                             }
                         }
                     }
+                    // (As below for a view made here.)
+                    if listed.unfilled {
+                        host.listed_stand_in(recording, words, index, list);
+                    }
                     if let Some(title) = title_first
                         && listed.texture
                         && listed.tabled != Some((title + k, kind.is_some()))
@@ -4109,7 +4176,9 @@ impl State {
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(view @ View::Constant(_, 0)) => host.make_at(index, &view),
+                    Some(view @ View::Constant(_, 0)) => {
+                        host.make_at(index, &view);
+                    }
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
@@ -4134,12 +4203,20 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let unfilled = host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
+                        }
+                        // A texture cut from a block that no upload filled yet,
+                        // and this list does not upload it either: what the
+                        // block's last texture left (`crate::pool::fill`).
+                        if let Some(copy) = unfilled
+                            && !crate::pool::fill::ready_for(&copy, list)
+                        {
+                            host.stand_in_at(index, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -5281,6 +5358,35 @@ mod bake_tests {
         assert_eq!(host.shown_resource(5).map(|r| r.as_raw()), Some(copy.as_raw()));
         assert_eq!(host.stand_ins_left(), [0, 0]);
         drop(other);
+    }
+
+    /// A title slot a draw's table showed at once to a list that uploads the
+    /// texture cut from a block it shows, before that list was sent, has its
+    /// upload in the bake's own list first: a bake reads slots by index and
+    /// may reach the card ahead of the other list (`crate::pool::fill`).
+    /// Then it is told to no later bake.
+    #[test]
+    fn a_bake_uploads_first_a_slot_shown_to_a_list_not_sent_yet() {
+        use crate::descriptor::host::tests::{unfilled_texture, write_record};
+        let Some((texture, copy)) = unfilled_texture() else { return };
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 8) else { return };
+        let gpu = crate::host::host().unwrap();
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, View::Shader(texture as usize, None));
+        let other = gpu.new_list().unwrap();
+        crate::pool::fill::uploading(&other, &copy);
+        assert!(heap.mirror_listed(1, handle, &other).is_some());
+        assert!(!heap.shows_none(1), "shown to the list that uploads it");
+        let bake = gpu.new_list().unwrap();
+        let mut sync = BakeSync { publish: Vec::new(), keep: Vec::new() };
+        State::bake_shown_early(&bake, &heap, &mut sync);
+        assert!(crate::pool::fill::ready_for(&copy, &bake), "the bake's list uploads it");
+        assert!(sync.keep.iter().any(|c| std::sync::Arc::ptr_eq(c, &copy)));
+        assert!(heap.shown_early().is_empty());
+        for list in [bake, other] {
+            list.close();
+            list.reset();
+        }
     }
 }
 

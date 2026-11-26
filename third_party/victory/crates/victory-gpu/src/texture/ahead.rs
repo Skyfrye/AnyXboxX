@@ -132,6 +132,13 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
     };
+    // Zeros of a texture cut where another lay run first on the lists'
+    // queue, or not at all: this upload writes every level
+    // (`crate::pool::fill`).
+    if !crate::pool::fill::for_copy_queue(&copy) {
+        copy.ahead.store(NONE, Relaxed);
+        return turned_down();
+    }
     if super::no_wait() && super::fill_unlocked() {
         staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
     }
@@ -324,6 +331,7 @@ fn finish(jobs: Vec<Arc<Job>>) {
         job.staging.uploaded.store(true, Relaxed);
         job.staging.dirty.store(false, Relaxed);
         job.staging.note_held();
+        crate::pool::fill::written(&job.copy);
         job.copy.ahead.store(DONE, Relaxed);
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
