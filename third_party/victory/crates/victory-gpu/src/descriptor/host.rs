@@ -536,6 +536,27 @@ fn view_dimension(view: &View) -> u32 {
     }
 }
 
+/// The format (`DXGI_FORMAT`) texture view `view` reads its texture as:
+/// what its description says, or for a view of a texture object made
+/// without one, the texture's own. 0: none known.
+fn view_format(view: &View) -> u32 {
+    match view {
+        View::Placed(false, _, desc) => desc[0],
+        View::Shader(_, Some(desc)) => desc[0],
+        View::Shader(r, None) => crate::resource::own_format(*r as crate::object::This),
+        _ => 0,
+    }
+}
+
+/// Whether texture view `view` reads integers (a `UINT` or `SINT` format).
+/// The [`neutral`] stand-in's UNORM texels are no defined value to such a
+/// read (in practice float bits, some 0x3F008081: an index read from it goes
+/// far out of range, on NVIDIA and RADV alike), where a null view's zeros
+/// are defined for every type.
+fn integer_view(view: &View) -> bool {
+    crate::pipeline::host::integer_format(DXGI_FORMAT(view_format(view) as i32))
+}
+
 /// The stand-in kind and view description for a texture view of SRV
 /// dimension `dimension`; `None` for a dimension that has none (buffers,
 /// multisampled textures).
@@ -595,9 +616,10 @@ fn neutral_desc(dimension: u32) -> Option<(Neutral, D3D12_SHADER_RESOURCE_VIEW_D
 
 /// Makes the descriptor of the [`neutral`] texture of `view`'s dimension
 /// for a slot of `view` at `at`; a null one of its kind if it has none
-/// (multisampled textures, buffers).
+/// (multisampled textures, buffers) or reads integers ([`integer_view`]).
 fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    let Some((kind, desc)) = neutral_desc(view_dimension(view)) else {
+    let stands = !integer_view(view);
+    let Some((kind, desc)) = neutral_desc(view_dimension(view)).filter(|_| stands) else {
         null_for(view, at);
         return None;
     };
@@ -5359,8 +5381,14 @@ impl Kin {
     }
 }
 
-/// [`Kin`] of the view `old`, which a slot shows, and `new`.
+/// [`Kin`] of the view `old`, which a slot shows, and `new`. A shader that
+/// reads integers through the new view reads nothing defined through an old
+/// one of floats, nor the other way round: of another kind, whatever else
+/// they share.
 fn kin(old: &View, new: &View) -> Kin {
+    if integer_view(old) != integer_view(new) {
+        return Kin::None;
+    }
     if same_placed_texture(old, new) {
         return Kin::Same;
     }
@@ -6061,6 +6089,47 @@ mod tests {
         assert_eq!(kin(&old, &View::Shader(flat as usize, None)), Kin::Other);
         assert_eq!(kin(&View::Shader(flat as usize, None), &old), Kin::Other);
         assert_eq!(kin(&old, &View::Shader(volume as usize, None)), Kin::None);
+    }
+
+    /// A texture view that reads integers gets a null view while it waits,
+    /// not the stand-in, whose UNORM texels read as nothing defined there;
+    /// and a slot that shows a texture read as floats does not go on showing
+    /// it for a view of integers, nor the other way round.
+    #[test]
+    fn views_of_integers_get_no_stand_in_and_keep_no_texture_of_floats() {
+        let Some(host) = host() else { return };
+        // SAFETY: plain heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        // SAFETY: a heap of ours, alive to the end of the test.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let view = |format: u32| View::Shader(0, Some([format, 4, 5768, 0, 0, 1, 0, 1, 0, 0]));
+        // R8G8B8A8_UNORM, R32_FLOAT, BC7_UNORM: the stand-in.
+        for format in [28, 41, 98] {
+            assert!(neutral_for(&view(format), at).is_some(), "format {format}");
+        }
+        // R32_UINT, R8G8B8A8_SINT, R16_UINT: null.
+        for format in [42, 32, 57] {
+            assert!(neutral_for(&view(format), at).is_none(), "format {format}");
+        }
+        let floats = placed_2d(0x7fee_3400_0000, 98);
+        let other = |format: u32| {
+            let mut view = placed_2d(0x7fee_3408_0000, format);
+            if let View::Placed(_, resource, _) = &mut view {
+                (resource[4], resource[6], resource[8]) = (128, 32, format);
+            }
+            view
+        };
+        assert_eq!(kin(&floats, &other(28)), Kin::Other);
+        assert_eq!(kin(&floats, &other(42)), Kin::None);
+        assert_eq!(kin(&other(42), &floats), Kin::None);
+        assert_eq!(kin(&other(42), &other(57)), Kin::Other);
     }
 
     /// A slot that shows a texture and is written with a view of another
