@@ -5124,6 +5124,10 @@ impl<'a> Lower<'a> {
     /// (`f` is an f32 result of two halves here; rounding it again to 16 bits gives the
     /// rounding of the exact result, 24 bits being more than twice 11 and two.)
     fn f16_nearest(&mut self, f: V) -> V {
+        // (on 32-lane hosts the same rounding from the bits, at a third of the cost)
+        if host_max_wave() == 32 {
+            return self.f16_nearest_bits(f);
+        }
         let c = self.cur;
         let f32t = self.s.t.f32;
         let lo = self.f16_toward_zero(f);
@@ -5151,6 +5155,54 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, tie, odd);
         let up = self.s.m.bin(c, Bin::Or, nearer, tie);
         self.s.m.select(c, up, hi, lo)
+    }
+
+    /// [`Self::f16_nearest`] from `f`'s bits, without the host's conversion but for NaN
+    /// (which stays what that conversion makes of it, as there): the same half for every
+    /// other f32, in about 18 integer operations and one f32 addition, where the other takes
+    /// four conversions and some 20 operations more (VALU f16 results on NVIDIA, the
+    /// verifier's measurement of the combined base's card time).
+    /// - From 2^-14 (a normal half): the f32 rebased to the half's exponent, plus a half step
+    ///   less one and the bit that ends up last (ties to even), its top bits taken; up to
+    ///   65520 that is also where it rounds to infinity.
+    /// - Below (subnormal halves and zero): added to 0.5, whose f32 step is the subnormal
+    ///   halves' (2^-24), so the f32 addition rounds to nearest as IEEE (and D3D) round it;
+    ///   the bits past 0.5's are the half.
+    /// - From 65536, infinity included: infinity.
+    fn f16_nearest_bits(&mut self, f: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let x = self.as_int(f);
+        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+        let (abs, k13, one) = (k(self, 0x7FFF_FFFF), k(self, 13), k(self, 1));
+        let a = self.s.m.bin(c, Bin::And, x, abs);
+        let odd = self.s.m.bin(c, Bin::LShr, a, k13);
+        let odd = self.s.m.bin(c, Bin::And, odd, one);
+        // (15 - 127) << 23, plus 0xFFF: wrapping
+        let rebase = k(self, 0xC800_0FFF);
+        let n = self.s.m.bin(c, Bin::Add, a, rebase);
+        let n = self.s.m.bin(c, Bin::Add, n, odd);
+        let normal = self.s.m.bin(c, Bin::LShr, n, k13);
+        let half = self.s.m.f32(0.5f32.to_bits());
+        let fa = self.as_float(a);
+        let s = self.s.m.bin(c, Bin::Add, fa, half);
+        let s = self.as_int(s);
+        let magic = k(self, 0x3F00_0000);
+        let small = self.s.m.bin(c, Bin::Sub, s, magic);
+        let min_normal = k(self, 0x3880_0000);
+        let tiny = self.s.m.cmp(c, pred::IULT, a, min_normal);
+        let h = self.s.m.select(c, tiny, small, normal);
+        let (top, infinity) = (k(self, 0x4780_0000), k(self, 0x7C00));
+        let big = self.s.m.cmp(c, pred::IUGE, a, top);
+        let h = self.s.m.select(c, big, infinity, h);
+        let (sign_bit, k16) = (k(self, 0x8000_0000), k(self, 16));
+        let sign = self.s.m.bin(c, Bin::And, x, sign_bit);
+        let sign = self.s.m.bin(c, Bin::LShr, sign, k16);
+        let h = self.s.m.bin(c, Bin::Or, h, sign);
+        let nan_from = k(self, 0x7F80_0000);
+        let nan = self.s.m.cmp(c, pred::IUGT, a, nan_from);
+        let host = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+        self.s.m.select(c, nan, host, h)
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
