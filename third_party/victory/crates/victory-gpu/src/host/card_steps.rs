@@ -615,6 +615,30 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line: the submissions [`Host::card_steps`]
+/// refused, by why (the reasons are the plan's own words, a few dozen at
+/// most). Only under diagnostics did a line name them, and the frame line
+/// of a release run showed one refused submission a frame, standing some
+/// 60 ms, with nothing to say which check it failed.
+static REFUSED: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+/// A submission was refused for `why`.
+fn refused_for(why: &'static str) {
+    let mut all = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter_mut().find(|(w, _)| *w == why) {
+        Some((_, n)) => *n += 1,
+        None => all.push((why, 1)),
+    }
+}
+
+/// The refusals since the last call, the most frequent first, each with how
+/// many there were.
+fn refusals() -> Vec<(&'static str, u64)> {
+    let mut all = std::mem::take(&mut *REFUSED.lock().unwrap_or_else(|e| e.into_inner()));
+    all.sort_by_key(|&(why, n)| (std::cmp::Reverse(n), why));
+    all
+}
+
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
 /// list by address, their place in it).
@@ -681,9 +705,9 @@ impl Host {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                refused_for(why);
                 #[cfg(feature = "diagnostics")]
                 refused(why);
-                let _ = why;
                 None
             }
         }
@@ -916,6 +940,11 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    let refused = refusals();
+    if !refused.is_empty() {
+        let named: Vec<String> = refused.iter().take(4).map(|(why, n)| format!("{:.2} {why}", *n as f64 / frames)).collect();
+        tracing::info!("submissions the card's steps refused, per frame, by why: {}", named.join("; "));
+    }
     #[cfg(feature = "diagnostics")]
     {
         let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1166,6 +1195,23 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// Refusals are told by why, the most frequent first, and taken once.
+    #[test]
+    fn refusals_are_counted_by_why() {
+        // (Other tests may refuse meanwhile: only these reasons are asserted.)
+        const A: &str = "a test's first reason";
+        const B: &str = "a test's second reason";
+        for why in [A, B, B, A, B] {
+            refused_for(why);
+        }
+        let all = refusals();
+        let of = |r: &str| all.iter().find(|(w, _)| *w == r).map(|(_, n)| *n);
+        assert_eq!((of(A), of(B)), (Some(2), Some(3)));
+        let (a, b) = (all.iter().position(|(w, _)| *w == A), all.iter().position(|(w, _)| *w == B));
+        assert!(b < a, "the most frequent first");
+        assert!(refusals().iter().all(|(w, _)| *w != A && *w != B), "taken once");
     }
 
     /// Reads are all before writes, between two buffers and within one, and
