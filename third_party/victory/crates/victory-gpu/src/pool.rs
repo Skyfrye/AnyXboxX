@@ -932,32 +932,10 @@ mod tests {
         assert_eq!(crate::host::references(&heap), before);
     }
 
-    /// A texture cut from a block is told so, and whether its piece held
-    /// another texture before (`crate::pool::fill`), for as long as it lives:
-    /// its address may be another resource's after.
-    #[test]
-    fn a_pooled_texture_is_told_for_as_long_as_it_lives() {
-        let Some(host) = crate::host::host() else { return };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 128,
-            Height: 128,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            ..Default::default()
-        };
-        // SAFETY: a valid description.
-        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
-        let raw = t.as_raw() as usize;
-        assert!(placed(&t).is_some());
-        drop(t);
-        assert!(!lock(&PLACED).contains_key(&raw));
-    }
-
     /// A pooled texture's piece comes back when its last reference goes, not
-    /// before; its staging piece begins as zeros.
+    /// before; while it lives it is told as cut from a block
+    /// (`crate::pool::fill`), and not after (its address may be another
+    /// resource's then); its staging piece begins as zeros.
     #[test]
     fn a_texture_gives_its_piece_back_when_it_goes() {
         let Some(host) = crate::host::host() else { return };
@@ -974,6 +952,8 @@ mod tests {
         // SAFETY: a valid description.
         let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
         assert_eq!(crate::host::references(&t), 1, "what the texture holds is no reference to it");
+        let raw = t.as_raw() as usize;
+        assert!(placed(&t).is_some());
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();
         let other = t.clone();
@@ -981,6 +961,7 @@ mod tests {
         assert_eq!(resting(), before);
         drop(other);
         assert_eq!(resting(), before + 1);
+        assert!(!lock(&PLACED).contains_key(&raw));
         // SAFETY: the piece's mapping, 4096 bytes of it ours.
         unsafe {
             let (piece, _, at, data) = staging(host, 4096).unwrap();
