@@ -1306,7 +1306,10 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        // (a file of its own for each dump: tests dump at once)
+        static DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!("victory-interp-{}-{n}.dxil", std::process::id()));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -1414,6 +1417,78 @@ mod tests {
             "clamp saturates the result"
         );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
+    }
+
+    /// `v_interp_p2_f16`'s result rounds to nearest on hosts of 32-lane waves (NVIDIA, whose
+    /// `f32tof16` rounds toward zero): the rounding from the bits (`Lower::f16_nearest_bits`,
+    /// its rebasing constant 0xC8000FFF), where other hosts keep their own conversion.
+    #[cfg(windows)]
+    #[test]
+    fn interpolated_f16_rounds_to_nearest_on_32_lane_hosts() {
+        let words = [
+            0x7E06_0301u32, // v_mov_b32 v3, v1
+            0xC808_0000,    // v_interp_p1_f32 v2, v0, attr0.x
+            0x35u32 << 26 | 0x35au32 << 16 | 3,
+            (256 + 1) << 9 | (256 + 2) << 18, // v_interp_p2_f16 v3, attr0, v1, v2
+            0xF800_180F,
+            0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 2,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, usage, half| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half,
+        };
+        let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0, true)], true);
+        let osg1 = super::container::signature(&[el("SV_Target", 16, 15, false)], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let on = |host_wave: u32| {
+            let was = super::lower::TEST_HOST_WAVE.replace(Some(host_wave));
+            let dxil = super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil;
+            super::lower::TEST_HOST_WAVE.set(was);
+            dxil
+        };
+        let (Some(nvidia), Some(other)) = (dump_dxil(&on(32)), dump_dxil(&on(64))) else {
+            eprintln!("no dxc.exe; DXIL check skipped");
+            return;
+        };
+        assert!(nvidia.contains("-939520001"), "the rounding from the bits on 32-lane hosts");
+        assert!(!other.contains("-939520001"), "the host's own conversion elsewhere");
     }
 
     #[test]

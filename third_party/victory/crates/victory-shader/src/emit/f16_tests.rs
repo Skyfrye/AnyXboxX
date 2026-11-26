@@ -1,7 +1,8 @@
 //! 16-bit float results on hosts of 32-lane waves (NVIDIA, whose `f32tof16` rounds toward
 //! zero, as WARP's does): rounded to nearest, ties to even, as the console rounds them, from
-//! the f32's bits (`Lower::f16_nearest_bits`). Lowered, validated by `dxil.dll` when present,
-//! and run on the hardware device and WARP.
+//! the f32's bits (`Lower::f16_nearest_bits`), d16 image reads included, which took the host's
+//! own conversion before. Lowered, validated by `dxil.dll` when present, and run on the
+//! hardware device and WARP.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -238,4 +239,66 @@ fn f16_results_from_the_bits_round_as_the_console_for_every_kind_of_f32() {
     }
     assert!(ran > 0, "no SM 6.6 device");
     eprintln!("ran on {ran} device(s): 655,360 f32s rounded to halves as the console rounds them");
+}
+
+/// A wave32 compute program of one thread: `image_load` with d16 of texel (0, 0) of the
+/// RGBA32F texture at table entry 0 (its red and green, one dword), stored to the raw UAV at
+/// entry 2. Red holds 1 + 0.75 of a half's step, green 1 + 1.75: to nearest 0x3C01 and
+/// 0x3C02, toward zero (the host's conversion on NVIDIA and WARP) 0x3C00 and 0x3C01.
+#[test]
+fn d16_image_reads_round_to_nearest_on_32_lane_hosts() {
+    let words = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0501, // s_load_dwordx4 s[20:23], s[2:3], 64
+        0xFA00_0040,
+        0xF40C_0201, // s_load_dwordx8 s[8:15], s[2:3], 0
+        0xFA00_0000,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xF000_1308, // image_load v2, v[0:1], s[8:15] dmask:0x3 dim:2D unorm d16
+        0x8002_0200,
+        0xE070_0000, // buffer_store_dword v2, off, s[20:23], 0
+        0x8005_0200,
+        S_ENDPGM,
+    ];
+    let param = |root, user_data| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot: 0,
+    };
+    let range = |kind, table_offset_dwords, dwords| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride: 0,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![param(RootType::Table, 0), param(RootType::ResourceHeap, 1)],
+        used: vec![range(ResourceType::Srv, 0, 8), range(ResourceType::Uav, 16, 4)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let shader = lowered(&native, 32);
+    let texel = [[f32::from_bits(0x3F80_1800), f32::from_bits(0x3F80_3800), 0.0, 1.0]];
+    let views = [View::Texture(1, 1, &texel), View::Texture(1, 1, &texel), View::RawUav(1)];
+    let mut ran = 0;
+    for (label, got) in super::waterfall_tests::run(&shader, &views) {
+        assert_eq!(got[0], 0x3C02_3C01, "{label}: d16 red and green");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device");
 }

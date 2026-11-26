@@ -393,6 +393,23 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
     }
 }
 
+/// A d16 typed load of an f32 (`tbuffer_load_format_d16_x`, 32_FLOAT) rounds to nearest on
+/// hosts of 32-lane waves, as the console does: 1 + 0.75 of a half's step is 0x3C01 (the
+/// host's conversion on NVIDIA and WARP gave 0x3C00), 1 + 0.5 a tie to even 0x3C00, and
+/// 1 + 1.5 steps 0x3C02.
+#[test]
+fn d16_typed_loads_of_floats_round_to_nearest_on_32_lane_hosts() {
+    let cases: &[(u32, u32)] = &[(0x3F80_1800, 0x3C01), (0x3F80_1000, 0x3C00), (0x3F80_3000, 0x3C02)];
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = tbuffer_load_of_v1(8, 22);
+    lower::TEST_HOST_WAVE.set(was);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (x, want) = cases[i];
+        assert_eq!(got, want, "{backend}: d16 of the f32 {x:#010x} = {got:#010x}, want {want:#010x}");
+    });
+}
+
 #[test]
 fn normalized_buffer_formats_load_their_ends_exactly() {
     // tbuffer_load_format_x.
@@ -2530,6 +2547,81 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
             );
         }
     }
+}
+
+/// `buffer_load_format_d16_x` of an R32_FLOAT typed view rounds the f32 to nearest on hosts of
+/// 32-lane waves, as the console does: 1 + 0.75 of a half's step and 1 + 1.75 are 0x3C01 and
+/// 0x3C02 (the host's conversion on NVIDIA and WARP gave 0x3C00 and 0x3C01).
+#[test]
+fn d16_buffer_loads_of_float_views_round_to_nearest_on_32_lane_hosts() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
+    let mut body = Vec::new();
+    // s[8:11] = table[0] (the typed view), s[16:19] = table[2] (raw UAV).
+    body.extend_from_slice(&s_load_dwordx4_off(8, 4, 0));
+    body.extend_from_slice(&s_load_dwordx4_off(16, 4, 64));
+    // buffer_load_format_d16_x v2, v0, s[8:11], 0 idxen (op 0x80)
+    body.extend_from_slice(&mubuf_idxen(0x80, 2, 0, 8));
+    body.push(0x3408_0082); // v_lshlrev_b32 v4, 2, v0
+    // buffer_store_dword v2, v4, s[16:19], 0 offen (op 0x1C, offen bit 12)
+    body.extend_from_slice(&[
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | (16u32 >> 2) << 16 | (2u32 << 8) | 4u32,
+    ]);
+    let used = (0..3u32)
+        .map(|k| UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: k * 8,
+            lower_bound: k,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 0,
+        })
+        .collect();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = build_table_typed_cs(&body, used);
+    lower::TEST_HOST_WAVE.set(was);
+    let input = [0x3F80_1800u32, 0x3F80_3800, 0x3F80_1000, 0xBF80_1800];
+    let want = [0x3C01u32, 0x3C02, 0x3C00, 0xBC01];
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
+        let views = [
+            View::TypedUav { data: &input, format: DXGI_FORMAT_R32_FLOAT, elem_bytes: 4 },
+            View::RawUav(4),
+            View::RawUav(4),
+        ];
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Table && u.slot == 0 {
+                ud[u.index as usize] = 0;
+            }
+        }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES) {
+            roots.push((1, Root::View { srv: true, data: vec![4, 1, 1] }));
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots,
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{backend}: dispatch failed: {e}"));
+        assert_eq!(out[2], want, "{backend}: buffer_load_format_d16_x of R32_FLOAT");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device");
 }
 
 /// Non-`d16` typed loads (`buffer_load_format_x`) are used by

@@ -5205,6 +5205,19 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, nan, host, h)
     }
 
+    /// The f16 of an f32 result kept in 16 bits (d16 image and typed buffer reads, f16
+    /// interpolation): on hosts of 32-lane waves (NVIDIA, whose `f32tof16` rounds toward
+    /// zero, as WARP's does) rounded to nearest as the console rounds it, as
+    /// [`Self::f16_result`] rounds VALU results; on other hosts the host's conversion, as
+    /// before.
+    fn d16_half(&mut self, f: V) -> V {
+        if host_max_wave() == 32 {
+            return self.f16_result(f);
+        }
+        let i32t = self.s.t.i32;
+        self.s.op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+    }
+
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
     /// top bit when `signed`; widths from 32 on take every bit. A signed
     /// field that runs past bit 31 extends from bit 31, as the hardware
@@ -8833,9 +8846,8 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.i32(0xFFFF);
                 self.s.m.bin(c, Bin::And, x, m)
             } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                let f = self.as_float(x);
+                self.d16_half(f)
             });
         }
         let mut out = Vec::new();
@@ -12424,10 +12436,7 @@ impl<'a> Lower<'a> {
                         None => Ok(None),
                     }
                 };
-                let to_f16 = |l: &mut Self, f: V| {
-                    let i32t = l.s.t.i32;
-                    l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-                };
+                let to_f16 = |l: &mut Self, f: V| l.d16_half(f);
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {
@@ -13372,10 +13381,9 @@ impl<'a> Lower<'a> {
             };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                // nearest even where the host's conversion does not,
+                // `d16_half`); integer formats would keep 16 bits.
+                self.d16_half(x)
             } else {
                 self.as_int(x)
             });
@@ -13947,14 +13955,11 @@ impl<'a> Lower<'a> {
             // 16 bits of an integer view's (see the stores above).
             let integer = if typed { self.integer_view(src)? } else { None };
             let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let mut h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let mut h = self.d16_half(f);
                     if let Some((int, _)) = integer {
                         let bits = self.as_int(f);
                         let low = self.s.m.i32(0xFFFF);
