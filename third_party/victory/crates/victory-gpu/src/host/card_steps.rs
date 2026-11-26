@@ -865,6 +865,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        let timed = own.list.timed_begin(super::ours::Kind::Steps);
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
@@ -883,6 +884,7 @@ impl Host {
             }
             let _ = record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
+        own.list.timed_end(timed);
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };

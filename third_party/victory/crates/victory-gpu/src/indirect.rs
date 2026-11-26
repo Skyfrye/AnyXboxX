@@ -439,7 +439,9 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
+    let timed = list.timed_begin(crate::host::ours::Kind::Clamps);
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    list.timed_end(timed);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -602,7 +604,9 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    let timed = list.timed_begin(crate::host::ours::Kind::Clamps);
     batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    list.timed_end(timed);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
