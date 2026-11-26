@@ -5749,7 +5749,10 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // Placed in a block made once (`crate::pool::copies`).
+    let host = host()?;
+    let bytes = len.next_multiple_of(256);
+    let (buffer, data) = crate::pool::copies::buffer(&host.device, bytes).or_else(|| host.shared_buffer(bytes))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5772,9 +5775,10 @@ pub(crate) fn exact_line(frames: f64) {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let placed = crate::pool::copies::line(frames).unwrap_or_default();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept; their buffers: {placed}",
         asked as f64 / frames,
         made as f64 / frames
     );
