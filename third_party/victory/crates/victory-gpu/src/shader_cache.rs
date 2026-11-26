@@ -143,8 +143,23 @@ fn build() -> [u8; 32] {
     });
     let mut hash = blake3::Hasher::new();
     hash.update(fixed);
-    for value in victory_shader::emit::host_settings() {
+    let settings = victory_shader::emit::host_settings();
+    for value in settings {
         hash.update(&value.to_le_bytes());
+    }
+    // The forms only hosts of 32-lane waves get, and their switches: in the key of those
+    // hosts' translations only, so that a 64-lane host keeps its entries when only these
+    // change (`victory_shader::WAVE32_REVISION`).
+    if settings[0] == 32 {
+        hash.update(&victory_shader::WAVE32_REVISION.to_le_bytes());
+        for name in ["VICTORY_WAVE_PAIRS", "VICTORY_WAVE_LDS_LOOSE", "VICTORY_INACTIVE_LANES"] {
+            hash.update(name.as_bytes());
+            hash.update(b"=");
+            if let Some(value) = std::env::var_os(name) {
+                hash.update(value.as_encoded_bytes());
+            }
+            hash.update(&[0]);
+        }
     }
     *hash.finalize().as_bytes()
 }
