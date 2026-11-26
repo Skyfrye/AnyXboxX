@@ -509,6 +509,25 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     out
 }
 
+/// Whether some 64 KiB page of `[start, end)` is shown at more than `most`
+/// addresses, its own included.
+pub(crate) fn shown_in_more_than(start: usize, end: usize, most: usize) -> bool {
+    let v = views();
+    if start >= end || v.pages_twice == 0 {
+        return false;
+    }
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
+        let from = start.max(base) & !(K64 - 1);
+        for page in (from..end.min(base + bytes)).step_by(K64) {
+            if v.pages.get(&(section, offset + (page - base) as u64)).is_some_and(|shown| shown.len() > most) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

@@ -929,6 +929,28 @@ mod tests {
         at
     }
 
+    /// The title writes through another view of the slot's page, which then
+    /// rests open: a slot read meanwhile at the first view cannot count on a
+    /// fault for the alias's next write, and is read again at a pass to
+    /// come. (The first view stayed read-only, but not clean, and was taken
+    /// for whole: the alias's writes reached nobody; round 1's review probe.)
+    #[test]
+    fn a_slot_whose_alias_rests_open_is_read_again() {
+        const SIZE: usize = PAGE;
+        TEST_ON.set(Some(true));
+        let (_, one, two) = kept_views(SIZE);
+        let mut watchers = Watchers::default();
+        assert_eq!(watch(&mut watchers, 1, one, SIZE), Kept::Told);
+        crate::watch::REST_IN_TEST.set(std::time::Duration::from_secs(60));
+        // SAFETY: the second view, read-write once the handler opened it.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert_eq!(watchers.moved(), [1]);
+        let kept = watch(&mut watchers, 1, one, SIZE);
+        crate::watch::REST_IN_TEST.set(std::time::Duration::ZERO);
+        assert_eq!(kept, Kept::Open, "the alias rests open: not whole");
+        assert_eq!(watchers.reopen(), [1]);
+    }
+
     /// A block the title has just written rests open (`crate::watch`'s
     /// guard rest): a slot read meanwhile could not count on a fault for the
     /// next write, and is read again at a pass to come, guarded then.

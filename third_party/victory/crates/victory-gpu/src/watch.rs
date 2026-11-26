@@ -2722,29 +2722,50 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// the title's next write (`crate::pagegen::arm`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Armed {
-    /// Every block is read-only by our hand, or known unmapped (its mapping
-    /// is told): the title's next write to any of it faults.
+    /// Every block is read-only by our hand at every view of its page
+    /// (clean), or known unmapped (its mapping is told): the title's next
+    /// write to any of it, through whichever view, faults.
     Whole,
     /// Some are left open for now (written just now and resting, or the
-    /// kernel or a change of mapping at work there): guarded at an asking
-    /// soon.
+    /// kernel or a change of mapping at work there), here or at another view
+    /// of their page: guarded at an asking soon.
     Soon,
     /// Some are not guarded here at all (other memory, a protection that
-    /// failed).
+    /// failed), or their page is shown at views the guards leave alone (more
+    /// than [`MANY_VIEWS`], or any other with `VICTORY_VIEW_GUARD=0`).
     Never,
 }
 
 /// See [`Armed`].
+///
+/// A block read-only here but not clean is not whole: another view of its
+/// page could not be made read-only ([`cover`]: it rests after a write, is
+/// left alone, or is being changed), and the title writes through that one
+/// with no fault. It was taken for whole, and the slot read then kept the
+/// bytes from before for as long as nobody guarded that view again (the
+/// texture "painted through another view": 102 of the 103 such of run nb1).
 pub(crate) fn armed(start: usize, end: usize) -> Armed {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return Armed::Whole;
     }
+    let most = if view_guard() { MANY_VIEWS } else { 1 };
+    if crate::inplace::shown_in_more_than(start, end, most) {
+        return Armed::Never;
+    }
     let g = guards_timed_shared();
     let rest = rest();
     let mut soon = false;
     for block in first..last {
-        if g.protected.contains(block) || g.absent.contains(block) {
+        if g.absent.contains(block) {
+            continue;
+        }
+        if g.protected.contains(block) {
+            // (A block the title's bytes were put in beside the guard is
+            // clean too, until an asking takes its bit: at the next.)
+            if !g.clean.contains(block) || BESIDE.any(block, block + 1) {
+                soon = true;
+            }
             continue;
         }
         if g.left_alone(block) || g.rests(block, rest) {
@@ -5321,6 +5342,25 @@ pub(crate) mod tests {
         assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
         assert!(!writable(two) && writable(two + BLOCK) && !writable(two + 2 * BLOCK));
         drop_views(section, &[one, two], SIZE);
+    }
+
+    /// A page shown in more than `MANY_VIEWS` views is guarded at each by
+    /// itself: memory there is never armed whole for a texture slot, which
+    /// looks at it by its digest instead (`crate::pagegen`).
+    #[test]
+    fn a_page_of_many_views_is_never_armed_whole() {
+        let (section, one, two) = two_views(BLOCK);
+        assert_eq!(writes(one, one + BLOCK, true).map(|_| ()), Some(()));
+        assert_eq!(armed(one, one + BLOCK), Armed::Whole);
+        let filler = one + (1 << 44);
+        for n in 0..MANY_VIEWS {
+            crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
+        }
+        // Guarded again, at this view alone.
+        assert_eq!(writes(one, one + BLOCK, true).map(|_| ()), Some(()));
+        assert_eq!(armed(one, one + BLOCK), Armed::Never);
+        title_memory_remapped(filler, MANY_VIEWS * BLOCK);
+        drop_views(section, &[one, two], BLOCK);
     }
 
     /// A page shown in more than `MANY_VIEWS` views is guarded at each by
