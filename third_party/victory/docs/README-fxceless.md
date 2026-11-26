@@ -279,6 +279,7 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+| mouse, once a click on the picture (or F9) took it | right stick; left / right button: right / left trigger. F9 lets it go; `VICTORY_MOUSE=2` turns twice as far |
 
 ## Commands
 
