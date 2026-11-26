@@ -177,8 +177,12 @@ const COUNTERS: usize = 11;
 impl Counters {
     fn now() -> Counters {
         use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
-        use crate::copystat::{C, peek};
         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        // The recording time is counted in diagnostics builds only.
+        #[cfg(feature = "diagnostics")]
+        let recorded = crate::copystat::peek(crate::copystat::C::RecordNs);
+        #[cfg(not(feature = "diagnostics"))]
+        let recorded = 0;
         Counters([
             super::worked(),
             get(&CARD_CLOCK_US[0]),
@@ -189,7 +193,7 @@ impl Counters {
             get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
             crate::draw::dropped_now(),
-            peek(C::RecordNs),
+            recorded,
             crate::draw::drawn(),
         ])
     }
@@ -205,11 +209,21 @@ impl Counters {
     }
 }
 
+/// The process's working set and private bytes, in every build.
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.WorkingSetSize as u64, c.PagefileUsage as u64)
+}
+
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
 fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = crate::copystat::process_memory();
+    let (working, private) = process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
     vec![
@@ -362,7 +376,8 @@ impl Panel {
             return;
         }
         let began = Instant::now();
-        // Not the title's: the frame recorder leaves it out.
+        // Not the title's: the frame recorder leaves it out (diagnostics builds have one).
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
