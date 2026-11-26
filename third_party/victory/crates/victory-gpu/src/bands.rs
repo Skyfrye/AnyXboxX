@@ -106,6 +106,34 @@ impl Drop for Lowered {
     }
 }
 
+/// Threads of ours a frame waits for that keep a core busy, whatever the
+/// background does: the submitting thread, the relay, and the list threads'
+/// work (eight threads, about one and a half cores together in the world:
+/// 143 ms of their time in a frame of 91-100 ms, run nbc-measure).
+pub(crate) const FRAME_CRITICAL: usize = 3;
+
+/// The threads of a background pool on a processor of `physical` cores: the
+/// cores [`FRAME_CRITICAL`] leaves, 2 to 16. Cores, not logical processors:
+/// two of these on one core share its units, and every one of our background
+/// threads beyond the free cores runs only to be put aside again, holding
+/// what it holds (the driver's locks while it makes a pipeline).
+pub(crate) fn pool_for(physical: usize) -> usize {
+    physical.saturating_sub(FRAME_CRITICAL).clamp(2, 16)
+}
+
+/// The physical cores [`pool_for`] goes by: the system's count, else half
+/// the logical processors.
+pub(crate) fn physical_cores() -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CORES.get_or_init(|| {
+        crate::cores::physical_cores().unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(2, |n| n.get())
+                .div_ceil(2)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +177,27 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn background_pools_follow_the_cores_a_frame_leaves() {
+        // This machine's 8 cores (16 logical processors): 5, not 10 + 2.
+        assert_eq!(pool_for(8), 5);
+        assert_eq!(
+            [pool_for(0), pool_for(1), pool_for(4), pool_for(6)],
+            [2, 2, 2, 3]
+        );
+        assert_eq!(
+            [pool_for(12), pool_for(16), pool_for(24), pool_for(64)],
+            [9, 13, 16, 16]
+        );
+        // Counted once per core, a core having one or two logical processors.
+        let logical = std::thread::available_parallelism().unwrap().get();
+        let cores = crate::cores::physical_cores().expect("the system says");
+        assert!(
+            cores <= logical && cores * 2 >= logical,
+            "{cores} cores, {logical} logical processors"
+        );
+        assert_eq!(physical_cores(), cores);
     }
 }

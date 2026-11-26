@@ -93,6 +93,37 @@ fn l3_of_sets() -> Vec<(u32, u32)> {
     sizes
 }
 
+/// The processor cores of the system, of every group (a core runs one or two
+/// logical processors); `None` when the system does not say.
+pub(crate) fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore};
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut bytes) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+    let ok = unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, buffer.as_mut_ptr().cast(), &mut bytes) };
+    if ok == 0 {
+        return None;
+    }
+    let (mut cores, mut at) = (0, 0usize);
+    // Each record begins with its kind and its size (a core's is smaller than
+    // the type, which is as large as the largest kind).
+    while at + 8 <= bytes as usize {
+        // SAFETY: two u32s inside the buffer.
+        let (kind, size) = unsafe {
+            let record = buffer.as_ptr().cast::<u8>().add(at);
+            (record.cast::<i32>().read_unaligned(), record.add(4).cast::<u32>().read_unaligned())
+        };
+        if size == 0 {
+            break;
+        }
+        cores += usize::from(kind == RelationProcessorCore);
+        at += size as usize;
+    }
+    (cores > 0).then_some(cores)
+}
+
 /// Whether the cores of the largest last-level cache count as the fast
 /// ones where all cores are of one class (`VICTORY_CACHE_CORES=0`: not).
 /// On a processor with two core complexes of which one has the stacked cache

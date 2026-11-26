@@ -505,13 +505,14 @@ fn next(screens_only: bool) -> Arc<Pending> {
 }
 
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
-/// 64), else two thirds of the logical processors, 2 to 16. They run below the
-/// title's own threads, and a cold cache queues hundreds at once.
-fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) -> usize {
+/// 64), else a background pool for `physical` cores (`bands::pool_for`; at
+/// most 8 where the host's memory is short). A cold cache queues hundreds at
+/// once.
+fn worker_count_for(asked: Option<usize>, physical: usize, limited_ram: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
-        None if limited_ram => (processors * 3 / 4).clamp(2, 8),
-        None => (processors * 2 / 3).clamp(2, 16),
+        None if limited_ram => crate::bands::pool_for(physical).min(8),
+        None => crate::bands::pool_for(physical),
     }
 }
 
@@ -521,7 +522,7 @@ fn worker_count() -> usize {
     *COUNT.get_or_init(|| {
         worker_count_for(
             std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
+            crate::bands::physical_cores(),
             crate::residency::limited_host_ram(),
         )
     })
@@ -547,6 +548,8 @@ fn workers() -> bool {
         tracing::info!(
             workers,
             screens,
+            cores = crate::bands::physical_cores(),
+            frame_critical = crate::bands::FRAME_CRITICAL,
             priority = worker_priority(false),
             "pipeline workers"
         );
@@ -637,17 +640,24 @@ mod tests {
         assert_ne!(mappings.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
     }
 
+    /// By the physical cores a frame leaves (`bands::pool_for`): on this
+    /// machine's 8 cores, 16 logical processors, 5 workers, where two thirds
+    /// of the logical processors made 10.
     #[test]
-    fn worker_count_follows_the_processors_and_the_switch() {
+    fn worker_count_follows_the_cores_and_the_switch() {
+        assert_eq!(worker_count_for(None, 8, false), 5);
         assert_eq!(worker_count_for(None, 1, false), 2);
-        assert_eq!(worker_count_for(None, 24, false), 16);
+        assert_eq!(worker_count_for(None, 12, false), 9);
+        assert_eq!(worker_count_for(None, 16, false), 13);
         assert_eq!(worker_count_for(None, 64, false), 16);
         assert_eq!(worker_count_for(Some(0), 24, false), 1);
         assert_eq!(worker_count_for(Some(20), 24, false), 20);
-        assert_eq!(worker_count_for(None, 8, true), 6);
+        assert_eq!(worker_count_for(None, 8, true), 5);
         assert_eq!(worker_count_for(None, 16, true), 8);
-        assert_eq!(worker_count_for(None, 24, true), 8);
         assert_eq!(worker_count_for(Some(12), 8, true), 12);
+        if std::env::var_os("VICTORY_PIPELINE_WORKERS").is_none() && !crate::residency::limited_host_ram() {
+            assert_eq!(worker_count(), crate::bands::pool_for(crate::cores::physical_cores().unwrap()));
+        }
     }
 
     /// The workers run below every thread of the title, but those of passes
