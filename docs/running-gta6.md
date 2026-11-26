@@ -427,6 +427,7 @@ Keyboard or pad. With no XInput pad connected, the keyboard acts as a pad while 
 | F / H | stick clicks |
 | Escape | Menu |
 | Tab | View |
+| Mouse (click the picture or F9 to take it, F9 to let go) | right stick; left / right button: right / left trigger (`VICTORY_MOUSE` scales it) |
 
 Hold each key for a moment: the game reads its input at 30 Hz, so a very short tap can be missed. Later launches resume directly from the save.
 

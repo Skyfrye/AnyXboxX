@@ -427,6 +427,7 @@ Clavier ou manette. Sans manette XInput branchée, le clavier sert de manette ta
 | F / H | clics de sticks |
 | Échap | Menu |
 | Tab | View |
+| Souris (un clic sur l'image ou F9 la prend, F9 la lâche) | stick droit ; bouton gauche / droit : gâchette droite / gauche (`VICTORY_MOUSE` règle la vitesse) |
 
 Maintenez chaque touche un instant : le jeu lit l'entrée à 30 Hz, un appui très bref peut être manqué. Les lancements suivants reprennent directement la sauvegarde.
 
