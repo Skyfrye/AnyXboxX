@@ -36,6 +36,8 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Taken by a worker while a draw had asked for it (a draw waits for it).
+    was_asked: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -160,6 +162,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            was_asked: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -460,7 +463,8 @@ impl Queue {
             }
         }
         let p = p?;
-        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let was = p.queue_state.swap(MAKING, Ordering::Relaxed);
+        p.was_asked.store(was == REQUESTED, Ordering::Relaxed);
         Some(p)
     }
 }
@@ -532,9 +536,12 @@ fn worker_count() -> usize {
 /// title, the streaming pager's among them; those of passes over the screen,
 /// which a draw waits for up to [`screen_budget`], below normal.
 fn worker_priority(screens_only: bool) -> i32 {
-    use windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL;
-    if screens_only { THREAD_PRIORITY_BELOW_NORMAL } else { crate::bands::BACKGROUND }
+    if screens_only { ASKED_PRIORITY } else { crate::bands::BACKGROUND }
 }
+
+/// The priority a pipeline a draw waits for is made at: below normal, as
+/// the workers of passes over the screen run.
+const ASKED_PRIORITY: i32 = windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL;
 
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
@@ -565,15 +572,27 @@ fn workers() -> bool {
                     }
                     loop {
                         let p = next(screens_only);
-                        p.make();
+                        {
+                            // One a draw asked for is waited for (up to
+                            // the budget, by the thread holding the
+                            // recording): made at the screen workers'
+                            // priority, not below the title's threads.
+                            let _asked = p
+                                .was_asked
+                                .load(Ordering::Relaxed)
+                                .then(|| crate::bands::Raised::to(ASKED_PRIORITY));
+                            p.make();
+                        }
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
                             AVAILABLE.notify_all();
                         }
+                        // (Saves stay off the workers of passes over the
+                        // screen: a draw waits for those.)
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
+                            drained(!screens_only);
+                        } else if !screens_only {
                             super::library::save(false);
                         }
                     }
@@ -592,8 +611,8 @@ fn workers() -> bool {
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
 /// The workers ran out of work: logged after a batch of 10 or more, and
-/// the cache saved (at most every 20 s).
-fn drained() {
+/// the cache saved (at most every 20 s) if `save`.
+fn drained(save: bool) {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
@@ -603,7 +622,9 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
+    if save {
+        super::library::save(false);
+    }
 }
 
 #[cfg(test)]
@@ -732,6 +753,10 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &earlier));
         assert!(queue.pop(false, 1).is_none());
+        // The two a draw asked for are made raised (`Raised`), the early one
+        // in the background band.
+        let asked = |p: &Pending| p.was_asked.load(Ordering::Relaxed);
+        assert_eq!((asked(&requested), asked(&promoted), asked(&earlier)), (true, true, false));
     }
 
     #[test]

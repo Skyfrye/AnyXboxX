@@ -729,7 +729,6 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let _band = (!now).then(crate::bands::Lowered::new);
     let _saving = crate::timeline::span("pipeline: save the library and early list");
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
@@ -765,6 +764,11 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
+    // Lowered only from here: under `saving.write()` above, every worker that
+    // has made a pipeline (those of passes over the screen too) waits for the
+    // save to store its own, so the save runs at its caller's priority there;
+    // the rest (the rename and the lists) waits for nothing of ours.
+    let _band = (!now).then(crate::bands::Lowered::new);
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();

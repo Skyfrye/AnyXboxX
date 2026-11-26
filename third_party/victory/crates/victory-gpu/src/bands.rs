@@ -106,6 +106,42 @@ impl Drop for Lowered {
     }
 }
 
+/// The calling thread at `to` at least until this is dropped, then back at
+/// its own priority: work a frame waits for on a thread of the background
+/// band (a pipeline a draw asked for, on a background worker). Nothing
+/// changes on a thread already at or above `to`.
+pub(crate) struct Raised {
+    was: Option<i32>,
+    /// (Of the thread that made it: the priority is that thread's.)
+    _here: PhantomData<*const ()>,
+}
+
+impl Raised {
+    pub(crate) fn to(to: i32) -> Self {
+        /// `GetThreadPriority`'s failure.
+        const ERROR_RETURN: i32 = i32::MAX;
+        // SAFETY: the calling thread's own priority.
+        let was = unsafe {
+            let thread = GetCurrentThread();
+            let was = GetThreadPriority(thread);
+            (was != ERROR_RETURN && was < to && SetThreadPriority(thread, to) != 0).then_some(was)
+        };
+        Self {
+            was,
+            _here: PhantomData,
+        }
+    }
+}
+
+impl Drop for Raised {
+    fn drop(&mut self) {
+        if let Some(was) = self.was {
+            // SAFETY: as in `to`, on the same thread (`Raised` is not `Send`).
+            unsafe { SetThreadPriority(GetCurrentThread(), was) };
+        }
+    }
+}
+
 /// Threads of ours a frame waits for that keep a core busy, whatever the
 /// background does: the submitting thread, the relay, and the list threads'
 /// work (eight threads, about one and a half cores together in the world:
@@ -177,6 +213,37 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// Work a frame waits for on a background thread runs raised, then the
+    /// thread goes back to the band; a thread already above stays as it is.
+    #[test]
+    fn a_stretch_a_frame_waits_for_runs_raised() {
+        let seen = spawn_background("victory-test-raised", || {
+            let inside = {
+                let _raised = Raised::to(THREAD_PRIORITY_BELOW_NORMAL);
+                priority()
+            };
+            // SAFETY: this thread's own priority.
+            unsafe { SetThreadPriority(GetCurrentThread(), 0) };
+            let above = {
+                let _raised = Raised::to(THREAD_PRIORITY_BELOW_NORMAL);
+                priority()
+            };
+            (inside, above, priority())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+        assert_eq!(seen, (THREAD_PRIORITY_BELOW_NORMAL, 0, 0));
+        let after = spawn_background("victory-test-raised-back", || {
+            drop(Raised::to(THREAD_PRIORITY_BELOW_NORMAL));
+            priority()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+        assert_eq!(after, BACKGROUND, "back in the band");
     }
 
     #[test]
