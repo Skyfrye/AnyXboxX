@@ -1301,6 +1301,13 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// A PC library recorded onto `list` (`crate::external`): it set its own
+    /// heaps, root signature and pipeline, so what the title set is set again
+    /// as for a new list ([`State::replay`]).
+    pub(crate) fn after_external(&mut self, list: &HostList) {
+        self.replay(list);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.

@@ -83,6 +83,7 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
+        drop_externals(&self.words);
         self.words.clear();
     }
 
@@ -265,6 +266,10 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        // Work of ours in what was never translated goes with it.
+        for chunk in &inner.chunks {
+            drop_externals(chunk);
+        }
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
             if !inner.closed {
@@ -469,6 +474,35 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+/// Work of ours (`super::record_external`): a boxed [`super::External`].
+const EXTERNAL: u64 = after(17);
+
+/// Writes `work` down at this place of title list `this`: it runs on our
+/// list when the translation gets there, and is dropped with a recording
+/// that is not run. False (and dropped now) if nothing is being recorded.
+pub(super) fn external(this: This, work: super::External) -> bool {
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return false;
+    }
+    let work = Box::into_raw(Box::new(work));
+    front.put(EXTERNAL, &[work as u64]);
+    true
+}
+
+/// Drops the work of ours in a stream that is not translated.
+fn drop_externals(stream: &[u64]) {
+    let mut i = 0;
+    while i < stream.len() {
+        let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+        if op == EXTERNAL && len >= 1 && i + 1 < stream.len() {
+            // SAFETY: made by `external`, named once; this stream is not
+            // translated, so nothing else takes it.
+            drop(unsafe { Box::from_raw(stream[i + 1] as *mut super::External) });
+        }
+        i += 1 + len;
+    }
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -699,6 +733,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             held(uploads).push(block);
             continue;
         }
+        if op == EXTERNAL {
+            // SAFETY: made by `external`, named once.
+            let work = *unsafe { Box::from_raw(w[0] as *mut super::External) };
+            if !skip {
+                super::run_external(list, work);
+            }
+            continue;
+        }
         if skip && op != CLOSE && op != RESET {
             continue;
         }
@@ -897,6 +939,62 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { *at::<[u32; 3]>(&w[1..], 2, 3) }, [7, 8, 9]);
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
+    }
+
+    /// Work of ours (`super::record_external`) for a test: it notes whether
+    /// it ran, and whether it was dropped.
+    fn noted_work(ran: &Arc<AtomicBool>, dropped: &Arc<AtomicBool>) -> super::External {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Relaxed);
+            }
+        }
+        let (ran, flag) = (ran.clone(), Flag(dropped.clone()));
+        Box::new(move |_| {
+            let _ = &flag;
+            ran.store(true, Relaxed);
+        })
+    }
+
+    fn flags() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Work of ours set down in a stream never translated is dropped, not
+    /// run; what is not one of our lists records none.
+    #[test]
+    fn work_of_ours_goes_with_a_stream_not_translated() {
+        let (ran, dropped) = flags();
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(noted_work(&ran, &dropped))) as u64]);
+        f.leave();
+        assert!(dropped.load(Relaxed) && !ran.load(Relaxed), "dropped, not run");
+        // (Null: reading other memory would install the write guards' fault
+        // handler, which the guards' own tests set up themselves.)
+        let (ran, dropped) = flags();
+        assert!(!super::record_external(std::ptr::null(), noted_work(&ran, &dropped)));
+        assert!(dropped.load(Relaxed) && !ran.load(Relaxed));
+    }
+
+    /// Work of ours runs once on our list when its stream is translated.
+    #[test]
+    #[ignore = "makes, resets and closes host lists beside the memory guards' tests; run by name in a fresh process"]
+    fn work_of_ours_runs_at_its_place_on_our_list() {
+        if crate::host::host().is_none() {
+            return; // no host GPU: no list of ours to run it on
+        }
+        let (ran, dropped) = flags();
+        let list = back_list(0);
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(RESET, &[0]);
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(noted_work(&ran, &dropped))) as u64]);
+        f.put(CLOSE, &[]);
+        let stream = std::mem::take(&mut f.words);
+        assert_eq!(translate(list, &stream, || false), (3, true));
+        assert!(ran.load(Relaxed) && dropped.load(Relaxed), "run once on our list, then dropped");
     }
 
     /// A view's record is the one at the call, also if its slot is written

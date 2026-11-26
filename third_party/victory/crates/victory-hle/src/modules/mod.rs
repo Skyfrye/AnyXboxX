@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -62,6 +64,12 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());
+    // Only when NVIDIA DLSS can be tried (`VICTORY_DLSS=1`): the title's
+    // own FidelityFX loader is mapped otherwise.
+    #[cfg(windows)]
+    if fidelityfx::enabled() {
+        all.push(fidelityfx::module());
+    }
     #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]
