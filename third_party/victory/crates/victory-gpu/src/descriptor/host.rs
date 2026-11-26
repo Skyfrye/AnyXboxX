@@ -379,7 +379,7 @@ pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 
 /// The submissions begun when the host texture `view` shows was made, if
 /// one begun before that may still run ([`crate::pool::begun_before`]). The
-/// host texture is made here if it is not yet, as [`make`] would.
+/// host texture is made here if it is not yet, as [`make_viewed`] would.
 fn begun_before(view: &View) -> Option<u64> {
     // (Resolved first: the texture made here, a moment ago, is the case.)
     let shader = match view {
@@ -392,6 +392,38 @@ fn begun_before(view: &View) -> Option<u64> {
     };
     let texture = crate::resource::host_resource(resource as crate::object::This)?;
     crate::pool::begun_before(texture)
+}
+
+/// What a slot at `at` of texture view `view` shows in place of a texture
+/// cut from a block that no upload filled yet (`crate::pool::fill`): the
+/// stand-in, or a null view with `VICTORY_STAND_IN=0` ([`stands_in`]).
+fn unfilled_stand_in(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    if stands_in(view) {
+        neutral_for(view, at)
+    } else {
+        null_for(view, at);
+        None
+    }
+}
+
+/// The host copy texture view `view` shows, if it is made (nothing is made
+/// here).
+pub(crate) fn view_copy(view: &View) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    let shader = match view {
+        View::Placed(false, resource, _) if resource[0] != 1 => placed_texture(view),
+        View::Shader(..) => Some(view.clone()),
+        _ => None,
+    };
+    let Some(View::Shader(resource, _)) = shader else {
+        return None;
+    };
+    crate::resource::made_copy(resource as crate::object::This)
+}
+
+/// Whether `view` shows a host copy, made already, of a texture cut from a
+/// block that no upload filled yet (`crate::pool::fill`).
+fn unfilled_copy(view: &View) -> bool {
+    view_copy(view).is_some_and(|copy| !copy.fill.ready())
 }
 
 /// Slots shown late ([`show_after`]), the frames they waited, the longest;
@@ -2602,7 +2634,7 @@ impl HostHeap {
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
     /// placed textures whose first level with memory changed since the
     /// last call ([`levels_changed`]), each from the view it was made
-    /// from, so that it shows the texture from that level ([`make`]). Only
+    /// from, so that it shows the texture from that level ([`make_viewed`]). Only
     /// slots that are made; a slot draws read through a table is made by
     /// its draw. Returns how many it made.
     /// shortcut: the starts are kept in one place for all heaps; the heap
@@ -2696,10 +2728,15 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
-            if let Some(kept) = make(&view, self.at(slot)) {
-                self.put(slot);
-                self.keep(slot, kept);
-                remade += 1;
+            match self.make_shown(&view, slot) {
+                Some(Some(kept)) => {
+                    self.put(slot);
+                    self.keep(slot, kept);
+                    remade += 1;
+                }
+                // (The slot shows what it showed.)
+                None => crate::pool::fill::stood(crate::pool::fill::Stood::Remade),
+                Some(None) => {}
             }
         }
         remade
@@ -2847,7 +2884,7 @@ impl HostHeap {
         {
             return self.texture_slot_show_after(list, index, handle);
         }
-        self.mirror(index, handle, true);
+        self.mirror_listed(index, handle, list);
     }
 
     fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
@@ -2986,15 +3023,20 @@ impl HostHeap {
                 return false;
             };
             let stale = self.note_buffer(index, Some(&view), true);
-            if let Some(kept) = make(&view, self.at(index)) {
-                self.put(index);
-                self.quick_is(index, 0);
-                self.clear_twin(index);
-                self.made.set(index, key);
-                self.keep(index, kept);
-                (true, stale)
-            } else {
-                (false, stale)
+            match self.make_shown(&view, index) {
+                Some(Some(kept)) => {
+                    self.put(index);
+                    self.quick_is(index, 0);
+                    self.clear_twin(index);
+                    self.made.set(index, key);
+                    self.keep(index, kept);
+                    (true, stale)
+                }
+                None => {
+                    crate::pool::fill::stood(crate::pool::fill::Stood::Remade);
+                    (false, stale)
+                }
+                Some(None) => (false, stale),
             }
         };
         self.unmake_stale(index, stale);
@@ -3027,6 +3069,7 @@ impl HostHeap {
         }
         let mut flipped = 0;
         let mut late_flipped = 0;
+        let mut held = Vec::new();
         for f in ready {
             let _made = self.made.lock(f.index);
             let Some(shown) = self.made.get(f.index) else {
@@ -3055,7 +3098,15 @@ impl HostHeap {
                     continue;
                 }
             }
-            if let Some(kept) = make(&view, self.at(f.index)) {
+            let Some(made) = self.make_shown(&view, f.index) else {
+                // A texture cut from a block that no upload filled yet (a
+                // flip that waited for lists sent before it, not for its
+                // upload): the slot goes on showing what it shows, and the
+                // flip is asked again at the next pass (`crate::pool::fill`).
+                held.push(f);
+                continue;
+            };
+            if let Some(kept) = made {
                 #[cfg(feature = "diagnostics")]
                 note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
                 self.put(f.index);
@@ -3092,6 +3143,10 @@ impl HostHeap {
             }
         }
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
+        crate::pool::fill::FLIPS_HELD.store(held.len() as u64, Relaxed);
+        if !held.is_empty() {
+            FLIPS.lock().unwrap_or_else(|e| e.into_inner()).extend(held);
+        }
         flipped + late_flipped
     }
 
@@ -3391,9 +3446,13 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make_twinned(view, self.at(index), self.twin(index));
+    /// host cannot. Returns the host copy it shows if that is a texture cut
+    /// from a block that no upload filled yet: unless the list the slot is
+    /// made for uploads it, the slot shows [`HostHeap::stand_in_at`]
+    /// (`crate::pool::fill`).
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+        let mut unfilled = None;
+        let kept = make_viewed(view, self.at(index), self.twin(index), &mut unfilled);
         if kept.is_none() {
             null_for(view, self.at(index));
         }
@@ -3401,6 +3460,51 @@ impl HostHeap {
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         self.keep(index, kept.flatten());
+        unfilled
+    }
+
+    /// Slot `index` (a dynamic one), made from texture view `view` for a
+    /// list that does not upload what it shows, a texture cut from a block
+    /// that no upload filled yet, shows the stand-in instead
+    /// (`crate::pool::fill`). The list's own slot: it runs no sooner than
+    /// the list does.
+    pub(crate) fn stand_in_at(&self, index: u32, view: &View) {
+        let shown = unfilled_stand_in(view, self.at(index));
+        self.put(index);
+        self.clear_twin(index);
+        self.keep(index, shown);
+        crate::pool::fill::stood(crate::pool::fill::Stood::Tabled);
+    }
+
+    /// [`HostHeap::stand_in_at`] of slot `index` made from what this thread's
+    /// recording `recording` made of the record `words`
+    /// ([`HostHeap::make_listed`]), if that is a texture cut from a block
+    /// that no upload filled and `list` does not upload it.
+    pub(crate) fn listed_stand_in(&self, recording: u64, words: [u32; 3], index: u32, list: &crate::host::HostList) {
+        let held = LIST_VIEWS.with(|views| {
+            let views = views.borrow();
+            let made = views.as_ref().filter(|v| v.recording == recording)?.made.get(&words)?;
+            let copy = made.unfilled.as_ref()?;
+            (!crate::pool::fill::ready_for(copy, list)).then(|| made.view.clone())
+        });
+        if let Some(view) = held {
+            self.stand_in_at(index, &view);
+        }
+    }
+
+    /// [`make_viewed`] of `view` for slot `index`, where any list may read it, if
+    /// what it shows may be shown there; `None` (nothing put in the slot) if
+    /// it is a texture cut from a block that no upload filled yet
+    /// (`crate::pool::fill`).
+    fn make_shown(&self, view: &View, index: u32) -> Option<Option<Kept>> {
+        // (Asked first too: a slot made in place, `VICTORY_VIEW_COPY=0`, is
+        // the card's at once.)
+        if unfilled_copy(view) {
+            return None;
+        }
+        let mut unfilled = None;
+        let kept = make_viewed(view, self.at(index), None, &mut unfilled);
+        unfilled.is_none().then_some(kept)
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -3435,16 +3539,24 @@ impl HostHeap {
                 // (`raw_twins`; none on a host that caps its heaps, as
                 // NVIDIA's: 13,386 twins a frame made for nothing in run nb1).
                 let twin_at = (victory_shader::emit::raw_views() != 0).then(|| views.slot(at + 1));
-                let kept = make_twinned(&view, views.slot(at), twin_at)?;
+                let mut unfilled = None;
+                let kept = make_viewed(&view, views.slot(at), twin_at, &mut unfilled)?;
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
                     ready: (0, 0, false),
                     tabled: None,
+                    unfilled: false,
                 };
                 let twin_made = twin_at.is_some();
-                views.made.insert(words, ListView { view, at, twin, twin_made, stride_word, kept, listed });
+                views.made.insert(words, ListView { view, at, twin, twin_made, stride_word, kept, listed, unfilled });
+            }
+            // Filled since: nothing more to ask.
+            if let Some(made) = views.made.get_mut(&words)
+                && made.unfilled.as_ref().is_some_and(|copy| copy.fill.ready())
+            {
+                made.unfilled = None;
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
@@ -3456,7 +3568,7 @@ impl HostHeap {
             }
             self.write_stride(index, made.stride_word);
             self.keep(index, made.kept.clone());
-            Some(made.listed)
+            Some(Listed { unfilled: made.unfilled.is_some(), ..made.listed })
         })
     }
 
@@ -3490,7 +3602,7 @@ impl HostHeap {
         (index < self.twins.len() as u32).then(|| staged(self.sampler, 1).unwrap_or_else(|| self.cpu(self.raw + index)))
     }
 
-    /// The raw twin of slot `index` was made by this thread ([`make_twinned`]),
+    /// The raw twin of slot `index` was made by this thread ([`make_viewed`]),
     /// or is a null view if it was not.
     fn twin_made(&self, index: u32, made: bool) {
         if !made {
@@ -3874,6 +3986,19 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_with(index, handle, for_draw, None)
+    }
+
+    /// [`HostHeap::mirror`] for a draw of `list`: a texture cut from a block
+    /// that no upload filled yet is shown if `list` records its upload ahead
+    /// of its draws (`crate::draw`'s `readable`; asked again once that ran),
+    /// the stand-in if it does not (`crate::pool::fill`; `mirror` shows the
+    /// stand-in either way).
+    pub(crate) fn mirror_listed(&self, index: u32, handle: u64, list: &crate::host::HostList) -> Option<View> {
+        self.mirror_with(index, handle, true, Some(list))
+    }
+
+    fn mirror_with(&self, index: u32, handle: u64, for_draw: bool, list: Option<&crate::host::HostList>) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -4018,11 +4143,35 @@ impl HostHeap {
             }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
+            let mut unfilled = None;
             let made = if later {
                 None
             } else {
-                make_twinned(&view, self.at(index), self.twin(index))
+                make_viewed(&view, self.at(index), self.twin(index), &mut unfilled)
             };
+            // A texture cut from a block that no upload filled yet holds what
+            // the block's last texture left (`crate::pool::fill`): shown to a
+            // list that uploads it ahead of its draws, else the stand-in in
+            // its place until an upload was sent. (Made in a slot the card
+            // does not see, `staged`: not put there.)
+            if let Some(copy) = unfilled.filter(|_| !self.sampler)
+                && !list.is_some_and(|list| crate::pool::fill::ready_for(&copy, list))
+            {
+                self.made.set(index, 0);
+                let shown = unfilled_stand_in(&view, self.at(index));
+                stood_in(shown.as_ref());
+                crate::pool::fill::stood(if list.is_some() {
+                    crate::pool::fill::Stood::Drawn
+                } else {
+                    crate::pool::fill::Stood::Written
+                });
+                self.put(index);
+                self.clear_twin(index);
+                self.keep(index, shown);
+                drop(held);
+                self.unmake_stale(index, stale);
+                return Some(view);
+            }
             let twin = made.is_some() && twinned(&view);
             let kept = if stand_in {
                 let shown = neutral_for(&view, self.at(index));
@@ -4327,7 +4476,7 @@ fn write_view_address(data: usize, index: u32, view: Option<&View>) {
 
 /// The title memory the host slot of buffer view `view` is made on
 /// (address, bytes): the whole buffer the view is of, which is what
-/// [`make`] finds the host copy by. [`buffer_range`] is the part of it the
+/// [`make_viewed`] finds the host copy by. [`buffer_range`] is the part of it the
 /// view reads.
 pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
     match view {
@@ -4354,7 +4503,7 @@ fn view_extent() -> bool {
 /// The host copy buffer view `view` reads, and the title range (address,
 /// bytes) it reads there; `None` for other views and empty ranges.
 ///
-/// The copy is the one the view's slot shows: [`make`] finds it by the
+/// The copy is the one the view's slot shows: [`make_viewed`] finds it by the
 /// whole buffer the view is of ([`buffer_extent`]). Looked up by the range
 /// the view reads, as it was, the copy is another one wherever the two
 /// lookups differ: for memory outside buffer objects, a view of a part of a
@@ -4398,7 +4547,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
-/// The host resource a slot made by [`make`] views, if any.
+/// The host resource a slot made by [`make_viewed`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
 /// A structured buffer view (`first`, `count` elements of `stride` bytes,
@@ -4987,19 +5136,26 @@ fn constant_twinned(
     true
 }
 
-/// Makes the host descriptor for `view` at `at`: the host resource it
-/// views, or `None` if it cannot.
+/// [`make_viewed`] without a raw twin, asking nothing of what it shows
+/// (tests).
+#[cfg(test)]
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
-    make_twinned(view, at, None)
+    make_viewed(view, at, None, &mut None)
 }
 
-/// [`make`]; `twin`: where the raw twin of a buffer view goes
-/// ([`raw_twins`]; a constant buffer's is the same view again, other views
-/// have none).
-fn make_twinned(
+/// Makes the host descriptor for `view` at `at`: the host resource it
+/// views, or `None` if it cannot. `twin`: where the raw twin of a buffer
+/// view goes ([`raw_twins`]; a constant buffer's is the same view again,
+/// other views have none). `unfilled` is given the host copy the view shows
+/// if it is a texture cut from a block that no upload filled yet
+/// (`crate::pool::fill`): the descriptor made at `at` then shows what the
+/// block's last texture left there, and may go only to a list that uploads
+/// it ahead of its draws.
+fn make_viewed(
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    unfilled: &mut Option<std::sync::Arc<crate::resource::HostTexture>>,
 ) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
@@ -5039,6 +5195,9 @@ fn make_twinned(
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
+                if !copy.fill.ready() {
+                    *unfilled = Some(copy.clone());
+                }
                 let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
@@ -5199,7 +5358,7 @@ fn make_twinned(
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make_viewed(&view, at, None, unfilled);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -6067,6 +6226,99 @@ mod tests {
                 assert_eq!(heap.kept_in(index).map(|r| r.as_raw()), Some(stand_in.as_raw()));
             }
         }
+    }
+
+    /// A title texture placed in memory of our own, 64x64 BC7, and its host
+    /// copy, if that was cut from a block, no upload filled it and no list
+    /// sent before it may read it (`crate::pool::fill`); `None` with the
+    /// pool off.
+    fn unfilled_texture() -> Option<(crate::object::This, std::sync::Arc<crate::resource::HostTexture>)> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        host()?;
+        let desc = [3u32, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let bytes = crate::resource::placed_bytes(&desc)? as usize;
+        // SAFETY: memory of our own that stays for the run.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let texture = crate::resource::texture_at(at as u64, &desc)?;
+        let copy = crate::resource::host_copy(texture)?;
+        if !crate::pool::on() {
+            return None;
+        }
+        assert!(copy.fill.pooled(), "a texture the title fills is cut from a block");
+        if crate::pool::begun_before(&copy.texture).is_some() {
+            return None;
+        }
+        assert!(!copy.fill.ready(), "shown at once (VICTORY_FILLED_ONLY=0)");
+        Some((texture, copy))
+    }
+
+    /// A title slot never shows a texture cut from a block that no upload
+    /// filled (its texels are what the block's last texture left: rainbow
+    /// blocks in a block-compressed format), but the stand-in, until an
+    /// upload into it was sent: not when written, nor for a draw whose list
+    /// does not upload it. A draw whose list uploads it ahead of its draws
+    /// is shown it at once. A fresh table's slot is made as its list says.
+    #[test]
+    fn a_slot_shows_a_pooled_texture_only_once_it_is_filled() {
+        use windows::core::Interface;
+        let Some((texture, copy)) = unfilled_texture() else { return };
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let view = View::Shader(texture as usize, None);
+        let stand_in = neutral(Neutral::Flat).unwrap().as_raw();
+        let shown = |index: u32| heap.kept_in(index).map(|r| r.as_raw());
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, view.clone());
+        let key = record_key(handle);
+        assert!(heap.mirror(2, handle, false).is_some());
+        assert!(heap.shows_none(2), "made again once filled");
+        assert_eq!(shown(2), Some(stand_in));
+        let list = host().unwrap().new_list().unwrap();
+        assert!(heap.mirror_listed(2, handle, &list).is_some());
+        assert!(heap.shows_none(2), "a list that does not upload it");
+        assert_eq!(shown(2), Some(stand_in));
+        // A fresh table's slot: made, then the stand-in for that list.
+        assert!(heap.make_at(4, &view).is_some_and(|c| std::sync::Arc::ptr_eq(&c, &copy)));
+        assert!(!crate::pool::fill::ready_for(&copy, &list));
+        heap.stand_in_at(4, &view);
+        assert_eq!(shown(4), Some(stand_in));
+        // The list uploads it ahead of its draws.
+        crate::pool::fill::uploading(&list, &copy);
+        assert!(heap.mirror_listed(2, handle, &list).is_some());
+        assert_eq!(heap.made.get(2), Some(key));
+        assert_eq!(shown(2), Some(copy.texture.as_raw()));
+        assert!(!copy.fill.ready(), "not where any list reads it before the list is sent");
+        // Sent: shown wherever written.
+        copy.fill.sent();
+        let mut other = [0u32; 4];
+        let handle = write_record(&mut other, view.clone());
+        assert!(heap.mirror(3, handle, false).is_some());
+        assert_eq!(heap.made.get(3), Some(key));
+        assert_eq!(shown(3), Some(copy.texture.as_raw()));
+        assert!(heap.make_at(5, &view).is_none());
+        list.close();
+        list.reset();
+    }
+
+    /// A flip that waited for lists sent before a texture cut from a block
+    /// (not for its upload) does not show it while no upload into it was
+    /// sent: it is asked again at the next pass, and shows it then.
+    #[test]
+    fn a_flip_of_a_pooled_texture_waits_for_its_upload() {
+        let Some((texture, copy)) = unfilled_texture() else { return };
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, View::Shader(texture as usize, None));
+        let key = record_key(handle);
+        let own = std::ptr::from_ref(&heap) as usize;
+        let flip = Flip { after: 0, heap: own, index: 5, handle, key, late: Some(crate::frame::current()), asked: 0 };
+        FLIPS.lock().unwrap().push(flip);
+        heap.texture_slots_flip();
+        assert!(heap.shows_none(5), "not shown before its upload");
+        assert!(FLIPS.lock().unwrap().iter().any(|f| f.heap == own && f.index == 5), "asked again");
+        copy.fill.sent();
+        heap.texture_slots_flip();
+        assert_eq!(heap.made.get(5), Some(key));
+        assert!(!FLIPS.lock().unwrap().iter().any(|f| f.heap == own));
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.
@@ -7202,6 +7454,10 @@ pub(crate) struct Listed {
     pub(crate) ready: (u64, usize, bool),
     /// The title's slot last noted for it, and whether the draw read it.
     pub(crate) tabled: Option<(u32, bool)>,
+    /// It shows a texture cut from a block that no upload had filled when
+    /// last asked: the slot shows it only if the list uploads it
+    /// ([`HostHeap::listed_stand_in`]).
+    pub(crate) unfilled: bool,
 }
 
 struct ListView {
@@ -7214,6 +7470,9 @@ struct ListView {
     stride_word: u32,
     kept: Kept,
     listed: Listed,
+    /// The host copy it shows while that is a texture cut from a block that
+    /// no upload filled yet (`crate::pool::fill`).
+    unfilled: Option<std::sync::Arc<crate::resource::HostTexture>>,
 }
 
 /// The descriptors a thread made for one recording of a list, by the record

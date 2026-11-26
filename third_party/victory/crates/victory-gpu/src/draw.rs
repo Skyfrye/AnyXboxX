@@ -3098,6 +3098,20 @@ impl State {
             if late && let Some(handle) = heap.handle(index) {
                 host.texture_slot_show_after(list, index, handle);
             }
+            // A slot made above with the stand-in for a texture cut from a
+            // block that no upload had filled (`crate::pool::fill`): shown
+            // once this list, which uploads it now, has run.
+            if !late
+                && !shows_other
+                && !sync_bake
+                && ahead.is_none()
+                && let Some(handle) = heap.handle(index)
+                && !host.texture_slot_made_from(index, handle)
+                && crate::resource::made_copy(resource)
+                    .is_some_and(|copy| !copy.fill.ready() && crate::pool::fill::ready_for(&copy, list))
+            {
+                host.texture_slot_show_after(list, index, handle);
+            }
             #[cfg(feature = "diagnostics")]
             if crate::book::on()
                 && let Some(texture) = texture.filter(|t| crate::pool::fresh(t))
@@ -3875,11 +3889,26 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        if let Some(view) = host.mirror_listed(index, handle, list) {
             readable(list, u.kind, &view);
+            // A texture cut from a block that no upload filled yet is shown
+            // in the slot only to a list that uploads it (`crate::pool::fill`):
+            // made again now that this one does. One whose upload this list
+            // could not have stays the texture pass's.
+            let mut stays = false;
+            if host.shows_none(index)
+                && let Some(copy) = crate::descriptor::host::view_copy(&view)
+                && !copy.fill.ready()
+            {
+                if crate::pool::fill::ready_for(&copy, list) {
+                    host.mirror_listed(index, handle, list);
+                } else {
+                    stays = true;
+                }
+            }
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
+                host.texture_slot_tabled(index, !stays);
             } else {
                 host.slot_tabled(index);
             }
@@ -4092,6 +4121,10 @@ impl State {
                             }
                         }
                     }
+                    // (As below for a view made here.)
+                    if listed.unfilled {
+                        host.listed_stand_in(recording, words, index, list);
+                    }
                     if let Some(title) = title_first
                         && listed.texture
                         && listed.tabled != Some((title + k, kind.is_some()))
@@ -4109,7 +4142,9 @@ impl State {
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(view @ View::Constant(_, 0)) => host.make_at(index, &view),
+                    Some(view @ View::Constant(_, 0)) => {
+                        host.make_at(index, &view);
+                    }
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
@@ -4134,12 +4169,20 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let unfilled = host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
+                        }
+                        // A texture cut from a block that no upload filled yet,
+                        // and this list does not upload it either: what the
+                        // block's last texture left (`crate::pool::fill`).
+                        if let Some(copy) = unfilled
+                            && !crate::pool::fill::ready_for(&copy, list)
+                        {
+                            host.stand_in_at(index, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it

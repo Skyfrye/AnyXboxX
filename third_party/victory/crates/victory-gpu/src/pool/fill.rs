@@ -11,14 +11,21 @@
 //! buffer can be had; and lists the card runs ahead of the one that uploads
 //! read the slot by index.
 //!
-//! Zeros at placement (`VICTORY_POOL_ZERO`, on; 0: none, as before): a
-//! texture cut where another lay is written with zeros by a list of its own
-//! at the head of the next submission, ahead of every list that may read
-//! it, from a buffer of zeros in the card's memory. A texture cut from
-//! memory of a block no texture used holds zeros already: nothing is done.
-//! (It has no render target or depth flag, so neither a clear nor a discard
-//! initializes it: only a copy does.) A line every five seconds counts
-//! them ([`line`]).
+//! Two things keep those bytes from shaders:
+//! - Zeros at placement (`VICTORY_POOL_ZERO`, on; 0: none, as before). A
+//!   texture cut where another lay is written with zeros by a list of its
+//!   own at the head of the next submission, ahead of every list that may
+//!   read it, from a buffer of zeros in the card's memory. A texture cut from
+//!   memory of a block no texture used holds zeros already: nothing is done.
+//!   (It has no render target or depth flag, so neither a clear nor a
+//!   discard initializes it: only a copy does.)
+//! - Filled textures only (`VICTORY_FILLED_ONLY`, on; 0: shown at once, as
+//!   before). No view of a texture cut from a block goes where lists read it
+//!   until an upload into it was sent, or the list that reads it records one
+//!   ahead of its draws. Meanwhile the slot shows the neutral stand-in
+//!   (`crate::descriptor::host`'s, opaque grey).
+//!
+//! A line every five seconds counts both ([`line`]).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +42,13 @@ pub(crate) fn zero_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_ZERO").is_none_or(|v| v != "0"))
 }
 
+/// Whether a texture cut from a block is shown only once filled
+/// (`VICTORY_FILLED_ONLY`, on).
+pub(crate) fn filled_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILLED_ONLY").is_none_or(|v| v != "0"))
+}
+
 /// [`Fill::zero`]: no zeros wanted; wanted, and waiting for the next
 /// submission; sent at the head of one; given up for an upload that writes
 /// every level on the copy queue (`crate::texture::ahead`).
@@ -43,8 +57,11 @@ const WAITING: u8 = 1;
 const SENT: u8 = 2;
 const TAKEN: u8 = 3;
 
-/// What a host copy holds of its own: its zeros.
+/// What a host copy holds of its own: whether it was cut from a block, its
+/// zeros, and whether an upload into it was sent.
 pub(crate) struct Fill {
+    pooled: bool,
+    filled: AtomicBool,
     zero: AtomicU8,
     /// The submission its zeros went at the head of.
     zeroed_in: AtomicU64,
@@ -53,26 +70,78 @@ pub(crate) struct Fill {
 impl Fill {
     /// For host texture `texture`, just made.
     pub(crate) fn of(texture: &ID3D12Resource) -> Fill {
-        Fill::placed(super::placed(texture) == Some(true) && zero_on())
+        let placed = super::placed(texture);
+        Fill::placed(placed.is_some(), placed == Some(true) && zero_on())
     }
 
     /// For a texture not cut from a block (it holds zeros, or the host's own).
     pub(crate) fn none() -> Fill {
-        Fill::placed(false)
+        Fill::placed(false, false)
     }
 
-    fn placed(zeros: bool) -> Fill {
+    fn placed(pooled: bool, zeros: bool) -> Fill {
         Fill {
+            pooled,
+            filled: AtomicBool::new(false),
             zero: AtomicU8::new(if zeros { WAITING } else { NONE }),
             zeroed_in: AtomicU64::new(0),
         }
     }
 
-    /// One whose zeros wait (`zeros`), for tests.
-    #[cfg(test)]
-    pub(crate) fn for_tests(zeros: bool) -> Fill {
-        Fill::placed(zeros)
+    /// Whether it may be shown where any list reads it: not cut from a
+    /// block, or an upload into it was sent.
+    pub(crate) fn ready(&self) -> bool {
+        !self.pooled || !filled_only() || self.filled.load(Ordering::Acquire)
     }
+
+    /// An upload into it was sent (or the host wrote it).
+    pub(crate) fn sent(&self) {
+        self.filled.store(true, Ordering::Release);
+    }
+
+    /// Whether it was cut from a block (tests).
+    #[cfg(test)]
+    pub(crate) fn pooled(&self) -> bool {
+        self.pooled
+    }
+
+    /// One cut from a block (`pooled`) whose zeros wait (`zeros`), for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests(pooled: bool, zeros: bool) -> Fill {
+        Fill::placed(pooled, zeros)
+    }
+}
+
+/// Whether host copy `copy` may be shown to `list`'s draws: it is ready
+/// ([`Fill::ready`]), or `list` records an upload into it ahead of them.
+pub(crate) fn ready_for(copy: &HostTexture, list: &crate::host::HostList) -> bool {
+    copy.fill.ready() || list.used(listed(copy))
+}
+
+/// What [`crate::host::HostList::first_use`] is told for a list that records
+/// an upload into `copy` (bit 62: no other key of that set has it).
+fn listed(copy: &HostTexture) -> usize {
+    1 << 62 | (std::ptr::from_ref(copy) as usize) >> 2
+}
+
+/// `list` records an upload into `copy`, which writes what its views show:
+/// its draws may show it from now on, and every list once `list` is sent.
+pub(crate) fn uploading(list: &crate::host::HostList, copy: &Arc<HostTexture>) {
+    if !copy.fill.pooled {
+        return;
+    }
+    list.first_use(listed(copy));
+    if !copy.fill.filled.load(Ordering::Relaxed) {
+        let copy = copy.clone();
+        list.defer_host(move || copy.fill.sent());
+    }
+}
+
+/// `copy` is written now by other means than an upload a list sends: a copy
+/// or resolve of the host's, a copy queue's upload that has run.
+pub(crate) fn written(copy: &HostTexture) {
+    copy.fill.sent();
 }
 
 /// Host copies whose zeros wait for the next submission.
@@ -393,29 +462,67 @@ unsafe fn zeros_into(
     (bytes, whole)
 }
 
+/// Where the stand-in was shown for a texture cut from a block that no
+/// upload had filled: a title slot made with no list (a write, or the slots
+/// made when a host copy is), one made for a draw whose list did not upload
+/// it, a fresh table's slot, a slot a pass would have made again or
+/// published.
+#[derive(Clone, Copy)]
+pub(crate) enum Stood {
+    Written = 0,
+    Drawn = 1,
+    Tabled = 2,
+    Remade = 3,
+}
+
+/// Since the start, by [`Stood`].
+static STOOD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Flips of slots held back at the last pass that made flips: what they
+/// would show is a texture cut from a block that no upload filled yet.
+pub(crate) static FLIPS_HELD: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn stood(at: Stood) {
+    STOOD[at as usize].fetch_add(1, Ordering::Relaxed);
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The line every five seconds: what was done since the start, and the
-/// zeros a frame since the last line.
+/// zeros and stand-ins a frame since the last line.
 pub(crate) fn line() -> String {
-    static LAST: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    static LAST: Mutex<(u64, [u64; 2])> = Mutex::new((0, [0; 2]));
     let z = ZEROS.each_ref().map(|n| n.load(Ordering::Relaxed));
+    let s = STOOD.each_ref().map(|n| n.load(Ordering::Relaxed));
+    let stood: u64 = s.iter().sum();
     let frame = crate::frame::current();
     let mut last = lock(&LAST);
     let frames = frame.saturating_sub(last.0).max(1) as f64;
-    let lately = z[0].saturating_sub(last.1) as f64 / frames;
-    *last = (frame, z[0]);
+    let [zeroed, grey] = [z[0], stood].map(|n| n as f64);
+    let lately = [(zeroed - last.1[0] as f64) / frames, (grey - last.1[1] as f64) / frames];
+    *last = (frame, [z[0], stood]);
     format!(
-        "textures cut from blocks where another lay (VICTORY_POOL_ZERO={}), a frame lately: {lately:.1} zeroed; since the \
-         start: {} zeroed ({} MB, {} not whole), {} left to their upload on the copy queue, {} gone before their zeros",
+        "textures cut from blocks, before their first upload (VICTORY_POOL_ZERO={}, VICTORY_FILLED_ONLY={}), a frame lately: \
+         {:.1} zeroed where another texture lay, {:.1} slots shown the stand-in as never filled; since the start: {} zeroed \
+         ({} MB, {} not whole), {} left to their upload on the copy queue, {} gone before their zeros; {stood} stand-ins \
+         ({} title slots made with no list, {} for a draw whose list did not upload them, {} fresh tables' slots, {} not \
+         made again or published), {} flips held at the last pass",
         u8::from(zero_on()),
+        u8::from(filled_only()),
+        lately[0],
+        lately[1],
         z[0],
         z[1] >> 20,
         z[4],
         z[2],
         z[3],
+        s[0],
+        s[1],
+        s[2],
+        s[3],
+        FLIPS_HELD.load(Ordering::Relaxed),
     )
 }
 
@@ -423,17 +530,32 @@ pub(crate) fn line() -> String {
 mod tests {
     use super::*;
 
+    /// A texture cut from a block is shown where any list reads it only once
+    /// an upload into it was sent; to a list that records one ahead of its
+    /// draws, at once. One not cut from a block is shown at once.
+    #[test]
+    fn a_pooled_texture_is_shown_once_an_upload_was_sent() {
+        let fill = Fill::placed(true, false);
+        assert!(!fill.ready() || !filled_only());
+        fill.sent();
+        assert!(fill.ready());
+        assert!(Fill::none().ready());
+        // Zeros are wanted only where another texture lay.
+        assert_eq!(Fill::placed(true, true).zero.load(Ordering::Relaxed), WAITING);
+        assert_eq!(Fill::placed(true, false).zero.load(Ordering::Relaxed), NONE);
+    }
+
     /// An upload on the copy queue (which writes every level) takes the place
     /// of zeros that still wait, and waits for zeros already sent until their
     /// submission has finished.
     #[test]
     fn the_copy_queue_gives_waiting_zeros_up_and_waits_for_sent_ones() {
-        let waiting = Fill::placed(true);
+        let waiting = Fill::placed(true, true);
         // Submissions up to 7 have run.
         let copy_queue = |fill: &Fill| fill.give_zeros_up(7);
         assert!(copy_queue(&waiting));
         assert_eq!(waiting.zero.load(Ordering::Relaxed), TAKEN);
-        let sent = Fill::placed(true);
+        let sent = Fill::placed(true, true);
         sent.zero.store(SENT, Ordering::Relaxed);
         sent.zeroed_in.store(8, Ordering::Relaxed);
         assert!(!copy_queue(&sent), "submission 8 has not finished");
@@ -668,12 +790,12 @@ mod tests {
         };
         let placed = over_a_pattern(host, &bench, &desc);
         let mut copy = HostTexture::for_tests(placed.texture.clone(), 0);
-        copy.fill = Fill::for_tests(true);
+        copy.fill = Fill::for_tests(true, true);
         let copy = Arc::new(copy);
         // Nothing but the queue holds it: no view shows it, no list names it.
         let gone = {
             let mut gone = HostTexture::for_tests(over_a_pattern(host, &bench, &desc).texture, 0);
-            gone.fill = Fill::for_tests(true);
+            gone.fill = Fill::for_tests(true, true);
             Arc::new(gone)
         };
         let gone_before = ZEROS[3].load(Ordering::Relaxed);
@@ -713,7 +835,7 @@ mod tests {
         };
         let placed_texture = over_a_pattern(host, &bench, &desc);
         let mut copy = HostTexture::for_tests(placed_texture.texture.clone(), 0);
-        copy.fill = Fill::for_tests(true);
+        copy.fill = Fill::for_tests(true, true);
         let copy = Arc::new(copy);
         placed(&copy);
         let list = host.new_list().unwrap();

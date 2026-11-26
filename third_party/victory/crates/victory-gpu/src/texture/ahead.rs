@@ -331,6 +331,7 @@ fn finish(jobs: Vec<Arc<Job>>) {
         job.staging.uploaded.store(true, Relaxed);
         job.staging.dirty.store(false, Relaxed);
         job.staging.note_held();
+        crate::pool::fill::written(&job.copy);
         job.copy.ahead.store(DONE, Relaxed);
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }

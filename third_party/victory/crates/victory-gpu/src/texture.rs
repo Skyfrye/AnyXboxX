@@ -370,6 +370,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
+    // Every level of it is the source's from this copy on
+    // (`crate::pool::fill`).
+    if let Some(copy) = crate::resource::made_copy(placed) {
+        crate::pool::fill::uploading(list, &copy);
+    }
     #[cfg(feature = "diagnostics")]
     crate::dispatchdump::alias(list, placed, source, from, to);
     // A draw that also writes the source (a view of it handled before
@@ -588,6 +593,11 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    // What it holds is the host's from that write on, and nothing uploads it
+    // (`crate::pool::fill`).
+    if let Some(copy) = crate::resource::made_copy(resource) {
+        crate::pool::fill::written(&copy);
+    }
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
@@ -851,6 +861,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         record_upload(list, resource, &copy, &staging, &source, 0);
         staging.uploaded.store(true, Relaxed);
+        // (Counted as there at once, as `uploaded` is: lists that sample
+        // the plane meanwhile skip its upload.)
+        crate::pool::fill::uploading(list, &copy);
+        crate::pool::fill::written(&copy);
         return;
     }
     // The host texture has the staging buffer's contents: only the check
@@ -881,6 +895,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.expected.store(there, Relaxed);
     }
     record_upload(list, resource, &copy, &staging, &staging.buffer, staging.base);
+    // The list's draws may show the texture from here on, every list once
+    // this one was sent (`crate::pool::fill`).
+    crate::pool::fill::uploading(list, &copy);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
