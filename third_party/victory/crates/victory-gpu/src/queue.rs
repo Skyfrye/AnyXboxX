@@ -971,7 +971,16 @@ extern "system" fn present(
         #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
-            tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // (console wave64 compute programs translated so far on 32-lane host waves in the
+            // paired form, and in an approximate one)
+            let [wave64_paired, wave64_approximate] = crate::pipeline::wave_forms();
+            tracing::info!(
+                hits,
+                misses,
+                wave64_paired,
+                wave64_approximate,
+                "shaders from the cache and translated so far"
+            );
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]

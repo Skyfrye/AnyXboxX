@@ -1,55 +1,55 @@
 //! Cross-lane instructions of console wave64 (and wave32) programs as the console runs them,
 //! in every form the host may take: 64-lane host waves (AMD) and 32-lane host waves, with or
 //! without the exchange between the two halves (NVIDIA). Ported from AnyXboxX `local/perf-linux`
-//! (VIctory PRs #284, #297, #300 and #334), without its paired form, which this tree lacks.
+//! (VIctory PRs #284, #297, #300 and #334); the paired form's cases are in `super::paired`.
 
 use super::*;
 
 // Operands as the hardware numbers them: SGPR n is n, VCC 106, EXEC 126, an inline integer
 // n 128 + n, a literal (the next dword) 255, VGPR n 256 + n.
-const VCC: u32 = 106;
-const EXEC: u32 = 126;
-const LIT: u32 = 255;
+pub(super) const VCC: u32 = 106;
+pub(super) const EXEC: u32 = 126;
+pub(super) const LIT: u32 = 255;
 
-const fn v(n: u32) -> u32 {
+pub(super) const fn v(n: u32) -> u32 {
     256 + n
 }
 
-const fn k(n: u32) -> u32 {
+pub(super) const fn k(n: u32) -> u32 {
     128 + n
 }
 
-const fn sop1(op: u32, sdst: u32, src0: u32) -> u32 {
+pub(super) const fn sop1(op: u32, sdst: u32, src0: u32) -> u32 {
     0xBE80_0000 | sdst << 16 | op << 8 | src0
 }
 
-const fn vop1(op: u32, vdst: u32, src0: u32) -> u32 {
+pub(super) const fn vop1(op: u32, vdst: u32, src0: u32) -> u32 {
     0x7E00_0000 | vdst << 17 | op << 9 | src0
 }
 
-const fn vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
+pub(super) const fn vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
     op << 25 | vdst << 17 | vsrc1 << 9 | src0
 }
 
-const fn vopc(op: u32, src0: u32, vsrc1: u32) -> u32 {
+pub(super) const fn vopc(op: u32, src0: u32, vsrc1: u32) -> u32 {
     0x7C00_0000 | op << 17 | vsrc1 << 9 | src0
 }
 
-const fn vop3(op: u32, dst: u32, src0: u32, src1: u32) -> [u32; 2] {
+pub(super) const fn vop3(op: u32, dst: u32, src0: u32, src1: u32) -> [u32; 2] {
     [0xD400_0000 | op << 16 | dst, src0 | src1 << 9]
 }
 
-const fn ds(op: u32, vdst: u32, addr: u32, data: u32, offset: u32) -> [u32; 2] {
+pub(super) const fn ds(op: u32, vdst: u32, addr: u32, data: u32, offset: u32) -> [u32; 2] {
     [0xD800_0000 | op << 18 | offset, vdst << 24 | data << 8 | addr]
 }
 
 /// `buffer_store_dword v<data>, v<addr>, s[8:11], 0 offen offset:<offset>`
-const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
+pub(super) const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
     [0xE070_1000 | offset, 0x8002_0000 | data << 8 | addr]
 }
 
 /// `v<regs>` stored as each thread's dwords of the UAV, the thread's index (v0) times 16 on.
-fn stores(regs: [u32; 4]) -> Vec<u32> {
+pub(super) fn stores(regs: [u32; 4]) -> Vec<u32> {
     let mut w = vec![vop2(0x1A, 15, k(4), 0)]; // v_lshlrev_b32 v15, 4, v0
     for (n, r) in regs.into_iter().enumerate() {
         w.extend(store(r, 15, 4 * n as u32));
@@ -79,7 +79,7 @@ fn emitted(native: &NativeProgram, host_wave: u32) -> HostShader {
 
 /// `shader` on the hardware device: one group, root constants `s0..s3`, a raw UAV of `dwords`
 /// zeroed dwords, which come back; None (and a line) without a device that takes it.
-fn run(shader: &HostShader, constants: [u32; 4], dwords: u32) -> Option<Vec<u32>> {
+pub(super) fn run(shader: &HostShader, constants: [u32; 4], dwords: u32) -> Option<Vec<u32>> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
@@ -114,7 +114,7 @@ fn run(shader: &HostShader, constants: [u32; 4], dwords: u32) -> Option<Vec<u32>
 
 /// Panics at the first dword of `got` that is not the console's (`want`), naming the thread
 /// and which of its four dwords.
-fn same_as_console(label: &str, got: &[u32], want: &[u32]) {
+pub(super) fn same_as_console(label: &str, got: &[u32], want: &[u32]) {
     assert_eq!(got.len(), want.len());
     if let Some(n) = (0..want.len()).find(|&n| got[n] != want[n]) {
         panic!("{label}: thread {}, dword {}: {:#x}, the console's {:#x}", n / 4, n % 4, got[n], want[n]);
@@ -215,9 +215,9 @@ fn writelane_ignores_exec_and_lane_indices_are_masked() {
     same_as_console("wave32", &got32, &want32);
 
     // Wave64: EXEC narrowed to the lanes below 32 (no branch), a write to inactive lane 45
-    // through index s1 = 109, EXEC restored, read back at index 109. (shortcut: inside a lane
-    // branch the host lanes outside it do not run the write at all; the AnyXboxX test of
-    // that case runs on its paired form, which this tree lacks.)
+    // through index s1 = 109, EXEC restored, read back at index 109. (Inside a lane branch the
+    // host lanes outside it do not run the write at all in these forms: that case is the
+    // paired form's, `super::paired`.)
     let mut w64 = vec![
         vop1(0x01, 6, v(0)),  // v_mov_b32 v6, v0
         sop1(0x04, 12, EXEC), // s_mov_b64 s[12:13], exec

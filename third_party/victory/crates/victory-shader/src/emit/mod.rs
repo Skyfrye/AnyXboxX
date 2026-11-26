@@ -466,7 +466,95 @@ pub fn emit_with_retries(
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// A console wave64 compute program on a host of 32-lane waves that no form in two host waves
+/// gives the host (it still asks for 64-lane waves, or does not translate) takes the paired
+/// form, each console wave run by one host wave ([`paired`]; `VICTORY_WAVE_PAIRS=0` turns it
+/// off). Which form such a program took is [`take_wave_form`]'s.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    WAVE_FORM.set(None);
+    let r = emit_forms(c, native, p, st, io, res);
+    let wave64_on_32 = native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
+    // (a mask with lanes elsewhere is retried with mask operations on numbers first,
+    // `translate`; the paired form comes after that)
+    let retried_first = matches!(&r, Err(ShaderError::Unsupported { what, .. })
+        if *what == lower::MASK_ELSEWHERE && !lower::mask_ops_on_numbers());
+    if matches!(&r, Err(ShaderError::Unsupported { .. })) && wave64_on_32 && !retried_first && pairs_on() {
+        let again = paired(c, native, p, io, res);
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &again {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired lanes: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY paired lanes: {e}"),
+            }
+        }
+        if let Ok((shader, _)) = again {
+            WAVE_FORM.set(Some(WaveForm::PAIRED));
+            return Ok(shader);
+        }
+    }
+    if r.is_ok() && wave64_on_32 && WAVE_FORM.get().is_none() {
+        WAVE_FORM.set(Some(WaveForm::HALVES));
+    }
+    r
+}
+
+/// The form a console wave64 compute program took on a host of 32-lane waves ([`emit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveForm(pub &'static str);
+
+impl WaveForm {
+    /// Host waves of 32 lanes, each a half of a console wave, exchanging through LDS where
+    /// they need the other half (exact).
+    pub const HALVES: WaveForm = WaveForm("host waves of 32 (halves)");
+    /// One host wave of 32 for each console wave, two lanes a thread ([`paired`], exact).
+    pub const PAIRED: WaveForm = WaveForm("paired lanes");
+
+    /// Whether the form gives each half-wave its own results, or may read LDS stale: not what
+    /// the console's 64 lanes compute in every case.
+    pub fn approximate(self) -> bool {
+        self.0.contains("APPROXIMATE")
+    }
+}
+
+thread_local! {
+    /// See [`take_wave_form`].
+    static WAVE_FORM: std::cell::Cell<Option<WaveForm>> = const { std::cell::Cell::new(None) };
+}
+
+/// The form the last program [`emit`] translated on this thread took, if it was a console
+/// wave64 compute program on a host of 32-lane waves (none after a refusal or for any other
+/// program), and forgets it.
+pub fn take_wave_form() -> Option<WaveForm> {
+    WAVE_FORM.take()
+}
+
+/// Whether console wave64 compute programs may take the paired form ([`paired`]):
+/// `VICTORY_WAVE_PAIRS=0` turns it off (a test can choose for its own thread).
+fn pairs_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PAIRS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`pairs_on`], for its thread only.
+    static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`emit`] in every form but the paired one; where an approximate form translates the
+/// program, the paired form instead if it does.
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -561,12 +649,39 @@ pub fn emit(
             ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
             ("without skips", form("without skips", ir::without_skips(p, false))),
         ];
+        // An exact form's result, named ([`take_wave_form`]).
+        let chosen = |name: &'static str, r: Result<(HostShader, Option<u32>), ShaderError>| {
+            WAVE_FORM.set(Some(WaveForm(name)));
+            r.map(|(shader, _)| shader)
+        };
+        // Where an approximate form below translates the program, the paired form
+        // ([`paired`]) is tried first: it runs each console wave as one host wave and gives
+        // what the console's 64 lanes compute, at no barrier but the entry's; the approximate
+        // form is kept for a program the paired form does not take. (Neptune's measurement
+        // on its base: 39 of the title's programs ran approximate, each half-wave counting,
+        // ORing or electing over its own 32 lanes - shadow-mask tiles and traces, temporal
+        // resolves, irradiance-cache and fallback lighting, light clustering, scattering
+        // gathers, decal and fire resolves, the light atlas - and 36 took the paired form.)
+        // A program no form takes gets the paired form last of all ([`emit`]).
+        // (`VICTORY_WAVE_PAIRS=0` turns the paired form off here too.)
+        let exactly = |name: &'static str, approximate: Result<(HostShader, Option<u32>), ShaderError>| {
+            if pairs_on() {
+                let again = paired(c, native, p, io, res);
+                report("paired lanes, before an approximate form", &again);
+                if let Ok((shader, _)) = again {
+                    WAVE_FORM.set(Some(WaveForm::PAIRED));
+                    return Ok(shader);
+                }
+            }
+            WAVE_FORM.set(Some(WaveForm(name)));
+            approximate.map(|(shader, _)| shader)
+        };
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return chosen(*name, again);
                 }
             }
         }
@@ -608,7 +723,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return chosen("without skips, scalars followed", again);
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -625,7 +740,7 @@ pub fn emit(
                         let again = widen(c, native, base, why, driver_loop);
                         report("wave-wide branches", &again);
                         if done(&again) {
-                            return again.map(|(shader, _)| shader);
+                            return chosen("wave-wide branches", again);
                         }
                     }
                 }
@@ -643,7 +758,11 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return if exact {
+                            chosen("local waves (idiom)", local)
+                        } else {
+                            exactly("local waves (APPROXIMATE)", local)
+                        };
                     }
                 }
             }
@@ -651,7 +770,11 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return if exact {
+                        chosen("local waves (idiom)", local)
+                    } else {
+                        exactly("local waves (APPROXIMATE)", local)
+                    };
                 }
             }
         }
@@ -663,14 +786,43 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return exactly("local waves (APPROXIMATE, any mask)", local);
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return exactly("local waves (APPROXIMATE, any mask)", local);
+                }
+            }
+        }
+        // Last of all (`VICTORY_WAVE_LDS_LOOSE=0` turns it off): LDS read and written inside
+        // one lane-branch region, ordered between the two host waves only where the region
+        // is entered and left (`lower::with_loose_lds`, approximate), where the paired form
+        // does not take the program either. A 32-lane host refuses the 64-lane form outright,
+        // which drops every dispatch of the program.
+        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0");
+        if loose_on && !strict {
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
+                    if done(&again) {
+                        return exactly("loose LDS (APPROXIMATE)", again);
+                    }
+                }
+            }
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            report("loose LDS (APPROXIMATE)", &again);
+            if done(&again) {
+                return exactly("loose LDS (APPROXIMATE)", again);
+            }
+            if local_on && !exact_only {
+                let local = lower::with_loose_lds(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
+                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
+                if done(&local) {
+                    return exactly("loose LDS + local waves (APPROXIMATE, any mask)", local);
                 }
             }
         }
@@ -820,6 +972,57 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form
+/// ([`lower::with_paired_lanes`]): each console wave run by one host wave of 32 lanes, each
+/// thread two of its lanes, with every per-lane branch taken by the whole wave as the console
+/// takes it ([`structure::structure_wide`]), so that a host wave's threads go the same way and
+/// EXEC stays each lane's guard. The program's barriers are reached by whole host waves where
+/// the console's waves reach them; the only barriers added are on entry, before the program,
+/// where a group of several console waves numbers its waves (`Lower::wave_base`). A thread
+/// group whose console waves are not full would need the lanes past its end kept out of every
+/// effect: refused.
+/// Descriptors and addresses stay those traced on the lanes' own paths (`res`, as for every
+/// other form): the per-lane form rests on a lane that reads a scalar after a join having
+/// come the way the wave did, and knowing less of a lane's way the wave-wide form would miss
+/// some of them (a sampler set in a skip that only a wave with no lane left for it skips).
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes outside compute",
+        });
+    };
+    if !cs.threads.iter().product::<u32>().is_multiple_of(64) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let mut wide = std::collections::HashSet::new();
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
+        }
+        wide.extend(lanes);
+    };
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
 }
 
 /// The translated program, and the wave size it requires of the host.

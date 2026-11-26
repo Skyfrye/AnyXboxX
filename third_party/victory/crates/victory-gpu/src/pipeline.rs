@@ -87,6 +87,20 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// kept and the bytes of their host code. None of them is ever let go.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Console wave64 compute programs translated in this run on a host of 32-lane waves that
+/// took the paired form (exact), and those that took an approximate form, each half-wave on
+/// its own or LDS read loosely ([`victory_shader::emit::WaveForm`]): for the shaders line.
+/// Translations served from the cache are not counted (their form is not kept).
+#[cfg(windows)]
+static WAVE_FORMS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`WAVE_FORMS`]: paired, approximate.
+#[cfg(windows)]
+pub(crate) fn wave_forms() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [WAVE_FORMS[0].load(Relaxed), WAVE_FORMS[1].load(Relaxed)]
+}
+
 /// What the shader table and the pipeline library keep in memory:
 /// containers and their bytes, translations and their bytes, the bytes of
 /// the library's file (kept whole while the library lives) and what its
@@ -160,8 +174,13 @@ impl Shader {
             .get_or_init(|| {
                 let done = {
                     let _translation = crate::timeline::span("pipeline: translate a shader");
+                    // (what an earlier translation on this thread named)
+                    let _ = victory_shader::emit::take_wave_form();
                     translate(&self.container)
                 };
+                // The form a console wave64 compute program took on a host of 32-lane
+                // waves, when the translator ran here (not for one from the cache).
+                let form = victory_shader::emit::take_wave_form();
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -191,6 +210,29 @@ impl Shader {
                         error = %e,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
+                }
+                if let (Ok(_), Some(form)) = (&done, form) {
+                    use victory_shader::emit::WaveForm;
+                    let counted = match form {
+                        WaveForm::PAIRED => Some(0),
+                        f if f.approximate() => Some(1),
+                        _ => None,
+                    };
+                    if let Some(n) = counted {
+                        WAVE_FORMS[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // (every other wave64 program runs as host waves of 32, halves of the
+                    // console's: the usual form, not named at info)
+                    if form == WaveForm::HALVES {
+                        tracing::debug!(hash = %self.hash, form = form.0, "wave64 compute program on host waves of 32");
+                    } else {
+                        tracing::info!(
+                            hash = %self.hash,
+                            form = form.0,
+                            approximate = form.approximate(),
+                            "wave64 compute program on host waves of 32"
+                        );
+                    }
                 }
                 done.ok()
             })
