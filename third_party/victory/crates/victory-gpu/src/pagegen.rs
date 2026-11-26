@@ -102,6 +102,15 @@ thread_local! {
     pub(crate) static TEST_ON: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Diagnostic (`VICTORY_PAGE_CHECK=1`, off by default): the fingerprint
+/// looks of the way before run beside page generations, and a change they
+/// find that no generation told of is warned of. A run with it on says
+/// whether any way of writing texture memory is still untold.
+pub(crate) fn check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_CHECK").is_some_and(|v| v == "1"))
+}
+
 /// The last tick given to a change; a change told after this returns gets a
 /// higher one.
 pub(crate) fn now() -> u64 {
@@ -708,6 +717,38 @@ impl Drop for Watchers {
     }
 }
 
+/// The page generations line for the log.
+pub(crate) fn line() -> String {
+    let n: [u64; 14] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
+    let kinds: [u64; 3] = std::array::from_fn(|i| KINDS[i].load(Ordering::Relaxed));
+    format!(
+        "page generations (VICTORY_PAGE_GENERATIONS=0: notices by address and fingerprint looks, as before), since the start: \
+         changes of watched pages told by guard faults {}, by the kernel's write watch {}, by our writes {}, by DirectStorage \
+         into physical pages {}, by mappings {}, by guards taken off {}; {} changes of memory no slot watches; {} slots made \
+         due ({} by a physical page, whatever view it was written through; {} read while their guard was not all up), {} \
+         times a heap fell behind the changes kept; {} askings of the kernel for slots of the title's own memory, {} looks by \
+         digest at memory nothing tracks ({} found it changed); now {} pages watched by {} slots guarded, {} asked, {} looked at",
+        n[Teller::Fault as usize],
+        n[Teller::Kernel as usize],
+        n[Teller::Ours as usize],
+        n[Teller::Physical as usize],
+        n[Teller::Mapping as usize],
+        n[Teller::Opened as usize],
+        n[UNWATCHED],
+        n[DUE],
+        n[DUE_SHOWN],
+        n[OPEN],
+        n[LOST],
+        n[ASKED],
+        n[LOOKS],
+        n[LOOKS_CHANGED],
+        WATCHED.load(Ordering::Relaxed),
+        kinds[0],
+        kinds[1],
+        kinds[2],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,6 +950,24 @@ mod tests {
         assert_eq!(watchers.moved(), [1, 2]);
         assert!(watchers.moved().is_empty());
         drop((watchers, other, memory));
+    }
+
+    /// The log line says who told of changes and what watches now.
+    #[test]
+    fn the_line_counts_who_told() {
+        let mut memory = vec![0u8; PAGE];
+        let at = memory.as_mut_ptr() as usize;
+        let mut watchers = Watchers::default();
+        watchers.watch(5, pages_of(at, PAGE), now(), Kept::Told);
+        let before = STATS[Teller::Ours as usize].load(Ordering::Relaxed);
+        written(at, 8);
+        assert!(STATS[Teller::Ours as usize].load(Ordering::Relaxed) > before);
+        let line = line();
+        assert!(line.starts_with("page generations (VICTORY_PAGE_GENERATIONS=0"), "{line}");
+        assert!(line.contains(" by our writes ") && line.contains(" slots guarded, "), "{line}");
+        assert_eq!(watchers.moved(), [5]);
+        drop(watchers);
+        drop(memory);
     }
 
     /// Watching a slot's pages again with the same pages keeps the count of

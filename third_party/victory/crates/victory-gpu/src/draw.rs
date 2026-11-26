@@ -812,12 +812,14 @@ fn reupload_when_full() -> bool {
 
 /// Whether textures picked by index are looked at again after their upload
 /// by fingerprint (`VICTORY_HEAP_RECHECK=0`: no). Only the way before page
-/// generations (`VICTORY_PAGE_GENERATIONS=0`): with them a slot is told of
-/// every change of its pages and needs no look.
+/// generations (`VICTORY_PAGE_GENERATIONS=0`), or beside them as their check
+/// (`VICTORY_PAGE_CHECK=1`): with them a slot is told of every change of its
+/// pages and needs no look.
 fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !crate::pagegen::on() && std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0")
+        (!crate::pagegen::on() || crate::pagegen::check())
+            && std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0")
     })
 }
 /// Times a placed texture's slot was passed over because its memory is not
@@ -2786,17 +2788,33 @@ impl State {
                         View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
                         _ => 0,
                     });
-                    tracing::warn!(
-                        first_level = first,
-                        blocks_shown_elsewhere = elsewhere.len(),
-                        slot = index,
-                        address = format_args!("{at:#x}"),
-                        bytes = len,
-                        frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
-                        changed = n + 1,
-                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
-                    );
+                    if generations {
+                        // (`VICTORY_PAGE_CHECK=1`: a way of writing texture
+                        // memory that tells no page generation.)
+                        tracing::warn!(
+                            first_level = first,
+                            blocks_shown_elsewhere = elsewhere.len(),
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            "a texture picked by index changed after its upload and no page generation told of it: uploaded again"
+                        );
+                    } else {
+                        tracing::warn!(
+                            first_level = first,
+                            blocks_shown_elsewhere = elsewhere.len(),
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                        );
+                    }
                 }
             }
             let mut partly = None;

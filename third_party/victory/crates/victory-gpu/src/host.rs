@@ -9507,6 +9507,9 @@ impl Meter {
                         crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                     );
                 }
+                if crate::pagegen::on() {
+                    tracing::info!("{}", crate::pagegen::line());
+                }
                 tracing::info!(
                     "slots of textures made while lists sent before them ran, shown once those had run (VICTORY_SHOW_NEW_LATER={}), since the start: {}",
                     u8::from(crate::descriptor::host::show_new_later()),
