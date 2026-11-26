@@ -156,6 +156,8 @@ const GAIN: f32 = 0.025;
 /// Of the stick, what is left of it at each reading: movement is smoothed
 /// over a few readings.
 const SMOOTH: f32 = 0.8;
+/// Below this the stick is at rest.
+const REST: f32 = 1e-3;
 
 /// The pointer as the stand-in pad's mouse. It is the user's own, and gives
 /// the pad nothing, until a click on the picture (or F9) takes it: from then
@@ -208,14 +210,18 @@ impl Pointer {
         self.click &= input.left;
         let (dx, dy) = if self.fresh { (0, 0) } else { (input.dx, input.dy) };
         self.fresh = false;
-        self.x = self.x * SMOOTH + dx as f32 * GAIN * scale;
-        self.y = self.y * SMOOTH + dy as f32 * GAIN * scale;
+        // Kept at the stick's ends, so a fast flick does not hold it there
+        // after the mouse stops; and what is left after the smoothing is let
+        // to rest, not carried on in ever smaller readings.
+        let settle = |v: f32| if v.abs() < REST { 0.0 } else { v.clamp(-1.0, 1.0) };
+        self.x = settle(self.x * SMOOTH + dx as f32 * GAIN * scale);
+        self.y = settle(self.y * SMOOTH + dy as f32 * GAIN * scale);
         let mouse = Mouse {
             left: input.left && !self.click,
             right: input.right,
-            x: self.x.clamp(-1.0, 1.0),
+            x: self.x,
             // (screen rows grow downwards; the stick's up is positive)
-            y: (-self.y).clamp(-1.0, 1.0),
+            y: -self.y,
         };
         (mouse, true)
     }
@@ -1253,7 +1259,7 @@ mod host {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, GWLP_WNDPROC, GetCursorPos, GetForegroundWindow, GetPropW, GetWindowInfo,
-        GetWindowLongPtrW, GetWindowThreadProcessId, HTCLIENT, RemovePropW, SetCursor, SetCursorPos,
+        GetWindowLongPtrW, GetWindowThreadProcessId, HTCLIENT, IsIconic, RemovePropW, SetCursor, SetCursorPos,
         SetPropW, SetWindowLongPtrW, WINDOWINFO, WM_NCDESTROY, WM_SETCURSOR, WNDPROC,
     };
     use windows_sys::core::{PCWSTR, w};
@@ -1373,12 +1379,13 @@ mod host {
                 TAKEN.store(false, Relaxed);
                 pointer.read(PointerInput::default(), *SCALE).0
             };
-            if !wanted || !focused() {
+            // One look at the foreground window: the window checked is the
+            // window used, even if another comes to the front meanwhile.
+            let Some(hwnd) = wanted.then(ours).flatten() else {
                 return at_rest(&mut self.pointer);
-            }
+            };
             // SAFETY: plain queries; the window is the foreground one, ours.
             unsafe {
-                let hwnd = GetForegroundWindow();
                 let mut info: WINDOWINFO = std::mem::zeroed();
                 info.cbSize = size_of::<WINDOWINFO>() as u32;
                 let mut at = POINT { x: 0, y: 0 };
@@ -1386,6 +1393,12 @@ mod host {
                     return at_rest(&mut self.pointer);
                 }
                 let picture = info.rcClient;
+                // Minimized (its picture at about -32000) or with no picture:
+                // putting the cursor back at its middle would read as a huge
+                // movement every reading, the stick held at its end.
+                if IsIconic(hwnd) != 0 || picture.right <= picture.left || picture.bottom <= picture.top {
+                    return at_rest(&mut self.pointer);
+                }
                 let middle = ((picture.left + picture.right) / 2, (picture.top + picture.bottom) / 2);
                 let input = PointerInput {
                     focused: true,
@@ -1496,11 +1509,17 @@ mod host {
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
+        ours().is_some()
+    }
+
+    /// The foreground window, if it is one of ours.
+    fn ours() -> Option<HWND> {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let hwnd = GetForegroundWindow();
+            GetWindowThreadProcessId(hwnd, &mut process);
+            (!hwnd.is_null() && process == GetCurrentProcessId()).then_some(hwnd)
         }
     }
 
@@ -1999,12 +2018,15 @@ mod tests {
             last = p.read(input(false, true, 8, 8), 1.0).0;
         }
         assert!(last.x > 0.99 && last.x <= 1.0 && last.y < -0.99 && last.y >= -1.0, "{last:?}");
-        // Further is no further than the end; still, it comes back.
+        // Further is no further than the end, and the mouse stopping lets
+        // the stick off it at the next reading (not ~11 readings later)...
         assert_eq!(p.read(input(false, true, 400, 0), 1.0).0.x, 1.0);
+        assert!(p.read(input(false, true, 0, 0), 1.0).0.x < 0.81);
+        // ...and back to rest: exactly 0, not ever smaller readings.
         for _ in 0..60 {
             last = p.read(input(false, true, 0, 0), 1.0).0;
         }
-        assert!(last.x.abs() < 0.01 && last.y.abs() < 0.01, "{last:?}");
+        assert_eq!((last.x, last.y), (0.0, 0.0), "{last:?}");
         // `VICTORY_MOUSE=2`: twice as far.
         let mut twice = Pointer { taken: true, ..Default::default() };
         assert_eq!(twice.read(input(false, true, 4, 0), 2.0).0.x, 0.2);
