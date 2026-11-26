@@ -2344,12 +2344,14 @@ impl HostHeap {
         if !crate::pagegen::on() || len == 0 || index >= self.count {
             return;
         }
-        let (since, kept) = crate::pagegen::arm(at, len);
-        let pages = crate::pagegen::pages_of(at, len);
-        let mut watchers = self.watchers.lock().unwrap_or_else(|e| e.into_inner());
-        watchers.watch(index, pages, since, kept);
-        // (Under the lock: a write of another view meanwhile forgets it after.)
-        self.watched.put(index);
+        // (The pages watched before the tick, the heap's lock let go for the
+        // guarding: `crate::pagegen::watch`.)
+        crate::pagegen::watch(index, at, len, |f| {
+            let mut watchers = self.watchers.lock().unwrap_or_else(|e| e.into_inner());
+            f(&mut watchers);
+            // (Under the lock: a write of another view meanwhile forgets it after.)
+            self.watched.put(index);
+        });
     }
 
     /// Title slot `index`'s texture memory `[at, at + len)` was found away
@@ -2360,9 +2362,11 @@ impl HostHeap {
         if !crate::pagegen::on() || len == 0 || index >= self.count {
             return;
         }
-        let since = crate::pagegen::now();
         let pages = crate::pagegen::pages_of(at, len);
         let mut watchers = self.watchers.lock().unwrap_or_else(|e| e.into_inner());
+        // (Watched before the tick: a mapping told between them is kept.)
+        watchers.begin(index, &pages);
+        let since = crate::pagegen::now();
         watchers.watch(index, pages, since, crate::pagegen::Kept::Told);
         self.watched.put(index);
     }
