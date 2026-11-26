@@ -2859,6 +2859,10 @@ struct Line {
     /// A read brings bytes of flights the card has run back into title
     /// memory ([`reads`]): no landing starts until it is done.
     reading: bool,
+    /// A read waits for the card to run the flight behind which the host's
+    /// fence takes this value ([`reads`]; 0: none): what is ahead of it is
+    /// landed meanwhile, it and what follows it are not.
+    hold: u64,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2876,6 +2880,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     in_hand: Vec::new(),
     landing: Vec::new(),
     reading: false,
+    hold: 0,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3636,10 +3641,18 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let n = landable(&fences, reads::landing_limit(completed, line.hold));
                 if n == 0 {
-                    // The first thing is a flight the card has not run.
-                    break Err(fences[0].unwrap_or(0));
+                    match fences[0] {
+                        // Run, and held for a read ([`reads`]): told when
+                        // it is done.
+                        Some(fence) if fence <= completed => {
+                            line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
+                            continue;
+                        }
+                        // The first thing is a flight the card has not run.
+                        _ => break Err(fences[0].unwrap_or(0)),
+                    }
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();

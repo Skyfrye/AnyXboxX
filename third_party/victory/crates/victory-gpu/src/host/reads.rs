@@ -34,6 +34,8 @@
 //! runs meanwhile: one in its course is waited for, and the thread that
 //! lands takes no new flights until the merge is done (`Line::reading`), so
 //! no fetch made before the card ran the last flight is merged after this.
+//! While the read waits for the card, that thread lands what is ahead of
+//! the flight waited for, and not it ([`landing_limit`]).
 //!
 //! Where that cannot be said the old wait is taken ([`needs`], [`plan`]): a
 //! step of ours that may read or write anything; a title buffer copy into
@@ -281,6 +283,20 @@ pub(super) fn may_land(line: &Line) -> bool {
     !line.line.is_empty() && !line.reading && !held()
 }
 
+/// The fence value up to which the thread that lands flights may land them
+/// ([`landable`]) when the card has reached `completed` and a read waits for
+/// the flight of `hold` ([`Line::hold`]; 0: none): not that flight.
+///
+/// Without it, when the card ran the flight a read waits for, the read and
+/// the thread that lands woke together, and if that thread took the line
+/// first the read waited for the whole landing, as before.
+pub(super) fn landing_limit(completed: u64, hold: u64) -> u64 {
+    match hold {
+        0 => completed,
+        hold => completed.min(hold - 1),
+    }
+}
+
 /// Tests: the thread that lands flights takes none while this is set (a
 /// landing that is late, or never comes). Never set outside them.
 pub(super) static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -335,6 +351,12 @@ impl Host {
         let _waiting = crate::timeline::span("waiting for the card: title memory read");
         let mut card_us = 0u64;
         let mut flights = 0usize;
+        // Lets the thread that lands flights take them all again.
+        let release = |mut line: std::sync::MutexGuard<'_, Line>| {
+            (line.reading, line.hold) = (false, 0);
+            drop(line);
+            RELAY_MOVED.notify_one();
+        };
         loop {
             let mut held = line();
             // A landing in its course is waited for: what it fetched may
@@ -345,12 +367,20 @@ impl Host {
             let plan = match plan(&held.line, &needs) {
                 Ok(Some(plan)) => plan,
                 // Landed meanwhile: title memory holds it.
-                Ok(None) => break,
-                Err(why) => return refused(why),
+                Ok(None) => {
+                    release(held);
+                    break;
+                }
+                Err(why) => {
+                    release(held);
+                    return refused(why);
+                }
             };
             flights = flights.max(plan.flights);
             // SAFETY: a plain query.
             if unsafe { self.fence.GetCompletedValue() } < plan.fence {
+                // What is ahead of it lands meanwhile; it waits for this.
+                held.hold = plan.fence;
                 drop(held);
                 let was_working = working(false);
                 let waiting = std::time::Instant::now();
@@ -376,8 +406,7 @@ impl Host {
             let bringing = std::time::Instant::now();
             let brought = self.bring_back(&plan);
             STATS[3].fetch_add(bringing.elapsed().as_micros() as u64, Ordering::Relaxed);
-            line().reading = false;
-            RELAY_MOVED.notify_one();
+            release(line());
             match brought {
                 Ok((bytes, put)) => {
                     STATS[4].fetch_add(bytes, Ordering::Relaxed);
@@ -773,6 +802,7 @@ mod tests {
             in_hand: Vec::new(),
             landing: Vec::new(),
             reading: false,
+            hold: 0,
         };
         assert!(may_land(&line) || held());
         line.reading = true;
@@ -780,5 +810,21 @@ mod tests {
         line.reading = false;
         line.line.clear();
         assert!(!may_land(&line));
+    }
+
+    /// While a read waits for the flight of fence 6, the flight of 5 and
+    /// what follows it land as soon as the card has run them; the flight of
+    /// 6 does not, even run, and lands once the read lets it.
+    #[test]
+    fn what_is_ahead_of_the_flight_a_read_waits_for_lands_and_not_it() {
+        // Flight 5, its write, flight 6, its write, flight 7.
+        let line = [Some(5), None, Some(6), None, Some(7)];
+        assert_eq!(landable(&line, landing_limit(4, 6)), 0);
+        assert_eq!(landable(&line, landing_limit(5, 6)), 2);
+        assert_eq!(landable(&line, landing_limit(7, 6)), 2);
+        assert_eq!(landable(&line[2..], landing_limit(7, 6)), 0);
+        // Let go.
+        assert_eq!(landable(&line[2..], landing_limit(7, 0)), 3);
+        assert_eq!(landable(&line, landing_limit(6, 0)), 4);
     }
 }
