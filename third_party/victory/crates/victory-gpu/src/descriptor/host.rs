@@ -4037,6 +4037,14 @@ impl HostHeap {
         self.mirror_with(index, handle, true, Some(list))
     }
 
+    /// The view the title's slot at `handle` holds, if one of ours, without
+    /// making anything: what [`Self::mirror_listed`] would show there.
+    pub(crate) fn view_in(handle: u64) -> Option<View> {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+    }
+
     fn mirror_with(&self, index: u32, handle: u64, for_draw: bool, list: Option<&crate::host::HostList>) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the

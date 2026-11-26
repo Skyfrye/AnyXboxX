@@ -3913,12 +3913,22 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        // What the slot shows is read first, so its upload is this list's
+        // before the slot is made: a texture cut from a block that no upload
+        // filled yet is then shown at once to a list that uploads it
+        // (`crate::pool::fill`), not the stand-in and then the texture (which
+        // made the descriptor twice, put a passing grey in the shared title
+        // slot, and counted every first read as stood in).
+        let read_first = crate::descriptor::host::HostHeap::view_in(handle);
+        if let Some(view) = &read_first {
+            readable(list, u.kind, view);
+        }
         if let Some(view) = host.mirror_listed(index, handle, list) {
-            readable(list, u.kind, &view);
-            // A texture cut from a block that no upload filled yet is shown
-            // in the slot only to a list that uploads it (`crate::pool::fill`):
-            // made again now that this one does. One whose upload this list
-            // could not have stays the texture pass's.
+            if read_first.is_none() {
+                readable(list, u.kind, &view);
+            }
+            // Still the stand-in, yet uploaded by this list: made again. One
+            // whose upload this list could not have stays the texture pass's.
             let mut stays = false;
             if host.shows_none(index)
                 && let Some(copy) = crate::descriptor::host::view_copy(&view)
