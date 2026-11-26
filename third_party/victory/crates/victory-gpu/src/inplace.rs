@@ -436,7 +436,10 @@ pub(crate) fn physical(start: usize, end: usize, mut each: impl FnMut(usize, Opt
         .next_back()
         .filter(|(base, view)| *base + view.0 > first * K64)
         .map_or(first * K64, |(base, _)| *base);
-    for (&base, &(bytes, section, offset)) in v.views.range(from..last * K64) {
+    // (A range that runs to the end of the address space: its last block's
+    // end is past it.)
+    let stop = last.checked_mul(K64).unwrap_or(usize::MAX);
+    for (&base, &(bytes, section, offset)) in v.views.range(from..stop) {
         let (shown, past) = (base.div_ceil(K64), (base + bytes) / K64);
         while block < shown.min(last) {
             each(block * K64, None);

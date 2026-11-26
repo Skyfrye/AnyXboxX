@@ -920,6 +920,22 @@ mod tests {
         assert!(entry(shared).is_none());
     }
 
+    /// A write told up to the end of the address space (a title's `fread`
+    /// with a huge count) is looked up to there, its last block's end being
+    /// past it. (The lookup overflowed whenever a slot watched pages: the
+    /// watch tests' `ranges_past_the_address_space_end_do_not_overflow`
+    /// failed when one of these ran beside it.)
+    #[test]
+    fn a_write_up_to_the_end_of_the_address_space_is_looked_up() {
+        TEST_ON.set(Some(true));
+        let at = own_memory(PAGE);
+        let mut watchers = Watchers::default();
+        watchers.watch(1, pages_of(at, PAGE), now(), Kept::Told);
+        written(usize::MAX - 16, PAGE);
+        assert_eq!(pages_of(usize::MAX - 16, 16), [Page::at(usize::MAX)]);
+        assert!(watchers.moved().is_empty());
+    }
+
     /// `bytes` of memory of our own (no view, not write-watched) that no
     /// other test is given: never freed, so its addresses, by which its
     /// pages are watched, are this test's alone. (Heap memory of a `Vec` is
