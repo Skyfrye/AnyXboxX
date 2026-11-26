@@ -478,12 +478,29 @@ fn library() -> Option<&'static Library> {
                 Some(dir) => open_dir(dir, keeps_other(), |blob| load(&device, blob)).or_else(|| empty(&device)),
                 None => open(&device, Blob::None),
             };
-            if library.is_none() {
-                tracing::warn!("no host pipeline library: pipelines are not kept");
+            match &library {
+                Some(library) => library.publish(),
+                None => tracing::warn!("no host pipeline library: pipelines are not kept"),
             }
             library
         })
         .as_ref()
+}
+
+impl Library {
+    /// Makes this library's bytes the ones the memory line, [`trim`] and
+    /// [`removal_note`] read: only the process's own library, which is never
+    /// dropped. A library made and dropped (an open that took the other
+    /// setup's file, a test) would leave [`VIEW`] pointing at a view that is
+    /// unmapped, and the removal report would read it.
+    fn publish(&self) {
+        BLOB.store(self._blob.bytes().len() as u64, Ordering::Relaxed);
+        if let Blob::Mapped(file) = &self._blob {
+            VIEW[1].store(file.len, Ordering::Relaxed);
+            VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
+            LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+        }
+    }
 }
 
 /// The library of the cache folder `dir`, made by `load` (which hands back
@@ -579,18 +596,13 @@ fn open_dir<L>(dir: &std::path::Path, other: bool, mut load: impl FnMut(Blob) ->
 
 /// The library the host makes from `blob` (not empty), or the blob back
 /// with the host's reason for rejecting it (an adapter or driver change,
-/// another setup of the device, damage).
+/// another setup of the device, damage). Publishes nothing: only
+/// [`library`] makes its own library's bytes known ([`Library::publish`]).
 fn load(device: &ID3D12Device1, blob: Blob) -> Result<Library, (Blob, String)> {
     match make(device, blob.bytes()) {
         Ok(library) => {
             let bytes = blob.bytes().len();
-            BLOB.store(bytes as u64, Ordering::Relaxed);
             tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
-            if let Blob::Mapped(file) = &blob {
-                VIEW[1].store(file.len, Ordering::Relaxed);
-                VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
-                LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-            }
             Ok(Library {
                 library,
                 _blob: blob,
@@ -1036,14 +1048,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
-        // A library this host made: an empty one, serialised.
-        let made = empty(&device).expect("an empty library");
-        // SAFETY: a plain query on a live library.
-        let size = unsafe { made.library.GetSerializedSize() };
-        let mut mine = vec![0u8; size];
-        // SAFETY: a buffer of the size the library asks for.
-        unsafe { made.library.Serialize(&mut mine) }.expect("serialised");
-        drop(made);
+        let mine = made_here(&device);
         let theirs = b"another setup's pipeline library".repeat(64);
         std::fs::write(d.join(LIBRARY_FILE), &theirs).unwrap();
         std::fs::write(d.join(OTHER_FILE), &mine).unwrap();
@@ -1059,6 +1064,46 @@ mod tests {
         let again = open_dir(d, true, |blob| load(&device, blob)).expect("loaded from the library's file");
         assert_eq!(again._blob.bytes(), &mine[..]);
         assert_eq!(read(d, OTHER_FILE).as_deref(), Some(&theirs[..]));
+    }
+
+    /// A library this host made: an empty one, serialised.
+    fn made_here(device: &ID3D12Device1) -> Vec<u8> {
+        let made = empty(device).expect("an empty library");
+        // SAFETY: a plain query on a live library.
+        let size = unsafe { made.library.GetSerializedSize() };
+        let mut bytes = vec![0u8; size];
+        // SAFETY: a buffer of the size the library asks for.
+        unsafe { made.library.Serialize(&mut bytes) }.expect("serialised");
+        bytes
+    }
+
+    /// Only the process's own library makes its mapped file known: a library
+    /// loaded from a mapped file and dropped (as the test above does) leaves
+    /// no view behind. Before, `load` published every library's view, and
+    /// the removal report then read the unmapped view and killed the test
+    /// process (the test above, then `host::trail`'s removal report).
+    #[test]
+    fn a_library_loaded_and_dropped_leaves_no_view_behind() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&path, made_here(&device)).unwrap();
+        let file = Mapped::open_holding(&path, true).expect("the file, mapped");
+        let at = file.at.Value as usize;
+        let library = load(&device, Blob::Mapped(file)).ok().expect("the host takes its own library");
+        let published = VIEW[0].load(Ordering::Relaxed) == at;
+        if published {
+            // Not left behind for the other tests, even when this one fails.
+            VIEW[0].store(0, Ordering::Relaxed);
+            VIEW[1].store(0, Ordering::Relaxed);
+        }
+        drop(library);
+        assert!(!published, "a library that is not the process's own published its mapped view");
+        // Nothing reads the unmapped view now: no library of the process's
+        // own is mapped in tests (no cache folder).
+        assert!(removal_note().contains("its file is not mapped"));
     }
 
     /// A mapped file reads as the file's bytes, a file written through a
