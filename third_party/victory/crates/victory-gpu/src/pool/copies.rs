@@ -144,6 +144,24 @@ fn grow() {
     }
 }
 
+/// Makes blocks until `places` are free (measurements).
+#[cfg(test)]
+pub(crate) fn reserve(device: &ID3D12Device, places: usize) {
+    while lock().free.len() < places {
+        if !reserve_one(device) {
+            return;
+        }
+    }
+}
+
+/// Makes a block (measurements).
+#[cfg(test)]
+pub(crate) fn reserve_one(device: &ID3D12Device) -> bool {
+    let Some((heap, ticket)) = block(device) else { return false };
+    lock().add(heap, ticket);
+    true
+}
+
 /// A block: the PC's memory that the CPU maps (write-back) and shaders read
 /// and write, as [`crate::host::Host::shared_buffer`]'s; and its ticket.
 fn block(device: &ID3D12Device) -> Option<(ID3D12Heap, u64)> {
