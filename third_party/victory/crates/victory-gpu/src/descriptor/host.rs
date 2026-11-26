@@ -404,117 +404,231 @@ fn note_before(index: u32, was: u64, by: &'static str) {
     }
 }
 
-/// A 1x1 gray texture, in the place of one that is not there yet.
-fn neutral() -> Option<&'static ID3D12Resource> {
-    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
-    TEXTURE
-        .get_or_init(|| {
-            let host = host()?;
-            let device = &host.device;
-            let (from, data) = host.upload_buffer(256)?;
-            // SAFETY: the buffer's mapping; plain creation and recording,
-            // waited for before what it names goes.
-            unsafe {
-                std::ptr::write_bytes(data, 0x80, 256);
-                let mut made: Option<ID3D12Resource> = None;
-                device
-                    .CreateCommittedResource(
-                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-                        D3D12_HEAP_FLAG_NONE,
-                        &D3D12_RESOURCE_DESC {
-                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                            Width: 1,
-                            Height: 1,
-                            DepthOrArraySize: 1,
-                            MipLevels: 1,
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                            ..Default::default()
-                        },
-                        D3D12_RESOURCE_STATE_COMMON,
-                        None,
-                        &mut made,
-                    )
-                    .ok()?;
-                let made = made?;
-                let queue: ID3D12CommandQueue = device
-                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
-                    .ok()?;
-                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
-                let list: ID3D12GraphicsCommandList =
-                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
-                let to = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&made),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-                };
-                let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: 0,
-                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                        Width: 1,
-                        Height: 1,
-                        Depth: 1,
-                        RowPitch: 256,
-                    },
-                };
-                let source = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&from),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
-                };
-                list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
-                list.Close().ok()?;
-                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-                queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
-                queue.Signal(&fence, 1).ok()?;
-                // (Without an event: this waits.)
-                fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).ok()?;
-                Some(made)
-            }
-        })
-        .as_ref()
+/// What a slot of a texture that is not there yet reads: mid grey with
+/// full alpha. Grey keeps a normal map flat and a roughness or colour
+/// middling; full alpha keeps a surface that an alpha test cuts (hair,
+/// leaves, decals) drawn where a null view's zeros (black, alpha 0) made
+/// it vanish, and where the old stand-in's half alpha left it to the
+/// test's threshold.
+const NEUTRAL_TEXEL: [u8; 4] = [0x80, 0x80, 0x80, 0xff];
+
+/// The shapes of stand-in textures, one for each kind of shader view a
+/// title names: a view of each kind needs a texture of its own kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Neutral {
+    /// 1D and 1D array views.
+    Line = 0,
+    /// 2D and 2D array views.
+    Flat = 1,
+    /// Cube and cube array views: six slices.
+    Cube = 2,
+    /// 3D views.
+    Volume = 3,
 }
 
-/// Makes the descriptor of [`neutral`] for a slot of `view` at `at`, if the
-/// view is a 2D texture's or an array's; else a null one of its kind.
-fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    const TEXTURE2D: u32 = 4;
-    const TEXTURE2D_ARRAY: u32 = 5;
-    let dimension = match view {
-        View::Shader(_, Some(desc)) => desc[1],
-        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
-        _ => 0,
+/// The stand-in texture of `kind`: 1x1 (and one deep), each slice
+/// [`NEUTRAL_TEXEL`], made and filled once.
+fn neutral(kind: Neutral) -> Option<&'static ID3D12Resource> {
+    static TEXTURES: [std::sync::OnceLock<Option<ID3D12Resource>>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    TEXTURES[kind as usize].get_or_init(|| make_neutral(kind)).as_ref()
+}
+
+fn make_neutral(kind: Neutral) -> Option<ID3D12Resource> {
+    // A slice's texel starts on the placement alignment, its row on the
+    // pitch alignment.
+    const SLICE: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+    let host = host()?;
+    let device = &host.device;
+    let (dimension, slices) = match kind {
+        Neutral::Line => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1u16),
+        Neutral::Flat => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1),
+        Neutral::Cube => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6),
+        Neutral::Volume => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, 1),
     };
-    let desc = match dimension {
-        TEXTURE2D => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
-            },
+    let (from, data) = host.upload_buffer(SLICE * u64::from(slices))?;
+    // SAFETY: the buffer's mapping; plain creation and recording,
+    // waited for before what it names goes.
+    unsafe {
+        for slice in 0..usize::from(slices) {
+            std::ptr::copy_nonoverlapping(NEUTRAL_TEXEL.as_ptr(), data.add(slice * SLICE as usize), NEUTRAL_TEXEL.len());
+        }
+        let mut made: Option<ID3D12Resource> = None;
+        device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: dimension,
+                    Width: 1,
+                    Height: 1,
+                    DepthOrArraySize: slices,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut made,
+            )
+            .ok()?;
+        let made = made?;
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+            .ok()?;
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
+        let list: ID3D12GraphicsCommandList =
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
+        for slice in 0..u32::from(slices) {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&made),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: slice },
+            };
+            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: u64::from(slice) * SLICE,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    Width: 1,
+                    Height: 1,
+                    Depth: 1,
+                    RowPitch: D3D12_TEXTURE_DATA_PITCH_ALIGNMENT,
+                },
+            };
+            let source = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&from),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
+        }
+        list.Close().ok()?;
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
+        queue.Signal(&fence, 1).ok()?;
+        // (Without an event: this waits.)
+        fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).ok()?;
+        Some(made)
+    }
+}
+
+/// The shader view dimension (`D3D12_SRV_DIMENSION`) of a view of a
+/// texture: what its description says, or for a view of a texture object
+/// with none, what D3D12 takes from the texture
+/// ([`crate::resource::own_view_dimension`]). 0: no texture view.
+fn view_dimension(view: &View) -> u32 {
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
+        View::Shader(r, desc) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => match desc {
+            Some(desc) => desc[1],
+            None => crate::resource::own_view_dimension(*r as crate::object::This),
         },
-        TEXTURE2D_ARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+        _ => 0,
+    }
+}
+
+/// The stand-in kind and view description for a texture view of SRV
+/// dimension `dimension`; `None` for a dimension that has none (buffers,
+/// multisampled textures).
+fn neutral_desc(dimension: u32) -> Option<(Neutral, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    let (kind, view_dimension, anonymous) = match D3D12_SRV_DIMENSION(dimension as i32) {
+        D3D12_SRV_DIMENSION_TEXTURE1D => (
+            Neutral::Line,
+            D3D12_SRV_DIMENSION_TEXTURE1D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture1D: D3D12_TEX1D_SRV { MipLevels: 1, ..Default::default() } },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => (
+            Neutral::Line,
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
+            },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURE2D => (
+            Neutral::Flat,
+            D3D12_SRV_DIMENSION_TEXTURE2D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => (
+            Neutral::Flat,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
             },
-        },
-        _ => {
-            null_for(view, at);
-            return None;
-        }
+        ),
+        D3D12_SRV_DIMENSION_TEXTURE3D => (
+            Neutral::Volume,
+            D3D12_SRV_DIMENSION_TEXTURE3D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture3D: D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() } },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURECUBE => (
+            Neutral::Cube,
+            D3D12_SRV_DIMENSION_TEXTURECUBE,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 { TextureCube: D3D12_TEXCUBE_SRV { MipLevels: 1, ..Default::default() } },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => (
+            Neutral::Cube,
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 1, NumCubes: 1, ..Default::default() },
+            },
+        ),
+        _ => return None,
     };
-    let (Some(texture), Some(host)) = (neutral(), host()) else {
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: view_dimension,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: anonymous,
+    };
+    Some((kind, desc))
+}
+
+/// Makes the descriptor of the [`neutral`] texture of `view`'s dimension
+/// for a slot of `view` at `at`; a null one of its kind if it has none
+/// (multisampled textures, buffers).
+fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    let Some((kind, desc)) = neutral_desc(view_dimension(view)) else {
+        null_for(view, at);
+        return None;
+    };
+    let (Some(texture), Some(host)) = (neutral(kind), host()) else {
         null_for(view, at);
         return None;
     };
     // SAFETY: a slot of our heap, a live texture.
     unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), at) };
     Some(texture.clone())
+}
+
+/// Whether a slot written with texture view `view`, left for the texture
+/// pass or a draw to make (it is not uploaded yet), shows the [`neutral`]
+/// stand-in meanwhile (`VICTORY_STAND_IN=0`: it is null, as before, and
+/// reads zeros). Only of a texture the title fills: one the host renders
+/// to or writes is made at the next pass and has no colour to stand for.
+fn stands_in(view: &View) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_STAND_IN").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    match view {
+        View::Placed(false, resource, _) => crate::resource::placed_fills(resource),
+        View::Shader(r, _) => {
+            let r = *r as crate::object::This;
+            crate::resource::buffer_bytes(r).is_none() && crate::resource::title_fills(r)
+        }
+        _ => false,
+    }
+}
+
+/// Texture slots made to show the [`neutral`] stand-in and made null, since
+/// the start (`crate::host`'s line every five seconds gives them a frame).
+pub(crate) static STAND_INS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Counts a texture slot made to show the stand-in (`shown`: what
+/// [`neutral_for`] gave) or made null.
+fn stood_in(shown: Option<&ID3D12Resource>) {
+    STAND_INS[usize::from(shown.is_none())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
@@ -2474,6 +2588,7 @@ impl HostHeap {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 let kept = neutral_for(&view, self.at(index));
+                stood_in(kept.as_ref());
                 self.put(index);
                 self.clear_twin(index);
                 LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
@@ -3635,6 +3750,7 @@ impl HostHeap {
                     self.quick_is(index, 0);
                     self.made.set(index, 0);
                     let kept = neutral_for(&view, self.at(index));
+                    stood_in(kept.as_ref());
                     self.put(index);
                     self.clear_twin(index);
                     self.keep(index, kept);
@@ -3647,24 +3763,42 @@ impl HostHeap {
                 self.unmake_stale(index, stale);
                 return Some(view);
             }
+            // A texture left for the texture pass or a draw (not uploaded
+            // yet) shows the stand-in until then ([`stands_in`]): null, it
+            // read as zeros from this write to the pass that uploads it,
+            // half a second on average and some twenty seconds when its
+            // memory came later (run nb1: black surfaces, and hair and
+            // decals gone with their alpha).
+            let stand_in = later && !self.sampler && is_texture_view(&view) && stands_in(&view);
             #[cfg(feature = "diagnostics")]
             if !self.sampler && is_texture_view(&view) {
-                note_before(index, shown, if later { "null, waits" } else { "at once" });
+                note_before(index, shown, if stand_in { "stand-in, waits" } else if later { "null, waits" } else { "at once" });
             }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
-            let kept = if later {
+            let made = if later {
                 None
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
-            }
+            let twin = made.is_some() && twinned(&view);
+            let kept = if stand_in {
+                let shown = neutral_for(&view, self.at(index));
+                stood_in(shown.as_ref());
+                Some(shown)
+            } else {
+                if made.is_none() && !self.sampler {
+                    null_for(&view, self.at(index));
+                    if is_texture_view(&view) {
+                        stood_in(None);
+                    }
+                }
+                made
+            };
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }
-            self.twin_made(index, kept.is_some() && twinned(&view));
+            self.twin_made(index, twin);
             self.keep(index, kept.flatten());
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
@@ -5452,7 +5586,8 @@ mod tests {
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
     }
 
-    /// 2D textures and arrays have a neutral stand-in, others a null view.
+    /// Every kind of texture view a title names has a stand-in of its own
+    /// kind; multisampled views and buffers get a null view.
     #[test]
     fn a_texture_not_there_yet_has_a_neutral_stand_in() {
         let Some(host) = host() else { return };
@@ -5468,12 +5603,141 @@ mod tests {
                 .unwrap();
             let at = heap.GetCPUDescriptorHandleForHeapStart();
             let view = |dimension| View::Shader(0, Some([98, dimension, 5768, 0, 0, 1, 0, 1, 0, 0]));
-            assert!(neutral_for(&view(4), at).is_some());
-            assert!(neutral_for(&view(5), at).is_some());
-            assert!(neutral_for(&view(9), at).is_none());
-            assert!(neutral_for(&view(8), at).is_none());
+            // 1D, 1D array, 2D, 2D array, 3D, cube, cube array.
+            for dimension in [2, 3, 4, 5, 8, 9, 10] {
+                assert!(neutral_for(&view(dimension), at).is_some(), "dimension {dimension}");
+            }
+            for dimension in [1, 6, 7] {
+                assert!(neutral_for(&view(dimension), at).is_none(), "dimension {dimension}");
+            }
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    /// Each stand-in holds opaque mid grey in every slice: a null view's
+    /// alpha 0 made alpha-tested surfaces vanish, the old stand-in's half
+    /// alpha left them to the test's threshold.
+    #[test]
+    fn the_stand_ins_are_opaque_grey_in_every_slice() {
+        let Some(host) = host() else { return };
+        for (kind, slices) in [(Neutral::Line, 1), (Neutral::Flat, 1), (Neutral::Cube, 6), (Neutral::Volume, 1)] {
+            let texture = neutral(kind).expect("a stand-in");
+            assert_eq!(read_texels(host, texture, slices), vec![[0x80, 0x80, 0x80, 0xff]; slices as usize], "{kind:?}");
+        }
+    }
+
+    /// The first texel of each of the first `slices` subresources of
+    /// `texture` (1x1 R8G8B8A8), read back through a copy.
+    fn read_texels(host: &crate::host::Host, texture: &ID3D12Resource, slices: u32) -> Vec<[u8; 4]> {
+        const SLICE: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+        let device = &host.device;
+        // SAFETY: plain creation, recording and a waited-for copy into a
+        // readback buffer that is mapped only after it.
+        unsafe {
+            let mut back: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: SLICE * u64::from(slices),
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut back,
+                )
+                .unwrap();
+            let back = back.unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).unwrap();
+            for slice in 0..slices {
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: slice },
+                };
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: u64::from(slice) * SLICE,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: 1,
+                                Height: 1,
+                                Depth: 1,
+                                RowPitch: D3D12_TEXTURE_DATA_PITCH_ALIGNMENT,
+                            },
+                        },
+                    },
+                };
+                list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            list.Close().unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).unwrap();
+            let texels = (0..slices as usize)
+                .map(|slice| std::ptr::read(data.cast::<u8>().add(slice * SLICE as usize).cast::<[u8; 4]>()))
+                .collect();
+            back.Unmap(0, None);
+            texels
+        }
+    }
+
+    /// The record words of `view`, written at the start of `slot` (a
+    /// title descriptor of 16 bytes): what the title's heap would hold.
+    fn write_record(slot: &mut [u32; 4], view: View) -> u64 {
+        let [i, generation] = super::super::words_for(view);
+        slot[..3].copy_from_slice(&[VIEW_TAG, i, generation]);
+        slot.as_mut_ptr() as u64
+    }
+
+    /// A 64x64 BC7 2D texture's view placed at `address`.
+    fn placed_2d(address: u64, format: u32) -> View {
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1], desc[10], desc[11]) = (format, 4, address as u32, (address >> 32) as u32);
+        View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+    }
+
+    /// A slot written with a texture the texture pass has yet to upload
+    /// shows the stand-in meanwhile: no view of ours reads zeros between
+    /// the write and that pass. The slot is still the pass's to make.
+    #[test]
+    fn a_texture_slot_shows_the_stand_in_until_its_pass() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let mut slot = [0u32; 4];
+        // An address no other test and no title uses.
+        let handle = write_record(&mut slot, placed_2d(0x7fee_3000_0000, 98));
+        assert!(heap.mirror(3, handle, false).is_some());
+        assert!(heap.shows_none(3), "the pass makes it");
+        let shown = heap.kept_in(3).expect("a stand-in, not a null view");
+        assert_eq!(shown.as_raw(), neutral(Neutral::Flat).unwrap().as_raw());
+        // A buffer view left for its draw stays null.
+        let mut words = [0u32; 4];
+        let mut buffer = placed_2d(0x7fee_3001_0000, 98);
+        if let View::Placed(_, resource, desc) = &mut buffer {
+            (resource[0], desc[1]) = (1, 1);
+        }
+        let handle = write_record(&mut words, buffer);
+        heap.mirror(4, handle, false);
+        assert!(heap.kept_in(4).is_none());
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.
