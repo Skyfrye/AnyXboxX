@@ -26,6 +26,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 pub(crate) mod copies;
+pub(crate) mod fill;
 
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
@@ -429,6 +430,21 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// The texture's address ([`PLACED`]).
+    texture: usize,
+}
+
+/// The textures cut from a block that are alive, by address: whether the
+/// part of the block each lies in held another texture before
+/// (`crate::pool::fill`).
+static PLACED: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, bool>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether `texture` was cut from a block, and if so whether its part of
+/// the block held another texture before: what lies there then is that
+/// texture's bytes, not zeros.
+pub(crate) fn placed(texture: &ID3D12Resource) -> Option<bool> {
+    lock(&PLACED).get(&(texture.as_raw() as usize)).copied()
 }
 
 struct Methods([*const (); 3]);
@@ -465,6 +481,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
+            lock(&PLACED).remove(&gone.texture);
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
@@ -628,17 +645,23 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
     unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
-/// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+/// Makes `texture` give `piece` back when the last reference to it goes;
+/// `again`: the piece held another texture before ([`placed`]).
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, again: bool) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let raw = texture.as_raw() as usize;
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, texture: raw }));
+    // (Before the texture holds it: its last reference may go at once.)
+    lock(&PLACED).insert(raw, again);
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
         if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
-            // under a texture that may be alive.
+            // under a texture that may be alive. Nor told of: nothing says
+            // when its address is another resource's.
+            lock(&PLACED).remove(&raw);
             std::mem::forget(object);
         }
     }
@@ -672,7 +695,6 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
@@ -708,7 +730,7 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            give_back_with(&made, piece, again);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -908,6 +930,30 @@ mod tests {
         assert!(held >= before);
         drop(made);
         assert_eq!(crate::host::references(&heap), before);
+    }
+
+    /// A texture cut from a block is told so, and whether its piece held
+    /// another texture before (`crate::pool::fill`), for as long as it lives:
+    /// its address may be another resource's after.
+    #[test]
+    fn a_pooled_texture_is_told_for_as_long_as_it_lives() {
+        let Some(host) = crate::host::host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 128,
+            Height: 128,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // SAFETY: a valid description.
+        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
+        let raw = t.as_raw() as usize;
+        assert!(placed(&t).is_some());
+        drop(t);
+        assert!(!lock(&PLACED).contains_key(&raw));
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not

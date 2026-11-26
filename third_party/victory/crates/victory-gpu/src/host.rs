@@ -5923,6 +5923,15 @@ impl Host {
         let sampled: Vec<Vec<crate::texture::Sampled>> = runs.iter().map(|list| list.deferred().sampled.clone()).collect();
         let late_uploads = crate::texture::late_uploads(&sampled);
         drop(sampled);
+        // Textures cut from a block where another lay, since the last
+        // submission: zeros, ahead of every list of this one and of the
+        // preludes, which find them in the state they left them in
+        // (`crate::pool::fill`).
+        if let Some(zeros) = crate::pool::fill::front(self, this_submission) {
+            #[cfg(feature = "diagnostics")]
+            marks.push((lists.len(), crate::copystat::Timed::Other));
+            lists.push(Some(zeros));
+        }
         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
         for ((_run, list), uploads) in runs.iter().enumerate().zip(&late_uploads) {
             firsts.push(lists.len());
@@ -9546,6 +9555,7 @@ impl Meter {
                         now[1]
                     );
                 }
+                tracing::info!("{}", crate::pool::fill::line());
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");

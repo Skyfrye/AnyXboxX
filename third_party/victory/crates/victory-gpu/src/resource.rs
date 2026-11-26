@@ -1304,6 +1304,9 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// Cut from a block: its zeros, and whether an upload filled it
+    /// (`crate::pool::fill`).
+    pub(crate) fill: crate::pool::fill::Fill,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1823,7 +1826,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
-        *made = Some((std::sync::Arc::new(host), twin));
+        let host = std::sync::Arc::new(host);
+        // Cut where another texture lay: zeros ahead of the next submission.
+        crate::pool::fill::placed(&host);
+        *made = Some((host, twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -2493,6 +2499,7 @@ impl HostTexture {
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        let fill = crate::pool::fill::Fill::of(&texture);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2507,7 +2514,15 @@ impl HostTexture {
             prefill: Default::default(),
             prefilled: Default::default(),
             flags,
+            fill,
         }
+    }
+
+    /// A host copy of `texture` in `state`, as one is made for a title
+    /// texture (tests).
+    #[cfg(test)]
+    pub(crate) fn for_tests(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+        HostTexture::new(texture, state)
     }
 
     /// A texture made without memory of its own (`crate::tiles`): counted
@@ -2534,6 +2549,7 @@ impl HostTexture {
             prefill: Default::default(),
             prefilled: Default::default(),
             flags,
+            fill: crate::pool::fill::Fill::none(),
         }
     }
 }
