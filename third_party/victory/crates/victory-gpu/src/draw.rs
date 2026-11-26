@@ -280,6 +280,29 @@ static BAKED_MS: AtomicU64 = AtomicU64::new(0);
 /// their heap still showed a stand-in ([`State::bake_left`]).
 static BAKES_LEFT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Since the start: draws taken for the title's bake by their targets alone
+/// ([`State::bake_targets`]; none of their programs is a known bake's).
+/// Each costs a pass and a wait for the card: one in gameplay (a compositing
+/// or virtual-texture pass of that shape) would make every such draw wait.
+pub(crate) static BAKES_BY_TARGETS: AtomicU64 = AtomicU64::new(0);
+
+/// Notes a draw taken for a bake by its targets alone ([`BAKES_BY_TARGETS`]):
+/// its pixel shader's hash is logged the first time it is seen, with the
+/// count so far.
+fn bake_by_targets(pixel: Option<&str>) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let n = BAKES_BY_TARGETS.fetch_add(1, Ordering::Relaxed) + 1;
+    let pixel = pixel.unwrap_or("none");
+    let new = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(pixel.to_owned());
+    if new {
+        tracing::info!(
+            pixel_shader = pixel,
+            so_far = n,
+            "a draw taken for the title's decoration bake by its targets alone (no depth, four or more targets, a square of 512 or more): its textures are made exact and the card waited for"
+        );
+    }
+}
+
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2319,7 +2342,17 @@ impl State {
     /// `VICTORY_BAKE_SYNC=1`: a permutation not in [`BAKE_PIXEL_SHADERS`]
     /// got no pass before it at all.)
     fn is_bake_draw<'a>(&self, shaders: impl IntoIterator<Item = &'a str>) -> bool {
-        bake_shaders(shaders) || self.bake_targets()
+        self.bake_draw(shaders).is_some()
+    }
+
+    /// [`State::is_bake_draw`], and how: `Some(true)` by a program,
+    /// `Some(false)` by the targets alone.
+    fn bake_draw<'a>(&self, shaders: impl IntoIterator<Item = &'a str>) -> Option<bool> {
+        if bake_shaders(shaders) {
+            Some(true)
+        } else {
+            self.bake_targets().then_some(false)
+        }
     }
 
     /// Whether the bound targets are a bake's: no depth, four targets or
@@ -2345,7 +2378,11 @@ impl State {
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
-        let is_bake = bake_ms > 0 && self.is_bake_draw(p.stages.iter().map(|s| s.shader.hash.as_str()));
+        let bake = if bake_ms > 0 { self.bake_draw(p.stages.iter().map(|s| s.shader.hash.as_str())) } else { None };
+        if bake == Some(false) {
+            bake_by_targets(p.stages.last().map(|s| s.shader.hash.as_str()));
+        }
+        let is_bake = bake.is_some();
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
         let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
@@ -5249,6 +5286,46 @@ mod bake_tests {
         assert!(!state.is_bake_draw([OTHER, OTHER]), "too small");
         state.targets = (0..3).map(|_| target(512, 512)).collect();
         assert!(!state.is_bake_draw([OTHER, OTHER]), "three targets");
+    }
+
+    /// How a draw is taken for a bake: by a program, or by its targets
+    /// alone, which are counted ([`BAKES_BY_TARGETS`]) and logged by pixel
+    /// shader: a false match in gameplay would make every such draw wait for
+    /// the card.
+    #[test]
+    fn draws_taken_for_a_bake_by_their_targets_alone_are_told_apart() {
+        const OTHER: &str = "0000000000000000";
+        let mut state = State::default();
+        assert_eq!(state.bake_draw([OTHER, OTHER]), None);
+        assert_eq!(state.bake_draw([OTHER, "c0a7fe77b1862e10"]), Some(true));
+        let target = |width: u64, height: u32| crate::resource::test_texture(3, width, height, 1) as usize;
+        state.targets = (0..4).map(|_| target(512, 512)).collect();
+        assert_eq!(state.bake_draw([OTHER, OTHER]), Some(false));
+        assert_eq!(state.bake_draw([OTHER, "c0a7fe77b1862e10"]), Some(true), "a program first");
+        let before = BAKES_BY_TARGETS.load(Ordering::Relaxed);
+        bake_by_targets(Some(OTHER));
+        bake_by_targets(Some(OTHER));
+        assert!(BAKES_BY_TARGETS.load(Ordering::Relaxed) >= before + 2);
+    }
+
+    /// A slot whose flip waits in a list not sent yet asks no settle of the
+    /// card before a bake: no settle brings it nearer, and the bake takes
+    /// its upload through its own list. (It settled the whole card for it,
+    /// up to four times a bake.)
+    #[test]
+    fn a_flip_waiting_in_a_list_asks_no_settle_before_a_bake() {
+        let Some(gpu) = crate::host::host() else { return };
+        let h = crate::descriptor::test_view_heap(16);
+        let heap = crate::descriptor::heap(h);
+        let Some(host) = heap.host() else { return };
+        let texture = crate::resource::test_texture(3, 4, 4, 1);
+        let handle = heap.handle(6).unwrap();
+        crate::descriptor::create_srv(std::ptr::null(), texture, std::ptr::null(), handle);
+        let other = gpu.new_list().unwrap();
+        host.texture_slot_show_after(&other, 6, handle);
+        assert_eq!(host.stand_ins_left()[1], 1, "behind the list's flip");
+        assert!(!host.needs_gpu_settle_for_bake());
+        drop(other);
     }
 
     /// A slot whose flip waits in a list not sent yet shows the stand-in.

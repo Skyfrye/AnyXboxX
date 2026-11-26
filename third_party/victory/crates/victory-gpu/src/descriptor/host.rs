@@ -2982,16 +2982,13 @@ impl HostHeap {
 
     /// Whether any deferred slot flip or view remake for this heap requires
     /// settling in-flight GPU submissions before exposing real textures to a
-    /// one-shot decoration bake draw.
+    /// one-shot decoration bake draw. Not a flip that waits in a list not
+    /// sent yet: no settle brings that nearer, and the bake takes it through
+    /// its own list ([`HostHeap::take_pending_list_flips`]). (It settled the
+    /// whole card for it, up to four times a bake.)
     pub(crate) fn needs_gpu_settle_for_bake(&self) -> bool {
         let own = std::ptr::from_ref(self) as usize;
         let finished = crate::host::submissions().1;
-        if PENDING_LIST_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0 {
-            let pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
-            if pending.iter().any(|p| p.flip.heap == own) {
-                return true;
-            }
-        }
         {
             let flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
             if flips.iter().any(|f| f.heap == own && f.after > finished) {
