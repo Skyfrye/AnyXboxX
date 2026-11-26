@@ -1084,8 +1084,14 @@ impl View {
 /// resource objects (freed with the resource), samplers (as many as there
 /// are sampler states), and the shapes of placed views (their descriptions
 /// without the address: as many as the title has kinds of textures and
-/// buffers, however often it moves them).
+/// buffers, however often it moves them, once the words the title leaves
+/// unwritten are left out: [`placed_resource_words`], [`placed_view_words`]).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+///
+/// What is still an entry without a resource (a placed view once the shapes
+/// are full, or one past 1 TiB; a constant buffer view that does not fit
+/// its record) is kept up to [`ownerless_cap`] entries, oldest freed first.
+#[cfg_attr(test, derive(Default))]
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -1096,6 +1102,13 @@ struct Views {
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
     shape_index: std::collections::BTreeMap<Shape, u32>,
+    /// Entries no resource owns (constant buffer views and views of placed
+    /// memory), oldest first, with the generation each was made at: past
+    /// [`ownerless_cap`] the oldest is freed, as nothing else frees them.
+    ownerless: std::collections::VecDeque<(u32, u32)>,
+    /// Entries of [`ownerless`](Self::ownerless) freed under the cap since
+    /// the start.
+    ownerless_freed: u64,
 }
 
 /// Read far more often than written: every slot a draw reads through a
@@ -1109,7 +1122,32 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     free: Vec::new(),
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
+    ownerless: std::collections::VecDeque::new(),
+    ownerless_freed: 0,
 });
+
+/// How many table entries no resource owns are kept ([`Views::ownerless`]).
+/// Nothing else frees them, and once the shapes of placed views are full
+/// every placed view the title writes is one: TaynanGT/Vice-Tay saw the
+/// 4,194,304 shapes full after half an hour of play, then some 15,000 such
+/// entries a second, 34.9 million of them and 16.7 GB after 70 minutes, and
+/// the frame rate halved. That many come from views written anew every
+/// frame or few, so the oldest of a million are long out of use; a record
+/// that still names a freed entry reads as stale (no view).
+/// `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (0: all, as before). By default
+/// 1,048,576; all with `VICTORY_VIEW_INLINE=0`, where every constant buffer
+/// view is such an entry (10,000 a second) and a million would last under
+/// two minutes, so that switch stays as before.
+fn ownerless_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_OWNERLESS_VIEWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(if inline() { 1 << 20 } else { 0 })
+    })
+}
+
 pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -1238,9 +1276,54 @@ impl Views {
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
     fn entry(&mut self, view: View) -> [u32; 2] {
+        self.entry_kept(view, ownerless_cap())
+    }
+
+    /// [`entry`](Self::entry), keeping at most `cap` entries no resource
+    /// owns (0: all).
+    fn entry_kept(&mut self, view: View, cap: usize) -> [u32; 2] {
+        let ownerless = matches!(view, View::Constant(..) | View::Placed(..));
+        let (words, made) = self.entry_made(view);
+        if ownerless && made {
+            self.ownerless.push_back((words[0], words[1]));
+            while cap != 0 && self.ownerless.len() > cap {
+                let Some((i, generation)) = self.ownerless.pop_front() else {
+                    break;
+                };
+                self.free_ownerless(i, generation);
+            }
+        }
+        words
+    }
+
+    /// Frees entry `i` if it still holds the view it had at `generation`,
+    /// as [`forget`] frees the entries of a released resource.
+    fn free_ownerless(&mut self, i: u32, generation: u32) {
+        let Some((view, current)) = self.list.get(i as usize).cloned() else {
+            return;
+        };
+        if current != generation || self.index.get(&view) != Some(&i) {
+            return;
+        }
+        self.index.remove(&view);
+        // (Below the bits that say a record is no table entry.)
+        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        self.free.push(i);
+        self.ownerless_freed += 1;
+        // Slots whose record names it read nothing now: a host slot made
+        // from it is made null the next time a draw or the heap's pass
+        // makes it (`host::HostHeap::mirror` finds no view), as for a
+        // released resource.
+    }
+
+    /// [`entry`](Self::entry) without the cap, and whether the entry was
+    /// made for `view` now.
+    fn entry_made(&mut self, view: View) -> ([u32; 2], bool) {
+        let mut made = false;
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
+                made = true;
                 let i = match self.free.pop() {
                     Some(i) => {
                         self.list[i as usize].0 = view.clone();
@@ -1258,7 +1341,7 @@ impl Views {
                 i
             }
         };
-        [i, self.list[i as usize].1]
+        ([i, self.list[i as usize].1], made)
     }
 }
 
@@ -1302,6 +1385,25 @@ fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// For the ram line, whether the view table fills: its entries and those of
+/// them free for reuse; the entries no resource owns ([`Views::ownerless`]),
+/// the most kept ([`ownerless_cap`], 0: all) and how many were freed under
+/// it since the start; the shapes of placed views kept, and the most there
+/// can be ([`SHAPES`]: past them, every placed view is such an entry).
+#[cfg(windows)]
+pub(crate) fn view_table() -> [u64; 7] {
+    let views = views_read();
+    [
+        views.list.len() as u64,
+        views.free.len() as u64,
+        views.ownerless.len() as u64,
+        ownerless_cap() as u64,
+        views.ownerless_freed,
+        views.shapes.len() as u64,
+        SHAPES as u64,
+    ]
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -1566,16 +1668,113 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// A placed view's resource description (D3D12_RESOURCE_DESC, 56 bytes) as
+/// words, its filler zeroed: word 1 (after the dimension, before the
+/// 8-byte alignment) and word 13 (after the flags, to the 8-byte end). The
+/// title leaves there what its stack held, so one view of one texture made
+/// a new shape ([`shape_of`]) each time. `VICTORY_PLACED_FILLER=1` keeps
+/// them ([`crate::resource::keep_placed_filler`]).
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    let mut words = words(desc)?;
+    if !crate::resource::keep_placed_filler() {
+        (words[1], words[13]) = (0, 0);
+    }
+    Some(words)
+}
+
+/// By D3D12_SRV_DIMENSION (unknown, buffer, 1D, 1D array, 2D, 2D array, 2D
+/// multisample, 2D multisample array, 3D, cube, cube array, acceleration
+/// structure): the words of D3D12_SHADER_RESOURCE_VIEW_DESC's union that
+/// the dimension's member takes, up to the end of its last field.
+/// - Buffer (D3D12_BUFFER_SRV): first element (two words), count, stride,
+///   flags: 5; the sixth is the member's padding to 8 bytes.
+/// - 1D: most detailed mip, mips, LOD clamp: 3; 1D array: most detailed
+///   mip, mips, first slice, slices, LOD clamp: 5.
+/// - 2D: most detailed mip, mips, plane, LOD clamp: 4; 2D array: most
+///   detailed mip, mips, first slice, slices, plane, LOD clamp: 6.
+/// - 2D multisample: one field D3D12 does not read
+///   (`UnusedField_NothingToDefine`): 0; its array: first slice, slices: 2.
+/// - 3D and cube: most detailed mip, mips, LOD clamp: 3; cube array: most
+///   detailed mip, mips, first face, cubes, LOD clamp: 5.
+/// - Acceleration structure: its address (two words): 2.
+const SRV_UNION_WORDS: [u8; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+
+/// As [`SRV_UNION_WORDS`], of D3D12_UNORDERED_ACCESS_VIEW_DESC, by
+/// D3D12_UAV_DIMENSION (unknown, buffer, 1D, 1D array, 2D, 2D array, 2D
+/// multisample, 2D multisample array, 3D).
+/// - Buffer (D3D12_BUFFER_UAV): first element (two words), count, stride,
+///   counter offset (two words), flags: 7; the eighth is padding.
+/// - 1D: mip: 1; 1D array: mip, first slice, slices: 3.
+/// - 2D: mip, plane: 2; 2D array: mip, first slice, slices, plane: 4.
+/// - 2D multisample: the unused field: 0; its array: first slice, slices: 2.
+/// - 3D: mip, first depth slice, depth slices: 3.
+const UAV_UNION_WORDS: [u8; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+
+/// Which of the sixteen words of a placed view's description tell it apart
+/// (as bits) for view dimension `dimension`; `None` for a dimension D3D12
+/// has not, of which every word does. Words 0 to 9 are the PC's view
+/// description: for a shader resource view the format, the dimension and
+/// the component mapping, a word of padding (the union holds 8-byte
+/// fields, so it starts at byte 16) and the union's six words; for an
+/// unordered access view the format, the dimension and the union's eight.
+/// Each dimension takes the head of the union only. Words 10 and 11 are
+/// the address and 12 to 15 the console's own: kept.
+fn placed_view_used(unordered: bool, dimension: u32) -> Option<u16> {
+    let (head, union, by_dimension): (u16, u32, &[u8]) = if unordered {
+        (0b11, 2, &UAV_UNION_WORDS)
+    } else {
+        (0b111, 4, &SRV_UNION_WORDS)
+    };
+    if dimension == 0 {
+        return None;
+    }
+    let n = *by_dimension.get(dimension as usize)?;
+    Some(head | ((1u16 << n) - 1) << union | 0xfc00)
+}
+
+/// A placed view's description as words, those its dimension does not take
+/// zeroed ([`placed_view_used`]). The title leaves them unwritten:
+/// TaynanGT/Vice-Tay counted 131,392 values in word 3 and 36,413 in word 9
+/// over a million shapes, each a new shape for the same view. Kept whole: a
+/// dimension D3D12 has not, and a view of a buffer that names another
+/// dimension (the host reads the buffer member of its words whatever the
+/// dimension says: `host::view_stride`, `host::make`).
+/// `VICTORY_PLACED_FILLER=1` keeps all words, as before.
+fn placed_view_words(
+    unordered: bool,
+    resource: &[u32; 14],
+    desc: *const [u32; 16],
+) -> Option<[u32; 16]> {
+    const BUFFER: u32 = 1;
+    let mut words = words(desc)?;
+    if crate::resource::keep_placed_filler() || (resource[0] == BUFFER && words[1] != BUFFER) {
+        return Some(words);
+    }
+    if let Some(used) = placed_view_used(unordered, words[1]) {
+        for (k, word) in words.iter_mut().enumerate() {
+            if used >> k & 1 == 0 {
+                *word = 0;
+            }
+        }
+    }
+    Some(words)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
-/// handle)`.
+/// handle)`. What the title leaves unwritten in both descriptions is left
+/// out ([`placed_resource_words`], [`placed_view_words`]): one texture's
+/// views are one shape however often it writes them.
 pub(crate) extern "system" fn create_placed_srv(
     _: This,
     resource: *const [u32; 14],
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    let Some(resource) = placed_resource_words(resource) else {
+        return;
+    };
+    if let Some(desc) = placed_view_words(false, &resource, desc) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1586,7 +1785,10 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    let Some(resource) = placed_resource_words(resource) else {
+        return;
+    };
+    if let Some(desc) = placed_view_words(true, &resource, desc) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -2002,8 +2204,11 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // A resource description and a view no other test uses (the
+        // resource's filler zero, as a view keeps it: `placed_resource_words`;
+        // the view's dimension none, so that all its words are kept).
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        (resource[1], resource[13]) = (0, 0);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
@@ -2042,6 +2247,206 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// The words [`placed_view_used`] keeps are D3D12's, as the windows
+    /// crate lays its view descriptions out: the head, and of the union
+    /// the member of the view's dimension up to the end of its last field.
+    #[cfg(windows)]
+    #[test]
+    fn placed_view_words_follow_the_d3d12_layout() {
+        use std::mem::offset_of;
+        use windows::Win32::Graphics::Direct3D12::*;
+        fn size_of_field<M, F>(_: impl Fn(&M) -> &F) -> usize {
+            size_of::<F>()
+        }
+        // Words of `$t` up to the end of its field `$last`.
+        macro_rules! words_to {
+            ($t:ty, $last:ident) => {
+                (offset_of!($t, $last) + size_of_field(|m: &$t| &m.$last)) / 4
+            };
+        }
+        let srv_head = words_to!(D3D12_SHADER_RESOURCE_VIEW_DESC, Shader4ComponentMapping);
+        let uav_head = words_to!(D3D12_UNORDERED_ACCESS_VIEW_DESC, ViewDimension);
+        let srv_union = offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Anonymous) / 4;
+        let uav_union = offset_of!(D3D12_UNORDERED_ACCESS_VIEW_DESC, Anonymous) / 4;
+        // Ten words each; the shader resource view's word 3 is padding.
+        assert_eq!((srv_head, srv_union, uav_head, uav_union), (3, 4, 2, 2));
+        assert_eq!(size_of::<D3D12_SHADER_RESOURCE_VIEW_DESC>(), 40);
+        assert_eq!(size_of::<D3D12_UNORDERED_ACCESS_VIEW_DESC>(), 40);
+        // The multisample members hold one field, which D3D12 does not
+        // read (`UnusedField_NothingToDefine`): no word.
+        assert_eq!(size_of::<D3D12_TEX2DMS_SRV>(), 4);
+        assert_eq!(size_of::<D3D12_TEX2DMS_UAV>(), 4);
+        let srv = [
+            (D3D12_SRV_DIMENSION_BUFFER, words_to!(D3D12_BUFFER_SRV, Flags)),
+            (D3D12_SRV_DIMENSION_TEXTURE1D, words_to!(D3D12_TEX1D_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURE1DARRAY, words_to!(D3D12_TEX1D_ARRAY_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURE2D, words_to!(D3D12_TEX2D_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, words_to!(D3D12_TEX2D_ARRAY_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURE2DMS, 0),
+            (D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY, words_to!(D3D12_TEX2DMS_ARRAY_SRV, ArraySize)),
+            (D3D12_SRV_DIMENSION_TEXTURE3D, words_to!(D3D12_TEX3D_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURECUBE, words_to!(D3D12_TEXCUBE_SRV, ResourceMinLODClamp)),
+            (D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, words_to!(D3D12_TEXCUBE_ARRAY_SRV, ResourceMinLODClamp)),
+            (
+                D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+                words_to!(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV, Location),
+            ),
+        ];
+        let uav = [
+            (D3D12_UAV_DIMENSION_BUFFER, words_to!(D3D12_BUFFER_UAV, Flags)),
+            (D3D12_UAV_DIMENSION_TEXTURE1D, words_to!(D3D12_TEX1D_UAV, MipSlice)),
+            (D3D12_UAV_DIMENSION_TEXTURE1DARRAY, words_to!(D3D12_TEX1D_ARRAY_UAV, ArraySize)),
+            (D3D12_UAV_DIMENSION_TEXTURE2D, words_to!(D3D12_TEX2D_UAV, PlaneSlice)),
+            (D3D12_UAV_DIMENSION_TEXTURE2DARRAY, words_to!(D3D12_TEX2D_ARRAY_UAV, PlaneSlice)),
+            (D3D12_UAV_DIMENSION_TEXTURE2DMS, 0),
+            (D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY, words_to!(D3D12_TEX2DMS_ARRAY_UAV, ArraySize)),
+            (D3D12_UAV_DIMENSION_TEXTURE3D, words_to!(D3D12_TEX3D_UAV, WSize)),
+        ];
+        // Every dimension D3D12 has, in order: 1 to 11, and 1 to 8.
+        assert_eq!(srv.map(|(d, _)| d.0), std::array::from_fn(|k| k as i32 + 1));
+        assert_eq!(uav.map(|(d, _)| d.0), std::array::from_fn(|k| k as i32 + 1));
+        let mask = |head: usize, union: usize, n: usize| ((1u16 << head) - 1) | ((1u16 << n) - 1) << union | 0xfc00;
+        for (dimension, n) in srv {
+            assert!(n <= 6, "inside the union");
+            let expected = mask(srv_head, srv_union, n);
+            assert_eq!(placed_view_used(false, dimension.0 as u32), Some(expected), "SRV dimension {}", dimension.0);
+        }
+        for (dimension, n) in uav {
+            assert!(n <= 8, "inside the union");
+            let expected = mask(uav_head, uav_union, n);
+            assert_eq!(placed_view_used(true, dimension.0 as u32), Some(expected), "UAV dimension {}", dimension.0);
+        }
+        // Unknown and past the last: every word counts.
+        for (unordered, past) in [(false, 12), (true, 9)] {
+            assert_eq!(placed_view_used(unordered, 0), None);
+            assert_eq!(placed_view_used(unordered, past), None);
+        }
+    }
+
+    /// Placed views of one texture are one shape whatever the words their
+    /// dimension does not take and the resource description's filler hold,
+    /// and two when a word that is taken differs: for every dimension of
+    /// both kinds, every word (TaynanGT/Vice-Tay: 4,194,304 shapes full in
+    /// half an hour of play, then a table entry kept for the run per view).
+    #[test]
+    fn placed_views_of_one_texture_share_a_shape_whatever_their_filler() {
+        if !inline() || crate::resource::keep_placed_filler() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slot = [0u64; 4];
+        let at = slot.as_ptr() as u64;
+        // Title memory (below 1 TiB): words 10 and 11, not in the shape.
+        let address = 0x3_5ad0_0000u64;
+        let kinds = [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _), 0..=12u32),
+            (true, create_placed_uav, 0..=9),
+        ];
+        for (unordered, create, dimensions) in kinds {
+            for dimension in dimensions {
+                // Words no other test uses; a buffer view of a buffer, the
+                // others of a 2D texture.
+                let tag = 0x5ad0_0000 | u32::from(unordered) << 12 | dimension << 6;
+                let mut resource: [u32; 14] = std::array::from_fn(|k| tag | k as u32);
+                resource[0] = if dimension == 1 { 1 } else { 3 };
+                let mut desc: [u32; 16] = std::array::from_fn(|k| tag | 0x20 | k as u32);
+                desc[1] = dimension;
+                (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+                let used = placed_view_used(unordered, dimension);
+                let mut kept = desc;
+                for (k, word) in kept.iter_mut().enumerate() {
+                    if used.is_some_and(|u| u >> k & 1 == 0) {
+                        *word = 0;
+                    }
+                }
+                let mut stored = resource;
+                (stored[1], stored[13]) = (0, 0);
+                create(null, &resource, &desc, at);
+                let what = format!("unordered {unordered}, dimension {dimension}");
+                let first = record_at(at).expect(&what);
+                assert_eq!(first[2] >> KIND_SHIFT, PLACED, "{what}: named whole");
+                assert_eq!(view(at), Some(View::Placed(unordered, stored, kept)), "{what}");
+                for k in (0..16).filter(|k| !(10..12).contains(k)) {
+                    let mut other = desc;
+                    other[k] ^= 0x4000_0000;
+                    create(null, &resource, &other, at);
+                    let taken = used.is_none_or(|u| u >> k & 1 != 0);
+                    if taken {
+                        assert_ne!(record_at(at), Some(first), "{what}: view word {k} is taken, two shapes");
+                    } else {
+                        assert_eq!(record_at(at), Some(first), "{what}: view word {k} is not, one shape");
+                    }
+                }
+                for k in 0..14 {
+                    let mut other = resource;
+                    other[k] ^= 0x4000_0000;
+                    create(null, &other, &desc, at);
+                    if k == 1 || k == 13 {
+                        assert_eq!(record_at(at), Some(first), "{what}: resource filler word {k}, one shape");
+                    } else {
+                        assert_ne!(record_at(at), Some(first), "{what}: resource word {k}, two shapes");
+                    }
+                }
+            }
+        }
+        // A view of a buffer that names a texture dimension is kept whole:
+        // the host reads its words as a buffer view's whatever it names.
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ad1_0000 | k as u32);
+        resource[0] = 1;
+        let mut desc = [0u32; 16];
+        (desc[1], desc[10], desc[11]) = (4, address as u32, (address >> 32) as u32);
+        create_placed_srv(null, &resource, &desc, at);
+        let first = record_at(at).expect("a view");
+        // A buffer view's flags; past a 2D view's member.
+        desc[8] = 1;
+        create_placed_srv(null, &resource, &desc, at);
+        assert_ne!(record_at(at), Some(first));
+    }
+
+    /// Entries no resource owns stay under their cap: the oldest go stale,
+    /// the newest still name their views, entries are reused rather than
+    /// added, and views of resources are never dropped.
+    #[test]
+    fn ownerless_entries_are_capped() {
+        let mut views = Views::default();
+        let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
+        let named = |views: &Views, words: [u32; 2], view: &View| {
+            views.list.get(words[0] as usize).is_some_and(|(v, g)| *g == words[1] && v == view)
+        };
+        let words: Vec<[u32; 2]> = (0..10).map(|n| views.entry_kept(placed(n), 4)).collect();
+        assert_eq!(views.index.len(), 4, "four kept");
+        assert_eq!((views.ownerless.len(), views.ownerless_freed), (4, 6));
+        assert!(views.list.len() <= 5, "entries reused, not added: {}", views.list.len());
+        for n in 0..6 {
+            assert!(!named(&views, words[n], &placed(n as u32)), "entry {n} stale");
+        }
+        for n in 6..10 {
+            assert!(named(&views, words[n], &placed(n as u32)), "entry {n} kept");
+        }
+        // The same view written again keeps its words; a constant buffer
+        // view counts as well.
+        assert_eq!(views.entry_kept(placed(9), 4), words[9]);
+        let constant = View::Constant(0x7_0000_0000, 1 << 22);
+        let kept_constant = views.entry_kept(constant.clone(), 4);
+        assert!(named(&views, kept_constant, &constant));
+        assert!(!named(&views, words[6], &placed(6)), "pushed out by the constant view");
+        // A view of a resource is freed with the resource only.
+        let shader = View::Shader(0x1234, None);
+        let kept = views.entry_kept(shader.clone(), 4);
+        for n in 10..40 {
+            views.entry_kept(placed(n), 4);
+        }
+        assert!(named(&views, kept, &shader));
+        assert!(views.list.len() <= 6);
+        assert_eq!(views.ownerless.len(), 4);
+        // 0 keeps them all.
+        for n in 40..60 {
+            views.entry_kept(placed(n), 0);
+        }
+        assert_eq!(views.index.len(), 1 + 4 + 20);
+        assert_eq!(views.ownerless.len(), 4 + 20);
     }
 
     /// A released resource's views go stale; the same view of a new

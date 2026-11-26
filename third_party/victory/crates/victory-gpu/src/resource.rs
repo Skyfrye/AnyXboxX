@@ -128,6 +128,23 @@ pub(crate) struct AllocationInfo {
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
+// Words 1 and 13 of a resource description are its filler (between the
+// dimension and the 8-byte alignment, and after the flags to the 8-byte
+// end): [`keep_placed_filler`], `descriptor::placed_resource_words`.
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, dimension) == 0);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
+
+/// Whether the filler words of placed views' descriptions are kept as the
+/// title left them: words 1 and 13 of the resource description (what keys
+/// a placed texture, [`texture_at`]) and the words of the view description
+/// its dimension does not use (`descriptor::placed_view_words`). The title
+/// leaves there what its stack held. Off by default;
+/// `VICTORY_PLACED_FILLER=1` keeps them, as before.
+pub(crate) fn keep_placed_filler() -> bool {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1"))
+}
 
 const BUFFER: u32 = 1;
 const TEXTURE_3D: u32 = 4;
@@ -3255,11 +3272,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // its stack held, and two views of one texture that differed only in
     // them each got a resource and a host copy of their own, on a card
     // that fills at world entry. They are not part of what a texture is.
-    // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
-    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // `VICTORY_PLACED_FILLER=1`: kept in the key, as before. (Views made
+    // through the device have them zeroed already:
+    // `descriptor::placed_resource_words`.)
     let raw = *desc;
     let mut key = *desc;
-    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+    if !keep_placed_filler() {
         key[1] = 0;
         key[13] = 0;
     }

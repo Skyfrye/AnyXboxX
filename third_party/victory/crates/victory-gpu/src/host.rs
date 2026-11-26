@@ -9571,6 +9571,18 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
+                {
+                    // Whether the view table fills: entries no resource owns
+                    // are what grew for the run once the shapes of placed
+                    // views were full (`descriptor::view_table`).
+                    let [entries, free, ownerless, cap, freed, shapes, most] = crate::descriptor::view_table();
+                    tracing::info!(
+                        "view table: {entries} entries ({free} free), {ownerless} of them owned by no resource \
+                         (kept at most {cap}, 0: all; VICTORY_OWNERLESS_VIEWS), {freed} of those freed under the \
+                         cap so far; shapes of placed views {shapes} of {most} (past them every placed view is \
+                         such an entry)"
+                    );
+                }
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
