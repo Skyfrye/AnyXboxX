@@ -656,6 +656,81 @@ fn stands_in(view: &View) -> bool {
     }
 }
 
+/// Whether slots written with a view of a placed texture whose host copy
+/// holds what it shows already are made at once ([`current_copy`]). On by
+/// default; `VICTORY_MIRROR_CURRENT=0`: every placed texture's slot waits
+/// for the texture pass, as before. `VICTORY_MIRROR_CURRENT_MB` (8): the
+/// title memory a frame's writes may compare with their copies' last uploads.
+fn mirror_current() -> (bool, u64) {
+    static ON: std::sync::OnceLock<(bool, u64)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_MIRROR_CURRENT").is_none_or(|v| v != "0");
+        let mb = std::env::var("VICTORY_MIRROR_CURRENT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(8);
+        (on, mb << 20)
+    })
+}
+
+/// Since the start: slots of placed textures made at once from a host copy
+/// that holds what they show ([`current_copy`]): of textures the host
+/// renders to, of ones whose memory is as their last upload took it; and
+/// writes that found a copy but not the bytes of the frame's budget left to
+/// compare it.
+pub(crate) static CURRENT_COPIES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether slot writes of placed texture view `view` can be made at once
+/// ([`HostHeap::mirror`]) from the host copy of the title texture made for
+/// it before (nothing is made here): one the host renders to (its contents
+/// are the host's), or one the title fills whose memory holds what the
+/// copy's last upload took (`crate::texture::unchanged`; not one a table's
+/// draws upload, `crate::texture::is_staged`, nor a copy made in the last
+/// second, `crate::pool::fresh`). The comparison reads the texture's memory:
+/// within [`mirror_current`]'s bytes a frame, the rest left to the pass.
+/// (Every placed texture's slot waited for the pass: grey, the textures of
+/// decals and hair opaque grey quads, where 88,036 uploads of run nb1 then
+/// found the host copy holding those bytes, half a second after the write
+/// on average; null for a texture the host renders to.)
+fn current_copy(view: &View) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (on, budget) = mirror_current();
+    let View::Placed(false, resource, desc) = view else {
+        return false;
+    };
+    if !on || resource[0] == 1 {
+        return false;
+    }
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let Some(texture) = crate::resource::placed_known(address, resource) else {
+        return false;
+    };
+    let Some(copy) = crate::resource::made_copy(texture) else {
+        return false;
+    };
+    if !crate::resource::title_fills(texture) {
+        CURRENT_COPIES[0].fetch_add(1, Relaxed);
+        return true;
+    }
+    if crate::texture::is_staged(texture) || crate::pool::fresh(&copy.texture) {
+        return false;
+    }
+    let first = crate::resource::first_mip(desc);
+    let Some((_, bytes)) = crate::texture::title_span(texture, first) else {
+        return false;
+    };
+    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    static SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let frame = crate::frame::current();
+    if FRAME.swap(frame, Relaxed) != frame {
+        SPENT.store(0, Relaxed);
+    }
+    if SPENT.fetch_add(bytes, Relaxed).saturating_add(bytes) > budget {
+        CURRENT_COPIES[2].fetch_add(1, Relaxed);
+        return false;
+    }
+    let same = crate::texture::unchanged(texture, first);
+    CURRENT_COPIES[1].fetch_add(u64::from(same), Relaxed);
+    same
+}
+
 /// Texture slots made to show the [`neutral`] stand-in and made null, since
 /// the start (`crate::host`'s line every five seconds gives them a frame).
 pub(crate) static STAND_INS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -4067,7 +4142,12 @@ impl HostHeap {
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            // A placed texture whose host copy holds what the view shows
+            // already is made at once ([`current_copy`]): it showed the
+            // stand-in (or, for one the host renders to, a null view) until
+            // the pass, which then found nothing to upload.
+            let current = !for_draw && !self.sampler && current_copy(&view);
+            let later = !for_draw && !current && (view.is_buffer() || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -6266,6 +6346,47 @@ mod tests {
         assert!(heap.shows_none(2));
         assert_eq!(STOOD_IN_HERE.get(), before + 1, "not again at the pass");
         drop(list);
+    }
+
+    /// A slot written with a view of a placed texture the host renders to,
+    /// whose host copy is made, shows it at once: it read null until the
+    /// texture pass, which had nothing to upload. One the title fills with
+    /// no upload of its copy yet waits behind the stand-in.
+    #[test]
+    fn a_placed_texture_whose_copy_holds_its_view_is_made_at_once() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        // A 64x64 R8G8B8A8_UNORM render target placed at an address of its own.
+        let address = 0x7fee_3700_0000u64;
+        let mut view = placed_2d(address, 28);
+        if let View::Placed(_, resource, desc) = &mut view {
+            (resource[8], resource[12]) = (28, 0x1);
+            // (A view the host can make: the default component mapping, one
+            // level; the levels' words follow a word of padding.)
+            (desc[2], desc[5]) = (5768, 1);
+        }
+        let View::Placed(_, resource, _) = &view else { unreachable!() };
+        let texture = crate::resource::texture_at(address, resource).expect("a title texture");
+        let Some(copy) = crate::resource::host_copy(texture) else { return };
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, view);
+        assert!(heap.mirror(1, handle, false).is_some());
+        assert_eq!(heap.made.get(1), Some(record_key(handle)), "made at once");
+        assert_eq!(heap.kept_in(1).map(|r| r.as_raw()), Some(copy.texture.as_raw()));
+        // SAFETY: a plain query.
+        assert!(unsafe { host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
+        // The title fills this one, and its copy holds no upload yet.
+        let address = 0x7fee_3708_0000u64;
+        let view = placed_2d(address, 98);
+        let View::Placed(_, resource, _) = &view else { unreachable!() };
+        let texture = crate::resource::texture_at(address, resource).expect("a title texture");
+        let _ = crate::resource::host_copy(texture);
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, view);
+        assert!(heap.mirror(2, handle, false).is_some());
+        assert!(heap.shows_none(2), "waits for its pass");
+        let stand_in = neutral(Neutral::Flat).unwrap();
+        assert_eq!(heap.kept_in(2).map(|r| r.as_raw()), Some(stand_in.as_raw()));
     }
 
     /// A slot that goes on showing another record's texture while its new
