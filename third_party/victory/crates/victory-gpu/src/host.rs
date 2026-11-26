@@ -225,8 +225,10 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
     }
 }
 
-/// Whether new memory is made resident, and waited for, before anything can
-/// name it (on by default; `VICTORY_WAIT_RESIDENT=0`: as before). A heap or
+/// Whether new memory is waited for before anything can name it (on by
+/// default; `VICTORY_WAIT_RESIDENT=0`: as before). Where it is waited for:
+/// where a slot shows it ([`mapping`], `VICTORY_MAPPED_LATER`, on), or where
+/// it is made ([`resident`] and [`mapped`], as at first). A heap or
 /// resource of the default kind is resident once it is made, but its
 /// mapping into the card's address space is work of the system's that runs
 /// later: only lists sent after it wait for it. Lists sent before run on,
@@ -239,9 +241,10 @@ fn wait_resident() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
-/// The flag memory is made with that [`resident`] waits for.
+/// The flag memory is made with that [`resident`] waits for: none, made
+/// resident, unless it is waited for where it is made (`VICTORY_MAPPED_LATER=0`).
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
-    if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+    if wait_resident() && !mapping::later() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
 /// A queue of its own that new memory is waited for with ([`mapped`]).
@@ -340,9 +343,11 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// New memory (made with [`not_resident`]) is resident when this returns.
+/// New memory (made with [`not_resident`]) is resident when this returns:
+/// it was made so, unless it is waited for where it is made
+/// (`VICTORY_MAPPED_LATER=0`).
 pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
-    if !wait_resident() {
+    if !wait_resident() || mapping::later() {
         return Ok(());
     }
     let started = std::time::Instant::now();
@@ -3883,6 +3888,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+pub(crate) mod mapping;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
@@ -9405,6 +9411,7 @@ impl Meter {
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
             crate::shadow::exact_line(frames);
+            mapping::line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
@@ -10203,7 +10210,7 @@ impl Host {
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    mapping::made(&self.device, b, mapping::What::Buffer);
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10292,7 +10299,7 @@ impl Host {
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    mapping::made(&self.device, b, mapping::What::Buffer);
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10344,7 +10351,12 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made.and_then(|()| {
+            let Some(b) = buffer.as_ref() else { return Ok(()) };
+            resident(&self.device, b)?;
+            mapping::made(&self.device, b, mapping::What::Buffer);
+            Ok(())
+        });
         match made {
             Ok(()) => buffer,
             Err(e) => {

@@ -684,11 +684,18 @@ pub(crate) unsafe fn texture(
             crate::residency::allocation_error(&e);
             tracing::warn!(error = %e, "no block of texture memory");
         }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
+        if let Some(h) = &heap {
+            if let Err(e) = crate::host::resident(device, h) {
+                tracing::warn!(error = %e, "a block of texture memory is not resident");
+                return None;
+            }
+            // Its textures' slots are shown once the submissions begun before
+            // them have run (`show_new_later`), and blocks are made ahead
+            // (`Ripe`): nothing waits for the block's mapping then.
+            let t = crate::host::mapping::made(device, h, crate::host::mapping::What::TextureBlock);
+            if !crate::descriptor::host::show_new_later() {
+                crate::host::mapping::wait_for(device, t, crate::host::mapping::What::TextureBlock);
+            }
         }
         heap
     })?;

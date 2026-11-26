@@ -3202,6 +3202,7 @@ impl HostHeap {
                 },
             },
         };
+        crate::host::mapping::shown(buffer);
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device
@@ -3244,6 +3245,7 @@ impl HostHeap {
                 },
             },
         };
+        crate::host::mapping::shown(buffer);
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device.CreateUnorderedAccessView(
@@ -3315,6 +3317,7 @@ impl HostHeap {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
         };
+        crate::host::mapping::shown(buffer);
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -3386,6 +3389,7 @@ impl HostHeap {
             SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
         };
         let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
+        crate::host::mapping::shown(buffer);
         // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
         // zero location makes a null constant buffer view).
         unsafe {
@@ -4203,6 +4207,7 @@ fn buffer_srv(
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     }
     let host = host()?;
+    crate::host::mapping::shown(&shadow.buffer);
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -4326,6 +4331,7 @@ fn buffer_uav(
         return None;
     }
     let host = host()?;
+    crate::host::mapping::shown(&shadow.buffer);
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -4617,6 +4623,7 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            crate::host::mapping::shown(&shadow.buffer);
             if crate::port_cbv::on() {
                 // Renderer port 5: shaders read constant buffers as raw bytes
                 // through the twin; a constant buffer view there would be read
@@ -4713,6 +4720,7 @@ fn make_twinned(
                 {
                     show_prefilled(desc, prefilled);
                 }
+                crate::host::mapping::shown(texture);
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4774,6 +4782,7 @@ fn make_twinned(
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
+            crate::host::mapping::shown(texture);
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
