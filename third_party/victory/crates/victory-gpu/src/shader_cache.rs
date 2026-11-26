@@ -152,7 +152,7 @@ fn build() -> [u8; 32] {
     // change (`victory_shader::WAVE32_REVISION`).
     if settings[0] == 32 {
         hash.update(&victory_shader::WAVE32_REVISION.to_le_bytes());
-        for name in ["VICTORY_WAVE_PAIRS", "VICTORY_WAVE_LDS_LOOSE"] {
+        for name in ["VICTORY_WAVE_PAIRS", "VICTORY_WAVE_LDS_LOOSE", "VICTORY_INACTIVE_LANES"] {
             hash.update(name.as_bytes());
             hash.update(b"=");
             if let Some(value) = std::env::var_os(name) {

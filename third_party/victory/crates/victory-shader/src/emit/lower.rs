@@ -1648,6 +1648,23 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Reads of other lanes test their source lane on hosts of 32-lane waves
+/// ([`Lower::source_lanes`]); `VICTORY_INACTIVE_LANES=0`: as the host gives them, as before.
+fn inactive_lanes_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_INACTIVE_LANES.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INACTIVE_LANES").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`inactive_lanes_on`], for its thread only.
+    pub(super) static TEST_INACTIVE_LANES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -6473,6 +6490,37 @@ impl<'a> Lower<'a> {
             .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[mine, or])
     }
 
+    /// Whether reads of other lanes (DPP, `ds_bpermute_b32`) test their source lane
+    /// ([`Self::read_lane_there`]): in compute programs on hosts of 32-lane waves (NVIDIA),
+    /// whose shuffle from a lane that is not at the instruction (it left through a branch)
+    /// gives no defined value, where the console's reads of a lane outside EXEC give 0 or
+    /// leave the reading lane's destination ([`inactive_lanes_on`]).
+    fn source_lanes(&self) -> bool {
+        host_max_wave() == 32 && self.mask_data == MaskData::Console && self.s.mesh.is_none() && inactive_lanes_on()
+    }
+
+    /// `x` of host lane `src` (of this host wave of 32), and whether that lane is there: at
+    /// this instruction on the host, and with `enabled` (its EXEC bit; none: every lane here)
+    /// set. A lane that is not there is not read (this lane is instead, its value unused), as
+    /// `v_permlane16_b32` reads them.
+    fn read_lane_there(&mut self, x: V, src: V, enabled: Option<V>) -> (V, V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let enabled = enabled.unwrap_or_else(|| self.s.m.bool(true));
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[enabled]);
+        self.s.flags |= flags::WAVE_OPS;
+        let there = self.s.m.extract(c, ballot, 0);
+        let (k31, one, zero) = (self.s.m.i32(31), self.s.m.i32(1), self.s.m.i32(0));
+        let at = self.s.m.bin(c, Bin::And, src, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, there, at);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        let on = self.s.m.cmp(c, pred::NE, bit, zero);
+        let me = self.lane_index();
+        let safe = self.s.m.select(c, on, src, me);
+        (self.read_lane(x, safe), on)
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         #[cfg(test)]
         LANE_SHUFFLES.set(LANE_SHUFFLES.get() + 1);
@@ -6600,9 +6648,10 @@ impl<'a> Lower<'a> {
             // wave64 permutes each half on its own); a source lane outside
             // EXEC gives 0. (the title's checkerboard shadow-mask generators
             // read their neighbours' samples with it.)
-            // shortcut: a source lane that is not at this instruction on the
-            // host (it left through a branch, not a guard) is read as the
-            // host gives it; the console reads 0.
+            // shortcut: but on hosts of 32-lane waves (`source_lanes`), a source
+            // lane that is not at this instruction on the host (it left through
+            // a branch, not a guard) is read as the host gives it; the console
+            // reads 0.
             self.cross_lane(false)?;
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
@@ -6629,7 +6678,14 @@ impl<'a> Lower<'a> {
                 }
                 None => x,
             };
-            let r = self.read_lane(x, src);
+            let r = if self.source_lanes() {
+                // (a source lane that left through a branch gives 0 too, `source_lanes`)
+                let (read, on) = self.read_lane_there(x, src, guard);
+                let z = self.s.m.i32(0);
+                self.s.m.select(self.cur, on, read, z)
+            } else {
+                self.read_lane(x, src)
+            };
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -9527,7 +9583,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -9540,8 +9596,8 @@ impl<'a> Lower<'a> {
     }
 
     /// DPP: src0 as read from another lane, and which lanes write their
-    /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    /// result (none: all). `guard`: this lane's EXEC bit where not every lane has it.
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<V>) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -9562,6 +9618,7 @@ impl<'a> Lower<'a> {
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
         let pos = self.s.m.bin(c, Bin::And, lane, low);
         // Source lane, and whether it lies in the row.
+        let fi = matches!(dpp, Dpp::Row { fi: true, .. } | Dpp::Lanes { fi: true, .. });
         let (src, inside, masks, zero) = match dpp {
             Dpp::Lanes { sel, .. } => {
                 let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
@@ -9630,6 +9687,9 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
+        // A source lane outside EXEC (`fi` clear) or not at this instruction on the host
+        // (it left through a branch): see `source_lanes`.
+        let mut source = None;
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
         } else if let Dpp::Row { ctrl, .. } = dpp
@@ -9641,16 +9701,34 @@ impl<'a> Lower<'a> {
             // programs too, the console's lanes in the same order. Only there:
             // other hosts read the lanes as before.)
             self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
+        } else if self.source_lanes() {
+            let enabled = if fi { None } else { guard };
+            let (read, on) = self.read_lane_there(x, src, enabled);
+            source = Some(on);
+            read
         } else {
             self.read_lane(x, src)
         };
         let mut enable = None;
+        if let Some(on) = source {
+            // as the console's DPP does: an invalid source reads 0 with `bound_ctrl`, else the
+            // lane keeps its destination (DPP8 has no `bound_ctrl`)
+            if zero {
+                let z = k(self, 0);
+                r = self.s.m.select(c, on, r, z);
+            } else {
+                enable = Some(on);
+            }
+        }
         if let Some(inside) = inside {
             if zero {
                 let z = k(self, 0);
                 r = self.s.m.select(c, inside, r, z);
             } else {
-                enable = Some(inside);
+                enable = Some(match enable {
+                    Some(e) => self.s.m.bin(c, Bin::And, e, inside),
+                    None => inside,
+                });
             }
         }
         if let Some((rows, banks)) = masks {

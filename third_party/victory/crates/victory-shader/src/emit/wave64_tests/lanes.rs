@@ -59,7 +59,7 @@ pub(super) fn stores(regs: [u32; 4]) -> Vec<u32> {
 
 /// `native` as [`super::emit`] gives it to a host whose waves have at most `host_wave` lanes,
 /// validated by `dxil.dll` when present.
-fn emitted(native: &NativeProgram, host_wave: u32) -> HostShader {
+pub(super) fn emitted(native: &NativeProgram, host_wave: u32) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
