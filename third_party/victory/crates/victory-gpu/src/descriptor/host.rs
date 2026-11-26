@@ -6909,7 +6909,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, u64::MAX, 8).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, in a page the title shows at two addresses.
         let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
         let len = crate::resource::placed_bytes(&resource).unwrap() as usize;
@@ -6922,7 +6922,7 @@ mod tests {
         assert!(heap.note_buffer(1, Some(&View::Placed(false, resource, desc)), false).is_empty());
         // What the pass does: watched before the memory is read, then done.
         let upload = |frame: u64| {
-            let (queued, write) = heap.texture_slots_due(frame, 8).0[0];
+            let (queued, write) = heap.texture_slots_due(frame, u64::MAX, 8).0[0];
             assert_eq!(queued, 1);
             heap.texture_slot_watch(1, one, len);
             heap.texture_slot_done(1, write, None);
