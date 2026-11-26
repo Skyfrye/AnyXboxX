@@ -1915,6 +1915,15 @@ pub(crate) fn counted_in_use(used: u64) -> u64 {
     crate::vram::counted(used, free, back, system) + crate::shadow::card_room_kept() + targets_room_kept()
 }
 
+/// For the memory line: with the card's `budget`, the bytes counted in use
+/// ([`counted_in_use`]) up to which textures picked by index are made, from
+/// which idle ones are let go, and down to which.
+#[cfg(windows)]
+pub(crate) fn lines(budget: u64) -> (u64, u64, u64) {
+    let share = |percent: u64| budget / 100 * percent;
+    (share(room_percent()), share(crate::host::LET_GO_FROM), share(crate::host::LET_GO_TO))
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as

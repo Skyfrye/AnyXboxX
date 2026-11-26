@@ -360,6 +360,16 @@ impl Card {
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// For the memory line ([`crate::vram::line`]): bytes alive of copies'
+/// card sides, of their "before" twins, and of windows' card sides.
+pub(crate) fn card_bytes() -> (u64, u64, u64) {
+    (
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_BYTES[1].load(Ordering::Relaxed),
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 /// Bytes of buffer copies in the card's memory and in windows (for the
 /// memory pressure log, [`crate::residency`]).
 pub(crate) fn live_span_bytes() -> u64 {

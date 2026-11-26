@@ -54,6 +54,8 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// free piece fits the next small texture, and a block whose copies were
 /// all replaced or let go empties and goes back to the system.
 const CLASS_TOPS: [u64; 2] = [64 << 10, 1 << 20];
+/// How many classes there are.
+pub(crate) const CLASSES: usize = CLASS_TOPS.len() + 1;
 
 fn class_of(len: u64) -> u8 {
     CLASS_TOPS.iter().position(|&top| len <= top).unwrap_or(CLASS_TOPS.len()) as u8
@@ -293,11 +295,34 @@ struct Pool<B> {
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
+    /// Blocks made and let go since the start.
+    made: u64,
+    released: u64,
+}
+
+/// What a pool of blocks holds now, and has made and let go since the start.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Census {
+    pub(crate) blocks: u64,
+    /// Blocks with pieces in them, by size class (without classes: all
+    /// in the first).
+    pub(crate) by_class: [u64; CLASSES],
+    pub(crate) empty: u64,
+    /// Pieces taken and their bytes.
+    pub(crate) pieces: u64,
+    pub(crate) held: u64,
+    /// Bytes of free ranges (empty blocks' included), and of pieces resting.
+    pub(crate) free: u64,
+    pub(crate) resting: u64,
+    /// Blocks left to empty now.
+    pub(crate) draining: u64,
+    pub(crate) made: u64,
+    pub(crate) released: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, made: 0, released: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -427,6 +452,7 @@ impl<B: Clone> Pool<B> {
             live: 0,
             draining: 0,
         });
+        self.made += 1;
         i
     }
 
@@ -464,6 +490,24 @@ impl<B: Clone> Pool<B> {
         self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count()
     }
 
+    fn census(&self, now: u64) -> Census {
+        let mut c = Census { made: self.made, released: self.released, ..Census::default() };
+        for b in self.blocks.iter().flatten() {
+            c.blocks += 1;
+            if b.free.whole(BLOCK) {
+                c.empty += 1;
+            } else {
+                c.by_class[usize::from(b.class.unwrap_or(0)).min(CLASSES - 1)] += 1;
+            }
+            c.pieces += u64::from(b.live);
+            c.free += b.free.0.values().sum::<u64>();
+            c.draining += u64::from(b.draining > now);
+        }
+        c.resting = self.resting.iter().map(|(_, p)| p.len).sum();
+        c.held = (c.blocks * BLOCK).saturating_sub(c.free + c.resting);
+        c
+    }
+
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
@@ -499,6 +543,7 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.released += 1;
                     }
                 }
             }
@@ -537,6 +582,21 @@ pub(crate) fn texture_room() -> u64 {
 /// on their way back to the system ([`DRAIN_MS`]).
 pub(crate) fn giving_back() -> u64 {
     lock(&TEXTURES).giving_back(now())
+}
+
+/// The texture blocks now, for the memory line ([`crate::vram`]).
+pub(crate) fn texture_census() -> Census {
+    lock(&TEXTURES).census(now())
+}
+
+/// The staging blocks now (the PC's memory).
+pub(crate) fn staging_census() -> Census {
+    lock(&STAGING).census(now())
+}
+
+/// Blocks left to empty since the start.
+pub(crate) fn drained() -> u64 {
+    DRAINED.load(Ordering::Relaxed)
 }
 
 /// The pieces taken of each texture block, by its number.
@@ -1131,6 +1191,44 @@ mod tests {
         let p = pool.take_ripe(64 << 10, 65536, 4 * REST + DRAIN_MS + 1, Ripe::ALL, Some(0), || None).unwrap().0;
         assert_eq!(p.block, 1);
         assert_eq!(pool.giving_back(4 * REST + DRAIN_MS + 1), 0, "taken again, it does not go back");
+    }
+
+    /// For the memory line: what the blocks hold, by class, free, resting,
+    /// empty and left to empty, and the blocks made and let go.
+    #[test]
+    fn a_census_says_what_the_blocks_hold() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let take = |pool: &mut Pool<u32>, len: u64| pool.take_ripe(len, 65536, 0, Ripe::ALL, Some(class_of(len)), make).unwrap().0;
+        let _a = take(&mut pool, 64 << 10);
+        let _b = take(&mut pool, 2 << 20);
+        let c = take(&mut pool, 64 << 10);
+        pool.give(c, 0);
+        pool.add(9, 0);
+        assert!(pool.drain(1, 0));
+        let census = pool.census(1);
+        assert_eq!(
+            census,
+            Census {
+                blocks: 3,
+                by_class: [1, 0, 1],
+                empty: 1,
+                pieces: 2,
+                held: (64 << 10) + (2 << 20),
+                free: 3 * BLOCK - (128 << 10) - (2 << 20),
+                resting: 64 << 10,
+                draining: 1,
+                made: 3,
+                released: 0,
+            }
+        );
+        pool.reclaim(REST, 0, true);
+        let census = pool.census(REST);
+        assert_eq!((census.blocks, census.empty, census.resting, census.released), (2, 0, 0, 1));
     }
 
     #[test]

@@ -176,14 +176,19 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(LET_GO_FROM) {
         (KEPT_MS, u64::MAX)
     } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+        (IDLE_MS, used - share(LET_GO_TO))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(LET_GO_TO))
     }
 }
+
+/// The shares of the card's budget, in percent, from which [`vram_keep`]
+/// lets idle textures go, and down to which.
+pub(crate) const LET_GO_FROM: u64 = 88;
+pub(crate) const LET_GO_TO: u64 = 85;
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
@@ -9547,6 +9552,8 @@ impl Meter {
                     );
                 }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
+                // What holds the card's memory (the old base's memory line).
+                tracing::info!("{}", crate::vram::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");
                 }

@@ -1,4 +1,5 @@
-//! The card's memory as the system counts it.
+//! The card's memory as the system counts it, and the line that says every
+//! five seconds, in release builds too, what holds it.
 //!
 //! The system counts a block of textures ([`crate::pool`]) as used from
 //! the moment it is made to the moment it goes back, whatever lies free
@@ -6,6 +7,8 @@
 //! of the budget where the system saw 100 % (audit vram V2), and kept
 //! making textures; and the sweep let textures go from all over the
 //! blocks, which freed pieces of them and none of the card's memory.
+
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Whether room on the card is what the system's budget leaves of what it
 /// counts in use (on by default): the free bytes inside texture blocks are
@@ -86,6 +89,104 @@ pub(crate) fn plan(idle: &[Idle], lives: &[u32], block_bytes: u64) -> Vec<Unit> 
 /// let go whole (a copy in them was in use by then).
 pub(crate) static LET_GO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// The counts of the last line, to say what changed since.
+static LAST: std::sync::Mutex<[u64; 9]> = std::sync::Mutex::new([0; 9]);
+
+/// The memory line: the system's budget and use, what of ours holds the
+/// card's memory, and what the queue and the sweep did since the last line.
+pub(crate) fn line() -> String {
+    let mb = |bytes: u64| bytes >> 20;
+    let memory = crate::host::host().and_then(|h| h.video_memory()).unwrap_or_default();
+    let [budget, used, _, shared] = memory;
+    let blocks = crate::pool::texture_census();
+    let staging = crate::pool::staging_census();
+    let giving_back = crate::pool::giving_back();
+    let system = system_room();
+    let counted = crate::resource::counted_in_use(used);
+    let kept = crate::shadow::card_room_kept() + crate::resource::targets_room_kept();
+    let host_bytes = crate::resource::HOST_TEXTURES[1].load(Relaxed);
+    let kinds: [u64; 7] = std::array::from_fn(|i| crate::resource::KINDS[i].load(Relaxed));
+    let (sides, before, windows) = crate::shadow::card_bytes();
+    let [whole, gave, broken] = [0, 1, 2].map(|i| LET_GO[i].load(Relaxed));
+    let now = [
+        kinds[2],
+        kinds[3],
+        crate::pool::drained(),
+        blocks.released,
+        blocks.made,
+        crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
+        whole,
+        gave,
+        broken,
+    ];
+    let since = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let since: [u64; 9] = std::array::from_fn(|i| now[i].saturating_sub(last[i]));
+        *last = now;
+        since
+    };
+    let percent = |part: u64| if budget == 0 { 0.0 } else { part as f64 * 100.0 / budget as f64 };
+    let classes = if crate::pool::classes() {
+        format!(
+            "with pieces of up to 64 KiB, up to 1 MiB and more {}, {} and {} (VICTORY_POOL_CLASSES=0: of any size together)",
+            blocks.by_class[0], blocks.by_class[1], blocks.by_class[2]
+        )
+    } else {
+        format!("{} with pieces of any size (VICTORY_POOL_CLASSES=0)", blocks.by_class.iter().sum::<u64>())
+    };
+    let (made_to, from, to) = crate::resource::lines(budget);
+    format!(
+        "card memory (VICTORY_SYSTEM_ROOM={}: {}): the system's budget {} MB, in use {} MB ({:.1} %), past the budget {} MB (what the \
+         system may move to the PC's memory); the PC's memory in use by the card {} MB, of it {} MB of our staging blocks; counted in \
+         use {} MB, less {} MB on its way back, with {} MB kept for targets and buffer copies to come: textures picked by index are \
+         made up to {} MB, idle ones let go from {} MB down to {} MB. Ours: {} blocks of textures {} MB, textures in {} pieces {} MB, free \
+         in them {} MB, resting {} MB, {} empty, {} left to empty, {classes}; host copies the title fills {} alive {} MB, {} MB of \
+         them outside blocks; other host textures (targets, depth, unordered access, twins) {} MB; buffer copies' card sides {} MB, \
+         their bytes from before {} MB, windows' {} MB. Since the last line: {} copies let go ({} MB), {} blocks let go whole ({} MB \
+         back), {} begun and left (a copy was used again), {} blocks left to empty, {} back to the system, {} made; {} texture passes \
+         refused for want of room ({} since the start)",
+        u8::from(system),
+        if system { "free bytes in blocks count as used" } else { "free bytes in blocks count as room" },
+        mb(budget),
+        mb(used),
+        percent(used),
+        mb(used.saturating_sub(budget)),
+        mb(shared),
+        mb(staging.blocks * crate::pool::BLOCK),
+        mb(counted),
+        mb(giving_back),
+        mb(kept),
+        mb(made_to),
+        mb(from),
+        mb(to),
+        blocks.blocks,
+        mb(blocks.blocks * crate::pool::BLOCK),
+        blocks.pieces,
+        mb(blocks.held),
+        mb(blocks.free),
+        mb(blocks.resting),
+        blocks.empty,
+        blocks.draining,
+        kinds[0],
+        mb(kinds[1]),
+        mb(kinds[1].saturating_sub(blocks.held)),
+        mb(host_bytes.saturating_sub(kinds[1])),
+        mb(sides),
+        mb(before),
+        mb(windows),
+        since[0],
+        mb(since[1]),
+        since[6],
+        mb(since[7]),
+        since[8],
+        since[2],
+        since[3],
+        since[4],
+        since[5],
+        now[5],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +201,18 @@ mod tests {
         assert_eq!(counted(mb(14_081), mb(1_769), mb(128), true), mb(13_953));
         assert!(counted(mb(14_081), mb(1_769), 0, false) < mb(14_580) / 100 * 90);
         assert!(counted(mb(14_081), mb(1_769), 0, true) > mb(14_580) / 100 * 90);
+    }
+
+    /// The line is made from counters alone, with or without a card, and
+    /// says what changed since the last one.
+    #[test]
+    fn the_memory_line_says_what_holds_the_card() {
+        let line = line();
+        println!("{line}");
+        assert!(line.starts_with("card memory (VICTORY_SYSTEM_ROOM=1: free bytes in blocks count as used): the system's budget"), "{line}");
+        for part in ["blocks of textures", "left to empty", "texture passes refused for want of room", "back to the system"] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
     }
 
     const BLOCK: u64 = 64 << 20;
