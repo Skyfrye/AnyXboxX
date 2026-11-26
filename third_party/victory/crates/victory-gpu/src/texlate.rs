@@ -25,12 +25,16 @@ pub(crate) enum Kind {
     /// whole level 0 (the title's streaming, ours of its files, and ours),
     /// or to a list that copied its larger levels from the store being sent.
     Full = 4,
-    /// The last look that found a slot's memory away to its upload: how
-    /// late its memory's arrival was noticed, at most.
+    /// The last look that found a slot's memory away to its upload, for a
+    /// slot a notice of memory (mapped, unmapped or written under it) made
+    /// due: how late its memory's arrival was noticed, at most.
     Noticed = 5,
+    /// The same for a slot its next look found with its memory: what the
+    /// look's wait by the clock adds where no notice tells.
+    Looked = 6,
 }
 
-const KINDS: usize = 6;
+const KINDS: usize = 7;
 /// Upper bounds of the buckets, in ms (the last is open).
 const BOUNDS: [u64; 14] = [16, 33, 66, 100, 166, 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, u64::MAX];
 
@@ -111,7 +115,8 @@ pub(crate) fn line() -> String {
         "upload to a sharper level shown",
         "upload to a new texture shown",
         "first viewed in part to shown whole",
-        "last look that found the memory away to the upload",
+        "last look that found the memory away to the upload, made due by a notice",
+        "the same, found by the next look",
     ];
     let mut parts = Vec::new();
     for (k, name) in NAMES.iter().enumerate() {

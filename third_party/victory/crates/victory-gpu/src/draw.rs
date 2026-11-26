@@ -206,11 +206,13 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
 }
 
-/// Frames ahead the pass before a bake takes slots from that are due only
-/// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
-/// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
-/// look reads 48 KiB, and a frame bakes up to sixteen times).
-const BAKE_AHEAD: [u64; 2] = [12, 2];
+/// Frames and milliseconds ahead the pass before a bake takes slots from
+/// that are due only then ([`bake_exact`]): those of notices (due in a
+/// frame or two), and at the frame's first bake alone the first two looks
+/// again ([`RECHECK_MS`]; a look reads 48 KiB, and a frame bakes up to
+/// sixteen times). (It was 12 frames at the first bake and 2 after, counted
+/// in frames for the looks again too.)
+const BAKE_AHEAD: [(u64, u64); 2] = [(2, RECHECK_MS[0] + RECHECK_MS[1]), (2, 0)];
 
 /// What [`crate::descriptor::host::HostHeap::texture_news`] said when the
 /// pass before a bake last served all there was, plus one (0: it did not):
@@ -778,9 +780,24 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
-/// Frames after a whole upload of a texture picked by index at which its
-/// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+/// Milliseconds after a whole upload of a texture picked by index at which
+/// its memory is looked at again, each counted from the look before (and
+/// never in the same frame). They were 4, 12, 40, 120 and 400 frames: the
+/// same at some 16 frames a second, and four times as long at the 2-5 of
+/// run nb1 (a texture the title filled after its upload showed what it
+/// had until then for 1.6 s to 160 s).
+const RECHECK_MS: [u64; 5] = [250, 750, 2500, 7500, 25000];
+
+/// Milliseconds after which a texture object at an address the title
+/// mapped, uploaded with not all of it there, is uploaded again (it was
+/// 120 frames: 8 s at 15 frames a second).
+const OBJECT_AGAIN_MS: u64 = 8000;
+
+/// Milliseconds a slot is held back while the card has no room for the
+/// host copy it needs (`full_card_pass`), unless the card has room before.
+/// (It was the frames of about four seconds, counted from the time since
+/// the last pass of any heap.)
+const FULL_HOLD_MS: u64 = 4000;
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -2504,7 +2521,7 @@ impl State {
         // host copy was let go: where their memory is, and its bytes.
         let (mut never, mut gone) = (Vec::new(), Vec::new());
         let mut seen = std::collections::BTreeSet::new();
-        for (index, uploaded) in host.texture_slots_all_due(frame) {
+        for (index, uploaded) in host.texture_slots_all_due(frame, crate::host::now_ms()) {
             due[0] += 1;
             due[1] += u64::from(uploaded);
             let state = match heap.handle(index).and_then(crate::descriptor::view) {
@@ -2551,8 +2568,8 @@ impl State {
     /// draws read through tables are not in the queue.
     /// shortcut: uploaded once, and again only when the title rewrites the
     /// slot. A placed texture not all mapped yet is uploaded with what is
-    /// there and looked at again (1, 2, 4, ... frames later, at most about
-    /// a second): uploaded again when more of it is mapped. Pages mapped
+    /// there and looked at again (16, 32, 64, ... ms later and at a later
+    /// frame, at most a second): uploaded again when more of it is mapped. Pages mapped
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
@@ -2630,14 +2647,24 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        // The longest wait between two looks at a slot whose memory is away:
+        // four of this heap's own passes once a frame, within 250 ms and a
+        // second (`TextureQueue::look_cap`; `VICTORY_TEXTURE_LOOK_MS` sets
+        // it). It was up to 256 frames, from the time since the last pass of
+        // any heap or kind (several a frame): 65-110 s at the 2-4 frames a
+        // second of run nb1, where the memory had come long before.
+        let now = crate::host::now_ms();
+        let cap = host.texture_pass(now, PASS_BUDGET.get().is_none());
+        let cap = look_ms().unwrap_or(cap);
+        let (mut due, census) = host.texture_slots_due(frame, now, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
             let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+            let (frames, ms) = BAKE_AHEAD[usize::from(again)];
+            let (ahead, _) = host.texture_slots_due(frame + frames, now + ms, 1 << 16);
             due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
@@ -2648,22 +2675,6 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
-        static PASSED: AtomicU64 = AtomicU64::new(0);
-        let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        // (`took` is since the last pass, of any heap and list: several a
-        // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
-        // second; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's time.)
-        let most = match look_ms() {
-            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
-            None => (4000 / took).clamp(16, 256),
-        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -2691,7 +2702,7 @@ impl State {
         let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
-        // (Not `most`: that is the longest wait between looks, used below.)
+        // (Not `cap`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes, _)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
@@ -2735,7 +2746,7 @@ impl State {
             // page alone, one whose first page is the one missing counted
             // as not there.)
             // A slot uploaded whole is looked at again a few times
-            // (`RECHECK_FRAMES`): the title writes a texture's view, and
+            // (`RECHECK_MS`): the title writes a texture's view, and
             // may fill the texture's memory itself only afterwards, with
             // no descriptor write and nothing from the runtime to tell of
             // it. The host copy then kept what the memory held at the
@@ -2747,20 +2758,27 @@ impl State {
             // title paints all the time through another view of their pages
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
-            let mut again_in = RECHECK_FRAMES[0];
+            let mut again_in = RECHECK_MS[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
+                    match RECHECK_MS.get(usize::from(looks) + 1) {
+                        Some(wait) => host.texture_slot_recheck(
+                            index,
+                            write,
+                            (frame + 1, now + wait),
+                            (at, len),
+                            print,
+                            looks + 1,
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
+                // (In the next frame.)
                 if recheck_soon() {
-                    again_in = 1;
+                    again_in = 0;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
@@ -2795,7 +2813,7 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
+                    host.texture_slot_later(index, write, frame, now, cap);
                     continue;
                 }
                 host.texture_slot_here(index);
@@ -2803,7 +2821,7 @@ impl State {
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        host.texture_slot_later(index, write, frame, now, cap);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
@@ -2842,10 +2860,10 @@ impl State {
                 if !has_its_texture {
                     refused += 1;
                     if full_card_pass() {
-                        // Held back for the frames of about four seconds
-                        // (`most`), or until the card has room; the pass
-                        // goes on, within a count that bounds one pass.
-                        host.texture_slot_held(index, write, frame + most);
+                        // Held back for about four seconds
+                        // (`FULL_HOLD_MS`), or until the card has room; the
+                        // pass goes on, within a count that bounds one pass.
+                        host.texture_slot_held(index, write, now + FULL_HOLD_MS);
                         if refused > 1024 {
                             break;
                         }
@@ -2962,12 +2980,12 @@ impl State {
                         at_once();
                     }
                 }
-                let again = partly.map(|mapped| (frame + 1, mapped));
+                let again = partly.map(|mapped| (frame + 1, 0, mapped));
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        host.texture_slot_recheck(index, write, (frame + 1, now + again_in), (at, len), print, 0, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
@@ -3014,10 +3032,10 @@ impl State {
                 served = false;
                 break;
             }
-            if let Some((since, waited, away)) = host.texture_slot_since(index) {
+            if let Some((since, waited, away, by_notice)) = host.texture_slot_since(index) {
                 use crate::texlate::{Kind, note};
                 note(if waited { Kind::Waited } else { Kind::Ready }, since);
-                note(Kind::Noticed, away);
+                note(if by_notice { Kind::Noticed } else { Kind::Looked }, away);
             }
             if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
                 if let Some(copy) = crate::resource::host_copy(resource) {
@@ -3065,8 +3083,8 @@ impl State {
             // more of it is mapped; a texture object at an address the
             // title mapped: again in 120 frames, as before).
             let again = match partly {
-                Some(mapped) => Some((frame + 1, mapped)),
-                None => (!whole).then_some((frame + 120, 0)),
+                Some(mapped) => Some((frame + 1, 0, mapped)),
+                None => (!whole).then_some((frame + 1, now + OBJECT_AGAIN_MS, 0)),
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
@@ -3103,7 +3121,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, (frame + 1, now + again_in), (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -5096,9 +5114,10 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 }
 
 /// The longest wait, in milliseconds, between two looks at a texture slot
-/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
-/// four seconds counted in passes, as before). The looks back off 1, 2, 4,
-/// ... frames up to it. Measured (run light-22, `crate::texlate`): from
+/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: four of
+/// its heap's own passes, within 250 ms and a second:
+/// `descriptor::host::TextureQueue::look_cap`). The looks back off 16, 32,
+/// 64, ... ms up to it. Measured (run light-22, `crate::texlate`): from
 /// the last look that found a slot's memory away to its upload, half under
 /// 0.5 s but nine in ten under 32 s: the memory had come long before.
 fn look_ms() -> Option<u64> {
@@ -5108,24 +5127,6 @@ fn look_ms() -> Option<u64> {
         tracing::info!(ms, "texture slots waiting for their memory are looked at at least this often (VICTORY_TEXTURE_LOOK_MS)");
         Some(ms)
     })
-}
-
-/// The milliseconds of a frame lately (a mean over the last frames), from
-/// the pass's frame number and clock.
-fn frame_ms(frame: u64, now: u64) -> u64 {
-    use std::sync::Mutex;
-    static LAST: Mutex<(u64, u64, f64)> = Mutex::new((0, 0, 50.0));
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let (was_frame, was_ms, mean) = *last;
-    if frame > was_frame {
-        if was_frame != 0 {
-            let each = now.saturating_sub(was_ms) as f64 / (frame - was_frame) as f64;
-            last.2 = mean * 0.9 + each.clamp(1.0, 2000.0) * 0.1;
-        }
-        last.0 = frame;
-        last.1 = now;
-    }
-    (last.2 as u64).max(1)
 }
 
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
@@ -5218,7 +5219,7 @@ mod bake_tests {
         // sent yet, and the slot shows the stand-in until that has run.
         let other = gpu.new_list().unwrap();
         host.texture_slot_show_after(&other, 5, handle);
-        for (index, write) in host.texture_slots_due(u64::MAX, 64).0 {
+        for (index, write) in host.texture_slots_due(u64::MAX, u64::MAX, 64).0 {
             host.texture_slot_done(index, write, None);
         }
         assert!(!host.made(5));
