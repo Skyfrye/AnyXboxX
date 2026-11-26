@@ -638,7 +638,6 @@ static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
 /// promote them out of the `neutral()` gray stand-in before sampling them.
 pub(crate) struct PendingListFlip {
     id: u64,
-    pub(crate) origin: (usize, u64),
     flip: Flip,
 }
 
@@ -2636,12 +2635,10 @@ impl HostHeap {
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         let asked = crate::host::now_ms();
         let id = NEXT_PENDING_FLIP.fetch_add(1, Relaxed);
-        let origin = (std::ptr::from_ref(list) as usize, list.epoch());
         {
             let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
             pending.push(PendingListFlip {
                 id,
-                origin,
                 flip: Flip { after: 0, heap, index, handle, key, late, asked },
             });
             PENDING_LIST_COUNT.store(pending.len(), Release);
@@ -2668,6 +2665,20 @@ impl HostHeap {
             flip.after = crate::host::submissions().0;
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
+    }
+
+    /// Slots of this heap that show a stand-in (or an older view) for a
+    /// texture on its way now: those behind a flip that waits for a
+    /// submission, and those whose flip waits in a list not sent yet.
+    pub(crate) fn stand_ins_left(&self) -> [usize; 2] {
+        let own = std::ptr::from_ref(self) as usize;
+        let flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|f| f.heap == own).count();
+        let listed = if PENDING_LIST_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            0
+        } else {
+            PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.flip.heap == own).count()
+        };
+        [flips, listed]
     }
 
     /// Whether any deferred slot flip or view remake for this heap requires
@@ -3827,6 +3838,12 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.get(index).is_some_and(|key| key != 0)
+    }
+
+    /// The host resource slot `index` views (tests).
+    #[cfg(test)]
+    pub(crate) fn shown_resource(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept_in(index)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -6889,12 +6906,10 @@ mod bake_flip_tests {
             let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
             pending.push(PendingListFlip {
                 id: id1,
-                origin: (1, 1),
                 flip: Flip { after: 0, heap, index: 7, handle: 0, key: 11, late: Some(1), asked: 0 },
             });
             pending.push(PendingListFlip {
                 id: id2,
-                origin: (2, 1),
                 flip: Flip { after: 0, heap, index: 8, handle: 0, key: 12, late: Some(1), asked: 0 },
             });
             PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
@@ -6916,7 +6931,6 @@ mod bake_flip_tests {
             for (id, idx) in [(id1, 10), (id2, 11)] {
                 pending.push(PendingListFlip {
                     id,
-                    origin: (3, 1),
                     flip: Flip { after: 0, heap, index: idx, handle: 0, key: 20, late: Some(1), asked: 0 },
                 });
             }
