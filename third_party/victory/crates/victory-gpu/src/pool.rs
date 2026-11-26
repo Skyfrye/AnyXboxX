@@ -616,6 +616,19 @@ fn made_now(texture: &ID3D12Resource) {
     unseen.insert(raw, begun);
 }
 
+/// `texture`, cut from a block where another lay, has its zeros queued for
+/// the next submission only now (`fill::placed`, after its twin and host copy
+/// were made): a submission begun since [`made_now`] took its head list
+/// without them, so it counts as begun before the texture too.
+pub(crate) fn zeros_queued(texture: &ID3D12Resource) {
+    let raw = texture.as_raw() as usize;
+    let begun = crate::host::submissions().0;
+    NEWEST_BEGUN.fetch_max(begun, Ordering::Relaxed);
+    let mut unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let at = unseen.entry(raw).or_insert(begun);
+    *at = (*at).max(begun);
+}
+
 /// Pooled textures made while submissions begun before them may still run:
 /// the submissions begun when each was made.
 static UNSEEN: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u64>>> = std::sync::LazyLock::new(Default::default);
