@@ -11,6 +11,17 @@
 //! card is never idle. Nothing is sent once no submission has gone out for
 //! a quarter of a second (a title that stands still; not a menu, which goes on
 //! drawing: the system's counter shows the compute queue at 100 % there too).
+//!
+//! Not on NVIDIA's cards (`VICTORY_CARD_AWAKE=always` keeps them awake all the
+//! same; `turns` too, to compare): there the drawing queue's work took twice
+//! as long beside the loop, and the clocks did not fall without it. On the
+//! RTX 5080, 28 submissions of draws and dispatches a frame took the card
+//! 83.6 ms alone and 175.4 ms with the loop (frames of 84.9 and 182.8 ms);
+//! with 260 us of the CPU's between submissions, as the submitting thread
+//! leaves them in the world, 83.6 and 175.2 ms; a light frame 8.5 and 18.1 ms
+//! (`host::ours::bench::bench_card_awake_beside_draws_and_dispatches`). The
+//! card runs the drawing queue and this compute queue by turns, not side by
+//! side, and each of the loop's dispatches holds it for its whole length.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,10 +64,13 @@ fn wanted() -> bool {
 /// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
 const TURN_MS: u64 = 20_000;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
     Off,
+    /// On, but not on NVIDIA's cards.
     On,
+    /// On whatever the card.
+    Always,
     /// On and off by turns, to compare the two in one run (the log says when).
     ByTurns,
 }
@@ -65,14 +79,60 @@ fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
         Ok("1") => Mode::On,
+        Ok("always") => Mode::Always,
         Ok("turns") => Mode::ByTurns,
         _ => Mode::Off,
     })
 }
 
+/// NVIDIA's PCI vendor number.
+const NVIDIA: u32 = 0x10de;
+
+/// Whether the loop runs, asked for as `mode`, on a card of `vendor`.
+fn runs(mode: Mode, vendor: Option<u32>) -> bool {
+    match mode {
+        Mode::Off => false,
+        Mode::On => vendor != Some(NVIDIA),
+        Mode::Always | Mode::ByTurns => true,
+    }
+}
+
+/// The PCI vendor of `device`'s card, if the system names it.
+fn vendor(device: &ID3D12Device) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .ok()
+            .map(|d| d.VendorId)
+    }
+}
+
+/// Whether the card of `device` is kept awake, asked for as it is; said once.
+fn kept(device: &ID3D12Device) -> bool {
+    static KEPT: OnceLock<bool> = OnceLock::new();
+    *KEPT.get_or_init(|| {
+        let mode = mode();
+        if mode == Mode::Off {
+            return false;
+        }
+        let vendor = vendor(device);
+        let kept = runs(mode, vendor);
+        if !kept {
+            tracing::info!(
+                "the card is not kept awake (VICTORY_CARD_AWAKE=1): on NVIDIA's cards the drawing queue's work took twice as \
+                 long beside the loop (VICTORY_CARD_AWAKE=always keeps it awake all the same)"
+            );
+        }
+        kept
+    })
+}
+
 /// A submission of the title's goes to `device`'s drawing queue.
 pub(super) fn sent(device: &ID3D12Device) {
-    if mode() == Mode::Off {
+    if mode() == Mode::Off || !kept(device) {
         return;
     }
     let now = now_ms();
@@ -207,6 +267,33 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Asked for with `1`, the loop runs on any card but NVIDIA's; with
+    /// `always` or `turns` on NVIDIA's too; never when not asked for.
+    #[test]
+    fn nvidia_cards_are_kept_awake_only_when_asked_for_whatever_the_card() {
+        let (amd, intel, warp) = (Some(0x1002), Some(0x8086), Some(0x1414));
+        for other in [amd, intel, warp, None] {
+            assert!(runs(Mode::On, other), "{other:?}");
+        }
+        assert!(!runs(Mode::On, Some(NVIDIA)));
+        for vendor in [Some(NVIDIA), amd, None] {
+            assert!(runs(Mode::Always, vendor) && runs(Mode::ByTurns, vendor));
+            assert!(!runs(Mode::Off, vendor));
+        }
+    }
+
+    /// The host's card is told apart by its vendor: on WARP the loop runs
+    /// as asked, on an NVIDIA card it does not (run with the card too).
+    #[test]
+    fn the_hosts_card_is_kept_awake_by_its_vendor() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let vendor = vendor(&host.device);
+        assert!(vendor.is_some());
+        assert_eq!(runs(Mode::On, vendor), vendor != Some(NVIDIA), "{vendor:x?}");
+    }
 
     /// Card memory the CPU maps holds what the CPU wrote, with the card kept
     /// awake meanwhile; the thread ends when it is let go.
