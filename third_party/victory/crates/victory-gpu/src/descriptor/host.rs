@@ -7187,6 +7187,7 @@ mod tests {
     /// slot was never looked at again.)
     #[test]
     fn a_slot_is_due_again_whenever_its_pages_change_at_any_view() {
+        crate::pagegen::TEST_ON.set(Some(true));
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
