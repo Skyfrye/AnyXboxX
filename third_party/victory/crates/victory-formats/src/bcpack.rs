@@ -344,9 +344,8 @@ impl Lane {
             return Ok(());
         }
         let mut x = self.x;
-        if x < LOW
-            && let Some(b) = self.latch.take()
-        {
+        let refill = if x < LOW { self.latch.take() } else { None };
+        if let Some(b) = refill {
             self.left = self.left.wrapping_sub(1);
             x = x << 8 | u32::from(b);
         }
@@ -374,16 +373,35 @@ impl Lane {
             // At exactly 2^24 the lane neither reads nor decodes again; only a
             // lane that has delivered its symbols may end up there.
             self.x = x;
+        } else if refill.is_some() && x < LOW {
+            // The fragment's last byte was the first of a two-byte refill.
+            // The state keeps it, and the lane takes this step without
+            // asking for input: the console's decoder drains for one step
+            // before it asks for the next header (Microsoft's `silicon-rans`
+            // RTL, `mdu_minirans.v`). Dropping the byte, and asking a step
+            // early, gave the rest of the stream to the wrong states or the
+            // wrong lanes, mostly without an error.
+            SPLIT_REFILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.x = x;
         } else {
-            // The fragment ends; a byte read in this step does not reach the carried state.
+            // The fragment ends. A byte read in this step stays in the state
+            // the next fragment carries on from, unless this one resets it.
             self.phase = 0;
             self.need = self.latch.is_none();
-            if self.reset {
-                self.x = 0;
-            }
+            self.x = if self.reset { 0 } else { x };
         }
         Ok(())
     }
+}
+
+/// Fragments that ended inside a two-byte refill, since the start (see
+/// [`Lane::step`]); the DirectStorage line says how many.
+static SPLIT_REFILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many fragments so far ended on the first byte of a two-byte refill:
+/// before this was handled, each one decoded the rest of its stream wrong.
+pub fn split_refills() -> u64 {
+    SPLIT_REFILLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The bucket holding `slot` (below 65536): the last whose start is at or
@@ -1265,6 +1283,63 @@ mod tests {
         } else {
             (-2 * v - 1) as u8
         }
+    }
+
+    /// A fragment that keeps its state (no reset bit) may end on the first
+    /// byte of a two-byte refill. The console's decoder (Microsoft's
+    /// `silicon-rans` RTL, `mdu_minirans.v`: PROCESSING, DRAINING, HDR0)
+    /// keeps that byte in the state, takes one step without input, and only
+    /// then asks for the next header. Uniform model of width 7 (`tables`):
+    /// symbol 0 owns slots 1-255 (frequency 255), symbol s > 0 slots 256 s
+    /// to 256 s + 255.
+    #[test]
+    fn a_refill_split_across_fragments_keeps_its_first_byte() {
+        let t = Tables::parse(&tables()).unwrap();
+        // Fragment 1 (header 0: model 7 * 16, no reset; 5 bytes): state
+        // 0x0100_0005 gives symbol 0 and leaves 0xff04; its last byte takes
+        // that to 0x00ff_04ab only. Fragment 2 (2 bytes): 0xff04_abcd gives
+        // symbol 0xab, then 0xff04_cdef 0xcd. Three bytes follow the stream,
+        // as in a source longer than its stream: a lane that dropped the
+        // byte read them as one more fragment and returned wrong symbols
+        // without an error.
+        let src = [
+            0x00, 4, 0x01, 0x00, 0x00, 0x05, 0xab, 0x00, 1, 0xcd, 0xef, 0x00, 0x00, 0x77,
+        ];
+        let mut next = src.iter().copied();
+        let mut got = [0u8; 3];
+        lanes(&t, &[7], 1, 3, |_| next.next(), &mut got).unwrap();
+        assert_eq!(got, [0, 0xab, 0xcd]);
+        assert_eq!(next.collect::<Vec<_>>(), [0x00, 0x00, 0x77]);
+        assert!(split_refills() > 0);
+    }
+
+    /// The same split on lane 0 of two, bytes in the console's order: lane 0
+    /// asks for nothing in the step after its fragment's last byte, so that
+    /// round's byte is lane 1's, and lane 0's header comes a round later.
+    #[test]
+    fn a_split_refill_waits_a_step_before_the_next_header() {
+        let t = Tables::parse(&tables()).unwrap();
+        // Lane 0 as above. Lane 1, one fragment of 9 bytes: three zeros hold
+        // its first symbol (0) back to the tenth round, then 0x7f and 0xcd
+        // give 0x7f. By round: (lane 0, lane 1).
+        let src = [
+            0x00, 0x00, // headers
+            4, 8, // lengths
+            0x01, 0x00, //
+            0x00, 0x00, //
+            0x00, 0x00, //
+            0x05, 0x01, //
+            0xab, 0x00, // lane 0 has its symbol 0
+            0x00, // lane 0 drains, asks nothing
+            0x00, 0x05, // lane 0's second header
+            0x00, 0x7f, // its length; lane 1 has its symbol 0
+            0xcd, 0xcd,
+        ];
+        let mut next = src.iter().copied();
+        let mut got = [0u8; 4];
+        lanes(&t, &[7, 7], 1, 2, |_| next.next(), &mut got).unwrap();
+        assert_eq!(got, [0, 0, 0xab, 0x7f]);
+        assert_eq!(next.next(), None);
     }
 
     #[test]

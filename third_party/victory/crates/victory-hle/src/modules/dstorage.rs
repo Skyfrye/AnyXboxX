@@ -801,7 +801,7 @@ fn work(scheduler: &'static Scheduler) {
 }
 
 impl Lanes {
-    /// Counts a finished request; every 5 s a debug line sums them up.
+    /// Counts a finished request; every 5 s an info line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
@@ -816,7 +816,10 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
+            // Said at info (as in the base before this one): whether loading
+            // waits for the disk, for BCPack or for neither is read from
+            // these lines, and so is the split refill count below.
+            tracing::info!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
@@ -824,6 +827,9 @@ impl Lanes {
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                // Since the start: BCPack fragments that ended inside a
+                // two-byte refill (decoded wrong before they were handled).
+                bcpack_split_refills = bcpack::split_refills(),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
