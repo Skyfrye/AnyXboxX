@@ -595,6 +595,10 @@ unsafe fn piece_at(
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
     let base = title / PAGE;
+    // What was opened for the landing at the title's own address, told to
+    // the texture slots that read it once the bytes are in
+    // (`crate::pagegen`; beside the guards, `Notes::flush` tells them).
+    let mut opened: Option<(usize, usize)> = None;
     if beside.is_none() {
         drop(reading);
         differing.fill(false);
@@ -613,6 +617,7 @@ unsafe fn piece_at(
         let opening = std::time::Instant::now();
         crate::watch::landing(from, to - from);
         spent(stat::NOTES, opening);
+        opened = Some((from, to));
     }
     let into = beside.unwrap_or(title);
     let since = crate::watch::changes();
@@ -661,6 +666,11 @@ unsafe fn piece_at(
             }
         }
     });
+    if let Some((from, to)) = opened
+        && dwords > 0
+    {
+        crate::pagegen::written(from, to - from);
+    }
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the

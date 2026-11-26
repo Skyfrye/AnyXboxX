@@ -232,6 +232,15 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// The pages each slot's texture was last read from for an upload, and
+    /// the tick from before that read (`crate::pagegen`): the slot is due
+    /// again when one of them changes, whatever address it was written
+    /// through ([`HostHeap::texture_slots_moved`]).
+    watchers: Mutex<crate::pagegen::Watchers>,
+    /// The slots that may be in `watchers` (put when a slot is watched,
+    /// taken out when it is forgotten): a write of a view that is no
+    /// texture needs nothing of `watchers` otherwise.
+    watched: Slots,
 }
 
 /// Whether a slot's write of no placed texture view leaves `placed` alone
@@ -992,6 +1001,11 @@ pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
+    // With page generations the slots are told at the pages
+    // (`crate::pagegen`), not at this address.
+    if crate::pagegen::on() {
+        return;
+    }
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -1054,6 +1068,11 @@ pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
+    // With page generations the slots are told at the pages and addresses
+    // themselves (`crate::pagegen`): this is the way before, for one release.
+    if crate::pagegen::on() {
+        return;
+    }
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -2031,6 +2050,8 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            watchers: Mutex::default(),
+            watched: Slots::new(count as usize),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2219,8 +2240,116 @@ impl HostHeap {
     /// whether memory was noted since a pass last took the notes.
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
+        if crate::pagegen::on() {
+            return (writes, self.watchers.lock().unwrap_or_else(|e| e.into_inner()).pending());
+        }
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))
+    }
+
+    /// Title slot `index`'s texture is about to be read from title memory
+    /// `[at, at + len)` for an upload (or found away there): from here on a
+    /// change of any page of it makes the slot due again, whatever address
+    /// it is written through ([`HostHeap::texture_slots_moved`]). Guards the
+    /// memory (or asks the kernel about it) first (`crate::pagegen::arm`).
+    pub(crate) fn texture_slot_watch(&self, index: u32, at: usize, len: usize) {
+        if !crate::pagegen::on() || len == 0 || index >= self.count {
+            return;
+        }
+        let (since, kept) = crate::pagegen::arm(at, len);
+        let pages = crate::pagegen::pages_of(at, len);
+        let mut watchers = self.watchers.lock().unwrap_or_else(|e| e.into_inner());
+        watchers.watch(index, pages, since, kept);
+        // (Under the lock: a write of another view meanwhile forgets it after.)
+        self.watched.put(index);
+    }
+
+    /// Title slot `index`'s texture memory `[at, at + len)` was found away
+    /// (not mapped): memory mapped there makes the slot due again
+    /// ([`crate::pagegen::readdressed`]). Nothing is read, so nothing is
+    /// guarded or asked.
+    pub(crate) fn texture_slot_watch_away(&self, index: u32, at: usize, len: usize) {
+        if !crate::pagegen::on() || len == 0 || index >= self.count {
+            return;
+        }
+        let since = crate::pagegen::now();
+        let pages = crate::pagegen::pages_of(at, len);
+        let mut watchers = self.watchers.lock().unwrap_or_else(|e| e.into_inner());
+        watchers.watch(index, pages, since, crate::pagegen::Kept::Told);
+        self.watched.put(index);
+    }
+
+    /// Title slot `index` holds no texture view any more, or one of a texture
+    /// the host fills itself: it watches nothing.
+    pub(crate) fn texture_slot_unwatch(&self, index: u32) {
+        if self.watched.remove(index) {
+            self.watchers.lock().unwrap_or_else(|e| e.into_inner()).forget(index);
+        }
+    }
+
+    /// Makes the slots due from `frame` whose texture's memory changed since
+    /// they last read it, at any address the title shows its pages
+    /// (`crate::pagegen`). Once a frame, asks the kernel about the slots in
+    /// the title's own memory; now and then looks at those in memory nothing
+    /// tracks. Slots tables read are left to their draws. Returns how many
+    /// it made due. (Instead of [`HostHeap::texture_slots_remapped`]'s
+    /// ranges by address and the fingerprint looks.)
+    pub(crate) fn texture_slots_moved(&self, frame: u64) -> usize {
+        /// Bytes of memory nothing tracks looked at in one pass, at most.
+        const LOOK_BYTES: usize = 8 << 20;
+        /// Ranges of the title's own memory asked about in a frame, at most.
+        const ASKS: usize = 64;
+        if self.sampler || !crate::pagegen::on() {
+            return 0;
+        }
+        let now_ms = crate::host::now_ms();
+        let (asks, looks) = {
+            let mut watchers = self.watchers.lock().unwrap_or_else(|e| e.into_inner());
+            (watchers.asks(frame, ASKS), watchers.looks(now_ms, LOOK_BYTES))
+        };
+        // (Asked with no lock of ours held: what the kernel says it tells.
+        // Memory it will not be asked about any more was freed or mapped
+        // otherwise: its slots read it again, as what it is now.)
+        for run in asks {
+            let (start, end) = (run[0].0, run.iter().map(|r| r.1).max().unwrap_or(run[0].1));
+            if crate::watch::writes(start, end, false).is_some() {
+                continue;
+            }
+            for (start, end) in run {
+                if crate::watch::writes(start, end, false).is_none() {
+                    crate::pagegen::readdressed(start, end - start);
+                }
+            }
+        }
+        let looked: Vec<(u32, usize, usize, u128)> =
+            looks.into_iter().map(|(slot, at, len)| (slot, at, len, crate::pagegen::digest_of(at, len))).collect();
+        let (mut slots, mut open) = {
+            let mut watchers = self.watchers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut slots = watchers.moved();
+            for (slot, at, len, digest) in looked {
+                if watchers.looked(slot, at, len, digest, now_ms) {
+                    slots.push(slot);
+                }
+            }
+            (slots, watchers.reopen())
+        };
+        if slots.is_empty() && open.is_empty() {
+            return 0;
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        open.retain(|&slot| !self.tabled_lately(slot, frame));
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        for &slot in &slots {
+            textures.changed(slot, frame, frame);
+        }
+        // Read while the guard was not all up: again from the next frame (by
+        // when what rests open is guarded at an asking), not at every pass.
+        for &slot in &open {
+            textures.changed(slot, frame, frame + 1);
+        }
+        slots.len() + open.len()
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -3145,6 +3274,9 @@ impl HostHeap {
             _ => false,
         };
         self.queue_texture(index, texture, seen, crate::frame::current());
+        if !texture {
+            self.texture_slot_unwatch(index);
+        }
         // The memory a placed texture view describes. Not for a slot
         // tables read (thousands of writes a frame, each read by its
         // draw): no pass looks at it, and the same texture's view in a
@@ -3199,9 +3331,14 @@ impl HostHeap {
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            {
+                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                for &(slot, _) in &stale {
+                    textures.remove(slot);
+                }
+            }
             for &(slot, _) in &stale {
-                textures.remove(slot);
+                self.texture_slot_unwatch(slot);
             }
         }
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
@@ -6727,9 +6864,11 @@ mod tests {
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
-    /// again from the next frame; a stale slot leaves the queue.
+    /// again from the next frame; a stale slot leaves the queue. (The way
+    /// before page generations, `VICTORY_PAGE_GENERATIONS=0`.)
     #[test]
     fn remapped_memory_makes_its_texture_slots_due() {
+        crate::pagegen::TEST_ON.set(Some(false));
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
@@ -6756,6 +6895,59 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// Page generations: a slot uploaded from one view of physical pages is
+    /// due again when the title writes them through another view (its CPU,
+    /// a guard's fault), or we do (a landing, a kernel read), however long
+    /// after the upload; and from the frame it is told in. (Before, nothing
+    /// told the slot of the CPU's write, a write of ours reached the
+    /// address it went through alone, and after five fingerprint looks the
+    /// slot was never looked at again.)
+    #[test]
+    fn a_slot_is_due_again_whenever_its_pages_change_at_any_view() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        // 64x64 BC7, one mip, in a page the title shows at two addresses.
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let len = crate::resource::placed_bytes(&resource).unwrap() as usize;
+        let size = len.div_ceil(64 << 10) * (64 << 10);
+        // (Kept mapped: what the guards know of their blocks must not become
+        // another test's fresh memory.)
+        let (_, one, two) = crate::watch::tests::two_views(size);
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (one as u32, (one as u64 >> 32) as u32);
+        assert!(heap.note_buffer(1, Some(&View::Placed(false, resource, desc)), false).is_empty());
+        // What the pass does: watched before the memory is read, then done.
+        let upload = |frame: u64| {
+            let (queued, write) = heap.texture_slots_due(frame, 8).0[0];
+            assert_eq!(queued, 1);
+            heap.texture_slot_watch(1, one, len);
+            heap.texture_slot_done(1, write, None);
+            assert_eq!(slots(u64::MAX), [] as [u32; 0]);
+        };
+        upload(u64::MAX);
+        assert_eq!(heap.texture_slots_moved(10), 0);
+        // The title's CPU writes the page through the other view.
+        // SAFETY: the second view, read-write once the handler opened it.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert_eq!(heap.texture_slots_moved(10), 1);
+        assert_eq!(slots(10), [1], "due from the frame it is told in");
+        upload(10);
+        // A thousand frames on, a write of ours at the other view.
+        for frame in 11..1011 {
+            assert_eq!(heap.texture_slots_moved(frame), 0);
+        }
+        crate::watch::writing(two + 64, 64);
+        assert_eq!(heap.texture_slots_moved(1011), 1);
+        assert_eq!(slots(1011), [1]);
+        upload(1011);
+        // The slot is written with a view of no texture: it watches nothing.
+        assert!(heap.note_buffer(1, None, false).is_empty());
+        crate::watch::writing(two, 64);
+        assert_eq!(heap.texture_slots_moved(1012), 0);
     }
 
     /// A write of no placed texture view forgets the slot in the spans

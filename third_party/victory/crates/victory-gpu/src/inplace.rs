@@ -415,6 +415,43 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+    // A slot that read these addresses before the view was known here read
+    // them as memory of their own (`crate::pagegen`): it reads them again.
+    crate::pagegen::readdressed(at, len);
+}
+
+/// For each 64 KiB block of `[start, end)`, in order: its address and the
+/// physical page a view of the title's shows there (the section's handle and
+/// the page's index in it), or `None` where no view does.
+pub(crate) fn physical(start: usize, end: usize, mut each: impl FnMut(usize, Option<(usize, u64)>)) {
+    let (first, last) = (start / K64, end.div_ceil(K64));
+    if first >= last {
+        return;
+    }
+    let v = views();
+    let mut block = first;
+    let from = v
+        .views
+        .range(..=first * K64)
+        .next_back()
+        .filter(|(base, view)| *base + view.0 > first * K64)
+        .map_or(first * K64, |(base, _)| *base);
+    for (&base, &(bytes, section, offset)) in v.views.range(from..last * K64) {
+        let (shown, past) = (base.div_ceil(K64), (base + bytes) / K64);
+        while block < shown.min(last) {
+            each(block * K64, None);
+            block += 1;
+        }
+        while block < past.min(last) {
+            let within = (block * K64 - base) as u64;
+            each(block * K64, Some((section, (offset + within) / K64 as u64)));
+            block += 1;
+        }
+    }
+    while block < last {
+        each(block * K64, None);
+        block += 1;
+    }
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):

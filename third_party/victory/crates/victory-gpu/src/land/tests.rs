@@ -250,6 +250,33 @@ fn a_piece_waits_for_a_change_of_mapping() {
     unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
 }
 
+/// What shaders wrote, landed through the title's own address or beside the
+/// guards, tells the texture slots that read the memory once it is in
+/// (`crate::pagegen`): before, a landing at the title's address told the
+/// texture pass only there, and before its bytes were in.
+#[test]
+fn a_landing_tells_the_texture_slots_that_read_it() {
+    assert!(crate::safecopy::on());
+    let title = Title::new(BLOCK);
+    for (round, beside) in [false, true].into_iter().enumerate() {
+        // (Not guarded: what tells is the landing, not a guard it opens.)
+        let mut watchers = crate::pagegen::Watchers::default();
+        let pages = crate::pagegen::pages_of(title.at, BLOCK);
+        watchers.watch(1, pages, crate::pagegen::now(), crate::pagegen::Kept::Told);
+        let now: Vec<u8> = (0..BLOCK).map(|i| (i as u8).wrapping_add(round as u8 * 7) | 1).collect();
+        let mut held = vec![0u8; BLOCK];
+        let mut notes = Notes::default();
+        // SAFETY: vectors of a block's bytes.
+        let put = unsafe {
+            piece_at(title.at, now.as_ptr(), held.as_mut_ptr(), &[(0, BLOCK)], true, &mut notes, beside, std::ptr::null())
+        };
+        assert!(put > 0, "beside: {beside}");
+        notes.flush();
+        assert_eq!(watchers.moved(), [1], "beside: {beside}");
+        assert_eq!(title.bytes(), now, "beside: {beside}");
+    }
+}
+
 /// Landings on several threads beside title threads that write the same
 /// blocks (other dwords) and a thread that refreshes a copy, guarding what
 /// it takes: no write of the title's is lost or undone, all the card wrote

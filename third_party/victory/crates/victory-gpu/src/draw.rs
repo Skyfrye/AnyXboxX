@@ -830,10 +830,16 @@ fn reupload_when_full() -> bool {
 }
 
 /// Whether textures picked by index are looked at again after their upload
-/// (`VICTORY_HEAP_RECHECK=0`: no).
+/// by fingerprint (`VICTORY_HEAP_RECHECK=0`: no). Only the way before page
+/// generations (`VICTORY_PAGE_GENERATIONS=0`), or beside them as their check
+/// (`VICTORY_PAGE_CHECK=1`): with them a slot is told of every change of its
+/// pages and needs no look.
 fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        (!crate::pagegen::on() || crate::pagegen::check())
+            && std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0")
+    })
 }
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
@@ -2628,11 +2634,19 @@ impl State {
         if room {
             host.texture_slots_room(frame);
         }
-        // Slots whose texture's memory the runtime mapped, unmapped or
-        // wrote since the last pass are due again.
-        host.texture_slots_remapped(frame);
+        // Slots whose texture's memory changed since they last read it, at
+        // whatever address the title wrote or mapped it (page generations,
+        // `crate::pagegen`), are due again. (`VICTORY_PAGE_GENERATIONS=0`,
+        // the way before: the ranges the runtime mapped, unmapped or wrote,
+        // by address.)
+        let generations = crate::pagegen::on();
+        if generations {
+            host.texture_slots_moved(frame);
+        } else {
+            host.texture_slots_remapped(frame);
+        }
         let baking = crate::texture::BAKING.get();
-        if baking {
+        if baking && !generations {
             host.texture_slots_bake_written(frame);
         }
         host.texture_slots_short(frame);
@@ -2789,28 +2803,52 @@ impl State {
                         View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
                         _ => 0,
                     });
-                    tracing::warn!(
-                        first_level = first,
-                        blocks_shown_elsewhere = elsewhere.len(),
-                        slot = index,
-                        address = format_args!("{at:#x}"),
-                        bytes = len,
-                        frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
-                        changed = n + 1,
-                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
-                    );
+                    if generations {
+                        // (`VICTORY_PAGE_CHECK=1`: a way of writing texture
+                        // memory that tells no page generation.)
+                        tracing::warn!(
+                            first_level = first,
+                            blocks_shown_elsewhere = elsewhere.len(),
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            "a texture picked by index changed after its upload and no page generation told of it: uploaded again"
+                        );
+                    } else {
+                        tracing::warn!(
+                            first_level = first,
+                            blocks_shown_elsewhere = elsewhere.len(),
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                        );
+                    }
                 }
             }
             let mut partly = None;
             let mut there = None;
+            // The memory a placed texture's view describes (address, bytes),
+            // which the slot watches the pages of (`crate::pagegen`) before
+            // they are read below.
+            let mut span = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
+                span = Some((address as usize, len as usize));
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                    // Memory mapped there makes the slot due again
+                    // (`crate::pagegen`), not only the next look.
+                    host.texture_slot_watch_away(index, address as usize, len as usize);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
                     host.texture_slot_later(index, write, frame, now, cap);
@@ -2938,15 +2976,16 @@ impl State {
             }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
-                // a render target, a depth or unordered access texture: the host's own.
-                // A bake's is shown with its other slots once its list has run
-                // (made "at once", one made while earlier submissions ran went
-                // behind the stand-in all the same: `show_new_later`).
+                // a render target, a depth or unordered access texture: the host's own,
+                // whatever title memory under it holds. A bake's is shown with its other
+                // slots once its list has run (made "at once", one made while earlier
+                // submissions ran went behind the stand-in all the same: `show_new_later`).
                 if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
                     sync.publish.push((index, handle, key));
                 } else {
                     at_once();
                 }
+                host.texture_slot_unwatch(index);
                 host.texture_slot_done(index, write, None);
                 continue;
             }
@@ -2959,6 +2998,16 @@ impl State {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
             };
+            // Before its memory is read: from here on a change of any of its
+            // pages, at whatever address the title writes or maps them, makes
+            // the slot due again, however long after this upload
+            // (`crate::pagegen`). A placed texture's memory as its view
+            // describes it, a texture object's where it lies.
+            if let Some((at, len)) =
+                span.or_else(|| crate::texture::title_span(resource, first).map(|(at, len)| (at as usize, len as usize)))
+            {
+                host.texture_slot_watch(index, at, len);
+            }
             let same = !tabled && crate::texture::unchanged(resource, first);
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);

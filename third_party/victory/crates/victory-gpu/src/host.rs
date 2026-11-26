@@ -8863,10 +8863,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
-    if title_dst {
-        // The kernel writes the destination: it must not be guarded.
-        crate::watch::writing(dst as usize, len);
-    }
+    // The kernel writes the destination: it must not be guarded. The texture
+    // slots that read it are told once the bytes are in, however this goes
+    // on (`crate::pagegen`).
+    let _told = title_dst.then(|| {
+        crate::watch::opening(dst as usize, len);
+        crate::pagegen::Writing(dst as usize, len)
+    });
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let since = crate::watch::changes();
@@ -9519,6 +9522,9 @@ impl Meter {
                         crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                         crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                     );
+                }
+                if crate::pagegen::on() {
+                    tracing::info!("{}", crate::pagegen::line());
                 }
                 tracing::info!(
                     "slots of textures made while lists sent before them ran, shown once those had run (VICTORY_SHOW_NEW_LATER={}), since the start: {}",

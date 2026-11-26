@@ -995,6 +995,24 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     runs
 }
 
+/// The bytes `[offset, offset + len)` of `pages` by section: the section's
+/// handle (as `victory_gpu::title_memory_section` was told), the offset of
+/// the first byte in it and the bytes, a run of consecutive pages each.
+/// Empty if a page is unknown.
+fn physical_bytes(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, u64, usize)> {
+    let Some(runs) = runs(pages, offset, len) else {
+        return Vec::new();
+    };
+    let (mut within, mut done) = (offset % PAGE, 0);
+    let mut out = Vec::with_capacity(runs.len());
+    for (slice, n) in &runs {
+        let k = (n * PAGE - within).min(len - done);
+        out.push((slice.section.handle as usize, (slice.index * PAGE + within) as u64, k));
+        (within, done) = (0, done + k);
+    }
+    out
+}
+
 /// DirectStorage has put bytes `[offset, offset + len)` of `pages` into
 /// memory, through a view of our own: the GPU side is told where the title
 /// sees them, so that what it copied there before they arrived (a texture
@@ -1005,6 +1023,12 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     if len == 0 {
         return;
+    }
+    // Told at the pages themselves first: the GPU side's texture slots know
+    // them by section and page, whatever address they read them at (one
+    // mapped since the write was asked for, or one not mapped now).
+    for (section, at, bytes) in physical_bytes(pages, offset, len) {
+        victory_gpu::title_physical_written(section, at, bytes);
     }
     for (at, bytes) in shown_at(pages, offset, len) {
         if stream_notice() {
@@ -2232,6 +2256,30 @@ mod tests {
         unsafe { at(3).cast::<u32>().write(7) };
         assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn physical_writes_are_told_by_section_and_offset() {
+        let mut one = [0usize; 2];
+        let mut two = [0usize; 1];
+        let (mut n, mut m) = (2, 1);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, one.as_mut_ptr()), 1);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut m, two.as_mut_ptr()), 1);
+        let handle = |page: usize| page_table().pages.get(&page).map(|s| s.section.handle as usize).unwrap();
+        let (a, b) = (handle(one[0]), handle(two[0]));
+        assert_ne!(a, b);
+        // The second page of the first allocation, then the second's only
+        // one: from 100 bytes into the first, 65,536 bytes in all.
+        let list = [one[1], two[0]];
+        assert_eq!(
+            physical_bytes(&list, 100, PAGE),
+            [(a, (PAGE + 100) as u64, PAGE - 100), (b, 0, 100)]
+        );
+        // Both pages of the first: one run.
+        assert_eq!(physical_bytes(&one, 8, 2 * PAGE - 8), [(a, 8, 2 * PAGE - 8)]);
+        assert!(physical_bytes(&[0x7fff_fff0], 0, 8).is_empty(), "a page the title does not own");
+        assert_eq!(XMemFreePhysicalPages(2, one.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, two.as_ptr()), 1);
     }
 
     #[test]
