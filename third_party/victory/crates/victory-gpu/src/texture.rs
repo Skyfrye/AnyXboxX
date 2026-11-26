@@ -111,8 +111,11 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<Digest>,
     asked: u64,
-    /// The frame a partly mapped texture was last read in.
+    /// When a partly mapped texture was last read (`crate::host::now_ms`).
     partial: Option<u64>,
+    /// When a guarded texture was last hashed (`crate::host::now_ms`, 0:
+    /// never): its turns come by the clock ([`HASH_EVERY_MS`]).
+    hashed: u64,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
@@ -123,21 +126,45 @@ struct Last {
 /// and after the hash found a change the guard did not see.
 const HOT_FRAMES: u64 = 64;
 
+/// Milliseconds between the turns of a guarded texture that saw no write
+/// to be hashed all the same, staggered by its address. It was every
+/// eighth frame: half a second at 16 frames a second, two at the 4 of run
+/// nb1.
+const HASH_EVERY_MS: u64 = 500;
+
+/// Milliseconds before a partly mapped texture is read again (reading
+/// around unmapped pages is slow, and nothing tells us when pages arrive).
+/// It was 30 frames: 2 s at 15 frames a second, 7-13 s at the 2.3-4 of
+/// run nb1, so long a mip that streamed in showed late.
+const PARTIAL_AGAIN_MS: u64 = 2000;
+
 /// Whether a guarded texture whose memory the hash found changed although
 /// the guard saw no write is hashed at every check for a while
-/// ([`HOT_FRAMES`]), not every eighth frame. A title that writes such a
-/// texture through another view of its pages (the guard sees none of it)
+/// ([`HOT_FRAMES`]), not every half second only ([`HASH_EVERY_MS`]; it
+/// was every eighth frame). A title that writes such a texture through
+/// another view of its pages (the guard sees none of it)
 /// every frame, a video's frames in a ring of three, showed each one up
 /// to eight frames late and in turns: the boot logo video and the loading
 /// animation flickered between old and new pictures (fx-flicker run 1441:
 /// the presented picture cycled through three, a new one every eight
 /// frames). A texture also starts hot, for the ones written that way from
 /// the start (the six-star screen of the first seconds, which the hash
-/// never caught changing). `VICTORY_TEXTURE_HOT=0`: every eighth frame
-/// only, as before.
+/// never caught changing). `VICTORY_TEXTURE_HOT=0`: in turns only, as
+/// before.
 fn hot_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
+}
+
+/// Whether a guarded texture at `start`, last hashed at `hashed` (0:
+/// never), takes its turn to be hashed at `now` (all `crate::host::now_ms`):
+/// once in every [`HASH_EVERY_MS`], at a point of that span its address
+/// sets, so that the textures take turns.
+fn hash_turn(start: usize, hashed: u64, now: u64) -> bool {
+    // (A prime step spreads neighbouring 64 KiB blocks over the span.)
+    let phase = ((start >> 16) as u64).wrapping_mul(61) % HASH_EVERY_MS;
+    let span = |t: u64| (t + phase) / HASH_EVERY_MS;
+    hashed == 0 || span(now) != span(hashed)
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1533,7 +1560,7 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
+        // the hash, which is taken every half second only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1543,13 +1570,10 @@ impl Staging {
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame
-                .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+            let turn = hash_turn(start, last.hashed, crate::host::now_ms());
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.hot_until == 0 {
@@ -1559,6 +1583,7 @@ impl Staging {
             if !exact && unwritten && !turn && !hot {
                 return 0;
             }
+            last.hashed = crate::host::now_ms();
             blind = unwritten;
         }
         // A change the guard did not see: hashed at every check for a while.
@@ -1591,14 +1616,13 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
-            let frame = crate::frame::current();
-            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
+            // shortcut: read again at most every [`PARTIAL_AGAIN_MS`]: a
+            // mip that streams in shows up to that late.
+            let now = crate::host::now_ms();
+            if !exact && last.partial.is_some_and(|at| now < at + PARTIAL_AGAIN_MS) {
                 return 0;
             }
-            last.partial = Some(frame);
+            last.partial = Some(now);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
@@ -1719,7 +1743,7 @@ impl Staging {
             }
             got
         });
-        last.partial = Some(crate::frame::current());
+        last.partial = Some(crate::host::now_ms());
         UNLOCKED[2].fetch_add(1, Relaxed);
         if got < there.max(self.expected.load(Relaxed)) {
             UNLOCKED[3].fetch_add(1, Relaxed);
@@ -2218,6 +2242,38 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod hash_turn_tests {
+    use super::{HASH_EVERY_MS, hash_turn};
+
+    /// A guarded texture that saw no write takes its turn to be hashed once
+    /// in every half second by the clock, whatever the frame rate, and
+    /// textures at other addresses take theirs at other points of it.
+    #[test]
+    fn guarded_textures_take_their_turns_by_the_clock() {
+        let start = 0x2_0000_0000usize;
+        assert!(hash_turn(start, 0, 5), "never hashed");
+        // Checked every 10 ms (100 frames a second) or every 250 ms (4 a
+        // second): one turn in each half second either way.
+        for every in [10u64, 250] {
+            let (mut hashed, mut turns) = (1, 0);
+            let mut now = 1;
+            while now < 1 + 10 * HASH_EVERY_MS {
+                if hash_turn(start, hashed, now) {
+                    turns += 1;
+                    hashed = now;
+                }
+                now += every;
+            }
+            assert!((9..=11).contains(&turns), "every {every} ms: {turns} turns in 5 s");
+        }
+        // Neighbouring blocks turn at other points of the span.
+        let turns_at = |start: usize| (1..2 * HASH_EVERY_MS).find(|&t| hash_turn(start, 1, t)).unwrap();
+        let points: std::collections::BTreeSet<u64> = (0..8).map(|k| turns_at(start + (k << 16))).collect();
+        assert!(points.len() >= 7, "{points:?}");
+    }
 }
 
 #[cfg(test)]

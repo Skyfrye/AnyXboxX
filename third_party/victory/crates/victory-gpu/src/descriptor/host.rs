@@ -404,117 +404,231 @@ fn note_before(index: u32, was: u64, by: &'static str) {
     }
 }
 
-/// A 1x1 gray texture, in the place of one that is not there yet.
-fn neutral() -> Option<&'static ID3D12Resource> {
-    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
-    TEXTURE
-        .get_or_init(|| {
-            let host = host()?;
-            let device = &host.device;
-            let (from, data) = host.upload_buffer(256)?;
-            // SAFETY: the buffer's mapping; plain creation and recording,
-            // waited for before what it names goes.
-            unsafe {
-                std::ptr::write_bytes(data, 0x80, 256);
-                let mut made: Option<ID3D12Resource> = None;
-                device
-                    .CreateCommittedResource(
-                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-                        D3D12_HEAP_FLAG_NONE,
-                        &D3D12_RESOURCE_DESC {
-                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                            Width: 1,
-                            Height: 1,
-                            DepthOrArraySize: 1,
-                            MipLevels: 1,
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                            ..Default::default()
-                        },
-                        D3D12_RESOURCE_STATE_COMMON,
-                        None,
-                        &mut made,
-                    )
-                    .ok()?;
-                let made = made?;
-                let queue: ID3D12CommandQueue = device
-                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
-                    .ok()?;
-                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
-                let list: ID3D12GraphicsCommandList =
-                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
-                let to = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&made),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-                };
-                let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: 0,
-                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                        Width: 1,
-                        Height: 1,
-                        Depth: 1,
-                        RowPitch: 256,
-                    },
-                };
-                let source = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&from),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
-                };
-                list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
-                list.Close().ok()?;
-                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-                queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
-                queue.Signal(&fence, 1).ok()?;
-                // (Without an event: this waits.)
-                fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).ok()?;
-                Some(made)
-            }
-        })
-        .as_ref()
+/// What a slot of a texture that is not there yet reads: mid grey with
+/// full alpha. Grey keeps a normal map flat and a roughness or colour
+/// middling; full alpha keeps a surface that an alpha test cuts (hair,
+/// leaves, decals) drawn where a null view's zeros (black, alpha 0) made
+/// it vanish, and where the old stand-in's half alpha left it to the
+/// test's threshold.
+const NEUTRAL_TEXEL: [u8; 4] = [0x80, 0x80, 0x80, 0xff];
+
+/// The shapes of stand-in textures, one for each kind of shader view a
+/// title names: a view of each kind needs a texture of its own kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Neutral {
+    /// 1D and 1D array views.
+    Line = 0,
+    /// 2D and 2D array views.
+    Flat = 1,
+    /// Cube and cube array views: six slices.
+    Cube = 2,
+    /// 3D views.
+    Volume = 3,
 }
 
-/// Makes the descriptor of [`neutral`] for a slot of `view` at `at`, if the
-/// view is a 2D texture's or an array's; else a null one of its kind.
-fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    const TEXTURE2D: u32 = 4;
-    const TEXTURE2D_ARRAY: u32 = 5;
-    let dimension = match view {
-        View::Shader(_, Some(desc)) => desc[1],
-        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
-        _ => 0,
+/// The stand-in texture of `kind`: 1x1 (and one deep), each slice
+/// [`NEUTRAL_TEXEL`], made and filled once.
+fn neutral(kind: Neutral) -> Option<&'static ID3D12Resource> {
+    static TEXTURES: [std::sync::OnceLock<Option<ID3D12Resource>>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    TEXTURES[kind as usize].get_or_init(|| make_neutral(kind)).as_ref()
+}
+
+fn make_neutral(kind: Neutral) -> Option<ID3D12Resource> {
+    // A slice's texel starts on the placement alignment, its row on the
+    // pitch alignment.
+    const SLICE: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+    let host = host()?;
+    let device = &host.device;
+    let (dimension, slices) = match kind {
+        Neutral::Line => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1u16),
+        Neutral::Flat => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1),
+        Neutral::Cube => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6),
+        Neutral::Volume => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, 1),
     };
-    let desc = match dimension {
-        TEXTURE2D => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
-            },
+    let (from, data) = host.upload_buffer(SLICE * u64::from(slices))?;
+    // SAFETY: the buffer's mapping; plain creation and recording,
+    // waited for before what it names goes.
+    unsafe {
+        for slice in 0..usize::from(slices) {
+            std::ptr::copy_nonoverlapping(NEUTRAL_TEXEL.as_ptr(), data.add(slice * SLICE as usize), NEUTRAL_TEXEL.len());
+        }
+        let mut made: Option<ID3D12Resource> = None;
+        device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: dimension,
+                    Width: 1,
+                    Height: 1,
+                    DepthOrArraySize: slices,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut made,
+            )
+            .ok()?;
+        let made = made?;
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+            .ok()?;
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
+        let list: ID3D12GraphicsCommandList =
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
+        for slice in 0..u32::from(slices) {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&made),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: slice },
+            };
+            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: u64::from(slice) * SLICE,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    Width: 1,
+                    Height: 1,
+                    Depth: 1,
+                    RowPitch: D3D12_TEXTURE_DATA_PITCH_ALIGNMENT,
+                },
+            };
+            let source = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&from),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
+        }
+        list.Close().ok()?;
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
+        queue.Signal(&fence, 1).ok()?;
+        // (Without an event: this waits.)
+        fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).ok()?;
+        Some(made)
+    }
+}
+
+/// The shader view dimension (`D3D12_SRV_DIMENSION`) of a view of a
+/// texture: what its description says, or for a view of a texture object
+/// with none, what D3D12 takes from the texture
+/// ([`crate::resource::own_view_dimension`]). 0: no texture view.
+fn view_dimension(view: &View) -> u32 {
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
+        View::Shader(r, desc) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => match desc {
+            Some(desc) => desc[1],
+            None => crate::resource::own_view_dimension(*r as crate::object::This),
         },
-        TEXTURE2D_ARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+        _ => 0,
+    }
+}
+
+/// The stand-in kind and view description for a texture view of SRV
+/// dimension `dimension`; `None` for a dimension that has none (buffers,
+/// multisampled textures).
+fn neutral_desc(dimension: u32) -> Option<(Neutral, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    let (kind, view_dimension, anonymous) = match D3D12_SRV_DIMENSION(dimension as i32) {
+        D3D12_SRV_DIMENSION_TEXTURE1D => (
+            Neutral::Line,
+            D3D12_SRV_DIMENSION_TEXTURE1D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture1D: D3D12_TEX1D_SRV { MipLevels: 1, ..Default::default() } },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => (
+            Neutral::Line,
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
+            },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURE2D => (
+            Neutral::Flat,
+            D3D12_SRV_DIMENSION_TEXTURE2D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => (
+            Neutral::Flat,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
             },
-        },
-        _ => {
-            null_for(view, at);
-            return None;
-        }
+        ),
+        D3D12_SRV_DIMENSION_TEXTURE3D => (
+            Neutral::Volume,
+            D3D12_SRV_DIMENSION_TEXTURE3D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture3D: D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() } },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURECUBE => (
+            Neutral::Cube,
+            D3D12_SRV_DIMENSION_TEXTURECUBE,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 { TextureCube: D3D12_TEXCUBE_SRV { MipLevels: 1, ..Default::default() } },
+        ),
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => (
+            Neutral::Cube,
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 1, NumCubes: 1, ..Default::default() },
+            },
+        ),
+        _ => return None,
     };
-    let (Some(texture), Some(host)) = (neutral(), host()) else {
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: view_dimension,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: anonymous,
+    };
+    Some((kind, desc))
+}
+
+/// Makes the descriptor of the [`neutral`] texture of `view`'s dimension
+/// for a slot of `view` at `at`; a null one of its kind if it has none
+/// (multisampled textures, buffers).
+fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    let Some((kind, desc)) = neutral_desc(view_dimension(view)) else {
+        null_for(view, at);
+        return None;
+    };
+    let (Some(texture), Some(host)) = (neutral(kind), host()) else {
         null_for(view, at);
         return None;
     };
     // SAFETY: a slot of our heap, a live texture.
     unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), at) };
     Some(texture.clone())
+}
+
+/// Whether a slot written with texture view `view`, left for the texture
+/// pass or a draw to make (it is not uploaded yet), shows the [`neutral`]
+/// stand-in meanwhile (`VICTORY_STAND_IN=0`: it is null, as before, and
+/// reads zeros). Only of a texture the title fills: one the host renders
+/// to or writes is made at the next pass and has no colour to stand for.
+fn stands_in(view: &View) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_STAND_IN").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    match view {
+        View::Placed(false, resource, _) => crate::resource::placed_fills(resource),
+        View::Shader(r, _) => {
+            let r = *r as crate::object::This;
+            crate::resource::buffer_bytes(r).is_none() && crate::resource::title_fills(r)
+        }
+        _ => false,
+    }
+}
+
+/// Texture slots made to show the [`neutral`] stand-in and made null, since
+/// the start (`crate::host`'s line every five seconds gives them a frame).
+pub(crate) static STAND_INS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Counts a texture slot made to show the stand-in (`shown`: what
+/// [`neutral_for`] gave) or made null.
+fn stood_in(shown: Option<&ID3D12Resource>) {
+    STAND_INS[usize::from(shown.is_none())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
@@ -524,7 +638,6 @@ static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
 /// promote them out of the `neutral()` gray stand-in before sampling them.
 pub(crate) struct PendingListFlip {
     id: u64,
-    pub(crate) origin: (usize, u64),
     flip: Flip,
 }
 
@@ -1013,11 +1126,28 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// The first wait, in milliseconds, before a slot whose memory a look
+/// found away is looked at again; each look after it waits twice as long,
+/// up to [`TextureQueue::look_cap`].
+const LOOK_FIRST_MS: u64 = 16;
+
+/// The longest wait between two looks at a slot whose memory is away
+/// ([`TextureQueue::look_cap`]): that of this many of its heap's own
+/// passes, within these bounds in milliseconds. Counted in frames it was
+/// up to 256 frames, 65-110 s at the 2-4 frames a second of run nb1, and
+/// the time it stood for came from the last pass of any heap or kind.
+const LOOK_CAP_PASSES: u64 = 4;
+const LOOK_CAP_MS: [u64; 2] = [250, 1000];
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
     /// The frame from which the slot is due.
     due: u64,
+    /// And the time (`crate::host::now_ms`) from which it is due, for a
+    /// slot that waits by the clock (looks, looks again after its upload,
+    /// held back while the card has no room); 0: from its frame.
+    at: u64,
     /// The frame it was written in.
     written: u64,
     /// Which write of the queue put it here: the pass hands it back with
@@ -1041,6 +1171,22 @@ struct Waiting {
     waited: bool,
     /// When a look last found its memory away (or no more of it): 0 none.
     away: u64,
+    /// Whether a notice of memory (mapped, unmapped or written under it)
+    /// made it due since that look, rather than its next look's time.
+    by_notice: bool,
+}
+
+impl Waiting {
+    /// Whether the slot is due at `frame` and time `now`.
+    fn is_due(&self, frame: u64, now: u64) -> bool {
+        self.due <= frame && self.at <= now
+    }
+
+    /// Whether it waited for its memory: a look found that away, or it was
+    /// uploaded in part (not a look again after a whole upload).
+    fn waited(&self) -> bool {
+        self.waited || (self.looks > 0 && self.checked.2 == 0) || self.mapped > 0
+    }
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -1057,6 +1203,9 @@ pub(crate) struct TextureQueue {
     /// Which slots are in `slots`, for those who only want one out
     /// ([`Queued`]).
     queued: std::sync::Arc<Queued>,
+    /// When this heap's last pass began (`crate::host::now_ms`, 0: none
+    /// yet), and the milliseconds between its passes lately (0: not known).
+    pass: (u64, u64),
 }
 
 /// A bit for each slot of a heap's [`TextureQueue`], changed under its lock
@@ -1121,21 +1270,29 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(
+            index,
+            Waiting { due, at: 0, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away, by_notice: false },
+        );
     }
 
-    /// What a slot written again keeps of its wait.
+    /// What a slot written again keeps of its wait: none of a slot that
+    /// was up to date and only waited for another look at its memory
+    /// ([`TextureQueue::recheck`]): its wait begins now.
     fn kept(&self, index: u32) -> (u64, bool, u64) {
-        self.slots.get(&index).map_or_else(
-            || (crate::host::now_ms(), false, 0),
-            |w| (w.since, w.waited || w.looks > 0 || w.mapped > 0, w.away),
-        )
+        match self.slots.get(&index) {
+            Some(w) if w.checked.2 == 0 => (w.since, w.waited(), w.away),
+            _ => (crate::host::now_ms(), false, 0),
+        }
     }
 
-    /// When slot `index` began to wait, whether it waited for its memory, and
-    /// when a look last found that away.
-    fn since(&self, index: u32) -> Option<(u64, bool, u64)> {
-        self.slots.get(&index).map(|w| (w.since, w.waited || w.looks > 0 || w.mapped > 0, w.away))
+    /// When slot `index` began to wait, whether it waited for its memory,
+    /// when a look last found that away, and whether a notice of memory
+    /// made it due since; `None` for a slot that is up to date and waits
+    /// only for another look at its memory ([`TextureQueue::recheck`]): an
+    /// upload after that look is no wait of a write's.
+    fn since(&self, index: u32) -> Option<(u64, bool, u64, bool)> {
+        self.slots.get(&index).filter(|w| w.checked.2 == 0).map(|w| (w.since, w.waited(), w.away, w.by_notice))
     }
 
     fn remove(&mut self, index: u32) {
@@ -1153,14 +1310,14 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     #[cfg(test)]
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        Self::in_order(self.all_due(frame), max)
+    fn due(&self, frame: u64, now: u64, max: usize) -> Vec<(u32, u64)> {
+        Self::in_order(self.all_due(frame, now), max)
     }
 
-    /// The slots due at `frame`, for [`TextureQueue::in_order`].
-    fn all_due(&self, frame: u64) -> Due {
+    /// The slots due at `frame` and time `now`, for [`TextureQueue::in_order`].
+    fn all_due(&self, frame: u64, now: u64) -> Due {
         let mut due = Due::default();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+        for (&index, w) in self.slots.iter().filter(|(_, w)| w.is_due(frame, now)) {
             due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
         }
         due
@@ -1199,13 +1356,38 @@ impl TextureQueue {
         }
     }
 
-    /// Nothing to upload at slot `index` now: looked at again after 1, 2,
-    /// 4, ... frames, at most `most`.
-    fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
+    /// Nothing to upload at slot `index` now (frame `frame`, time `now`):
+    /// looked at again at a pass of a later frame, once [`LOOK_FIRST_MS`],
+    /// then twice and four times as long, ... have gone by, at most `cap`
+    /// milliseconds ([`TextureQueue::look_cap`]).
+    fn later(&mut self, index: u32, write: u64, frame: u64, now: u64, cap: u64) {
         if let Some(w) = self.same(index, write) {
-            w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
+            w.due = frame + 1;
+            w.at = now + (LOOK_FIRST_MS << w.looks.min(16)).min(cap.max(1));
             w.looks = w.looks.saturating_add(1);
-            w.away = crate::host::now_ms();
+            w.away = now;
+            w.by_notice = false;
+        }
+    }
+
+    /// The pass of this heap's that begins at `now`: its time between
+    /// passes is counted ([`TextureQueue::look_cap`]).
+    fn passed(&mut self, now: u64) {
+        let (last, mean) = self.pass;
+        if last != 0 && now > last {
+            let each = (now - last).min(10_000);
+            self.pass.1 = if mean == 0 { each } else { (mean * 3 + each) / 4 };
+        }
+        self.pass.0 = now;
+    }
+
+    /// The longest wait between two looks at a slot whose memory is away:
+    /// [`LOOK_CAP_PASSES`] of this heap's own passes, within
+    /// [`LOOK_CAP_MS`] (the most until the time between them is known).
+    fn look_cap(&self) -> u64 {
+        match self.pass.1 {
+            0 => LOOK_CAP_MS[1],
+            each => (each * LOOK_CAP_PASSES).clamp(LOOK_CAP_MS[0], LOOK_CAP_MS[1]),
         }
     }
 
@@ -1219,9 +1401,9 @@ impl TextureQueue {
     /// reached: the ones whose host copy exists and only wants bringing up
     /// to date, and the ones whose memory went, which is what lets host
     /// copies go and makes room.)
-    fn hold(&mut self, index: u32, write: u64, due: u64) {
+    fn hold(&mut self, index: u32, write: u64, until: u64) {
         if let Some(w) = self.same(index, write) {
-            w.due = w.due.max(due);
+            w.at = w.at.max(until);
             self.held.insert(index, write);
         }
     }
@@ -1234,6 +1416,7 @@ impl TextureQueue {
         for (index, write) in held {
             if let Some(w) = self.same(index, write) {
                 w.due = w.due.min(frame);
+                w.at = 0;
                 back += 1;
             }
         }
@@ -1241,22 +1424,25 @@ impl TextureQueue {
     }
 
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
-    /// not all of it: looked at again from frame `due`.
-    fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
+    /// not all of it: looked at again from frame `due` and time `at`.
+    fn partly(&mut self, index: u32, write: u64, due: u64, at: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
-            (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            (w.due, w.at, w.looks, w.mapped) = (due, at, 0, mapped.max(1));
         }
     }
 
-    /// Slot `index` was uploaded whole from memory `at` (address, bytes)
-    /// with fingerprint `print`: looked at again from frame `due`, for a
-    /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame).
+    /// Slot `index` was uploaded whole from memory `region` (address,
+    /// bytes) with fingerprint `print`: looked at again from frame `due`
+    /// and time `at`, for a title that fills a texture's memory after it
+    /// wrote the view (the `looks`-th such look; `uploaded` is the upload's
+    /// frame). It is up to date meanwhile: no wait of a write's
+    /// ([`TextureQueue::since`]).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(&mut self, index: u32, write: u64, due: u64, at: u64, region: (u64, u64), print: u64, looks: u8, uploaded: u64) {
         if let Some(w) = self.same(index, write) {
-            (w.due, w.looks, w.mapped) = (due, 1, 0);
-            w.checked = (at.0, at.1, print, looks, uploaded);
+            (w.due, w.at, w.looks, w.mapped) = (due, at, 1, 0);
+            w.checked = (region.0, region.1, print, looks, uploaded);
+            (w.waited, w.away, w.by_notice) = (false, 0, false);
         }
     }
 
@@ -1274,8 +1460,14 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+        // (Told of while a look had found its memory away: what the next
+        // upload shows of the notices.)
+        let by_notice = self.slots.get(&index).is_some_and(|w| w.away != 0 && w.checked.2 == 0);
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(
+            index,
+            Waiting { due, at: 0, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away, by_notice },
+        );
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1284,18 +1476,20 @@ impl TextureQueue {
         self.slots.get(&index).map_or(0, |w| w.mapped)
     }
 
-    /// For the frame line: slots in the queue; of them due at `frame`;
-    /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
+    /// For the frame line: slots in the queue; of them due at `frame` and
+    /// time `now`; waiting for their memory (looked at, never uploaded: not
+    /// those uploaded whole and waiting for another look at it); uploaded
+    /// in part; and the frames the oldest due one has waited since its
+    /// write.
+    fn census(&self, frame: u64, now: u64) -> [u64; 5] {
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
         for w in self.slots.values() {
             if w.mapped > 0 {
                 c[3] += 1;
-            } else if w.looks > 0 {
+            } else if w.looks > 0 && w.checked.2 == 0 {
                 c[2] += 1;
             }
-            if w.due <= frame {
+            if w.is_due(frame, now) {
                 c[1] += 1;
                 c[4] = c[4].max(frame.saturating_sub(w.written));
             }
@@ -1997,16 +2191,28 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
-    /// Up to `max` title slots whose texture view is due at `frame`, each
-    /// with its write number, in the order to serve them
-    /// ([`TextureQueue::due`]), and the queue's counts
-    /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    /// Up to `max` title slots whose texture view is due at `frame` and
+    /// time `now` (`crate::host::now_ms`), each with its write number, in
+    /// the order to serve them ([`TextureQueue::due`]), and the queue's
+    /// counts ([`TextureQueue::census`]).
+    pub(crate) fn texture_slots_due(&self, frame: u64, now: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let (due, census) = {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame))
+            (if max == 0 { Due::default() } else { textures.all_due(frame, now) }, textures.census(frame, now))
         };
         (TextureQueue::in_order(due, max), census)
+    }
+
+    /// A pass of the texture queue begins at `now`: one of this heap's
+    /// own once a frame (`own`), whose time between them is counted, or one
+    /// made early or for a bake. Returns the longest wait between two looks
+    /// at a slot whose memory is away ([`TextureQueue::look_cap`]).
+    pub(crate) fn texture_pass(&self, now: u64, own: bool) -> u64 {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if own {
+            textures.passed(now);
+        }
+        textures.look_cap()
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -2021,30 +2227,29 @@ impl HostHeap {
     /// it was uploaded before (in part, or whole and waiting for another
     /// look): for the card accounting line
     /// (`crate::resource::card_accounting`).
-    pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
+    pub(crate) fn texture_slots_all_due(&self, frame: u64, now: u64) -> Vec<(u32, bool)> {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures
             .slots
             .iter()
-            .filter(|(_, w)| w.due <= frame)
+            .filter(|(_, w)| w.is_due(frame, now))
             .map(|(&index, w)| (index, w.mapped > 0 || w.checked.2 != 0))
             .collect()
     }
 
-    /// The texture view of title slot `index` (as handed out with `write`)
-    /// was brought up to date: due again from frame `again` (uploaded with
-    /// that many bytes of its memory there, not all), or not until the
-    /// slot is written again.
-    pub(crate) fn texture_slot_since(&self, index: u32) -> Option<(u64, bool, u64)> {
+    /// See [`TextureQueue::since`].
+    pub(crate) fn texture_slot_since(&self, index: u32) -> Option<(u64, bool, u64, bool)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).since(index)
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
-    /// was brought up to date: see [`HostHeap::texture_slot_done`].
-    pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
+    /// was brought up to date: due again from frame and time `again`
+    /// (uploaded with that many bytes of its memory there, not all), or
+    /// not until the slot is written again.
+    pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64, u64)>) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match again {
-            Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
+            Some((frame, at, mapped)) => textures.partly(index, write, frame, at, mapped),
             None => textures.done(index, write),
         }
     }
@@ -2055,14 +2260,14 @@ impl HostHeap {
         &self,
         index: u32,
         write: u64,
-        due: u64,
-        at: (u64, u64),
+        (due, at): (u64, u64),
+        region: (u64, u64),
         print: u64,
         looks: u8,
         uploaded: u64,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, at, region, print, looks, uploaded);
     }
 
     /// See [`TextureQueue::checked`].
@@ -2071,16 +2276,15 @@ impl HostHeap {
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
-    /// mapped, or no more of it than before): looked at again after 1, 2,
-    /// 4, ... frames, at most `most`.
-    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
+    /// mapped, or no more of it than before): see [`TextureQueue::later`].
+    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, now: u64, cap: u64) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.later(index, write, frame, most);
+        textures.later(index, write, frame, now, cap);
     }
 
-    /// See [`TextureQueue::hold`].
-    pub(crate) fn texture_slot_held(&self, index: u32, write: u64, due: u64) {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).hold(index, write, due);
+    /// See [`TextureQueue::hold`] (`until`: a time, `crate::host::now_ms`).
+    pub(crate) fn texture_slot_held(&self, index: u32, write: u64, until: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).hold(index, write, until);
     }
 
     /// See [`TextureQueue::room`].
@@ -2464,16 +2668,14 @@ impl HostHeap {
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
-            let kept = old.is_some_and(|old| match kin(&old, &view) {
-                Kin::Same => true,
-                kin => kin.kept(keep_shown()),
-            });
+            let kept = old.is_some_and(|old| self.keeps(index, kin(&old, &view)));
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(index, shown, "neutral");
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 let kept = neutral_for(&view, self.at(index));
+                stood_in(kept.as_ref());
                 self.put(index);
                 self.clear_twin(index);
                 LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
@@ -2524,12 +2726,10 @@ impl HostHeap {
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         let asked = crate::host::now_ms();
         let id = NEXT_PENDING_FLIP.fetch_add(1, Relaxed);
-        let origin = (std::ptr::from_ref(list) as usize, list.epoch());
         {
             let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
             pending.push(PendingListFlip {
                 id,
-                origin,
                 flip: Flip { after: 0, heap, index, handle, key, late, asked },
             });
             PENDING_LIST_COUNT.store(pending.len(), Release);
@@ -2556,6 +2756,20 @@ impl HostHeap {
             flip.after = crate::host::submissions().0;
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
+    }
+
+    /// Slots of this heap that show a stand-in (or an older view) for a
+    /// texture on its way now: those behind a flip that waits for a
+    /// submission, and those whose flip waits in a list not sent yet.
+    pub(crate) fn stand_ins_left(&self) -> [usize; 2] {
+        let own = std::ptr::from_ref(self) as usize;
+        let flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|f| f.heap == own).count();
+        let listed = if PENDING_LIST_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            0
+        } else {
+            PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.flip.heap == own).count()
+        };
+        [flips, listed]
     }
 
     /// Whether any deferred slot flip or view remake for this heap requires
@@ -3606,8 +3820,8 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
-                    rewritten(kin, kept);
+                    let kept = self.keeps(index, kin);
+                    rewritten(kin, kept, is_texture_view(&view));
                     if kept {
                         drop(held);
                         self.unmake_stale(index, stale);
@@ -3634,16 +3848,14 @@ impl HostHeap {
                     return Some(view);
                 }
                 let old = view_at(shown as u32, (shown >> 32) as u32);
-                let kept = old.is_some_and(|old| match kin(&old, &view) {
-                    Kin::Same => true,
-                    kin => kin.kept(keep_shown()),
-                });
+                let kept = old.is_some_and(|old| self.keeps(index, kin(&old, &view)));
                 if shown == 0 || !kept {
                     #[cfg(feature = "diagnostics")]
                     note_before(index, shown, "neutral, new texture");
                     self.quick_is(index, 0);
                     self.made.set(index, 0);
                     let kept = neutral_for(&view, self.at(index));
+                    stood_in(kept.as_ref());
                     self.put(index);
                     self.clear_twin(index);
                     self.keep(index, kept);
@@ -3656,30 +3868,56 @@ impl HostHeap {
                 self.unmake_stale(index, stale);
                 return Some(view);
             }
+            // A texture left for the texture pass or a draw (not uploaded
+            // yet) shows the stand-in until then ([`stands_in`]): null, it
+            // read as zeros from this write to the pass that uploads it,
+            // half a second on average and some twenty seconds when its
+            // memory came later (run nb1: black surfaces, and hair and
+            // decals gone with their alpha).
+            let stand_in = later && !self.sampler && is_texture_view(&view) && stands_in(&view);
             #[cfg(feature = "diagnostics")]
             if !self.sampler && is_texture_view(&view) {
-                note_before(index, shown, if later { "null, waits" } else { "at once" });
+                note_before(index, shown, if stand_in { "stand-in, waits" } else if later { "null, waits" } else { "at once" });
             }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
-            let kept = if later {
+            let made = if later {
                 None
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
-            }
+            let twin = made.is_some() && twinned(&view);
+            let kept = if stand_in {
+                let shown = neutral_for(&view, self.at(index));
+                stood_in(shown.as_ref());
+                Some(shown)
+            } else {
+                if made.is_none() && !self.sampler {
+                    null_for(&view, self.at(index));
+                    if is_texture_view(&view) {
+                        stood_in(None);
+                    }
+                }
+                made
+            };
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }
-            self.twin_made(index, kept.is_some() && twinned(&view));
+            self.twin_made(index, twin);
             self.keep(index, kept.flatten());
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
         }
         Some(view)
+    }
+
+    /// Whether slot `index`, which shows a texture, goes on showing it when
+    /// written with a view of `kin` to it ([`Kin::kept`] by [`keep_shown`]):
+    /// a texture of another kind only while the slot holds that texture's
+    /// host copy, which it then goes on viewing until the new one is made.
+    fn keeps(&self, index: u32, kin: Kin) -> bool {
+        kin.kept(keep_shown()) && (kin != Kin::Other || self.kept_in(index).is_some())
     }
 
     /// Whether slot `index` was made from no record: what [`HostHeap::mirror`]
@@ -3700,6 +3938,12 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.get(index).is_some_and(|key| key != 0)
+    }
+
+    /// The host resource slot `index` views (tests).
+    #[cfg(test)]
+    pub(crate) fn shown_resource(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept_in(index)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -4961,12 +5205,9 @@ fn kin(old: &View, new: &View) -> Kin {
             Kin::Other
         };
     }
-    let dimension = |view: &View| match view {
-        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
-        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => desc[1],
-        _ => 0,
-    };
-    match (dimension(old), dimension(new)) {
+    // (A view of a texture object without a description has the
+    // texture's own dimension: [`view_dimension`].)
+    match (view_dimension(old), view_dimension(new)) {
         (0, _) | (_, 0) => Kin::None,
         (a, b) if a == b => Kin::Other,
         _ => Kin::None,
@@ -4975,42 +5216,57 @@ fn kin(old: &View, new: &View) -> Kin {
 
 /// Whether a slot that is written with a view of another texture goes on
 /// showing the one it shows until the new one is made and its upload has run
-/// (`VICTORY_KEEP_SHOWN`): 0: never, it reads as zeros, then as the neutral
-/// texture; 1: one of the same kind in another place or size; 2: any of the
-/// same dimension.
+/// (`VICTORY_KEEP_SHOWN`): 0: never, it shows the stand-in (or reads as
+/// zeros); 1: one of the same kind in another place or size, as before;
+/// 2 (the default): any of the same dimension, while the slot holds its
+/// host copy ([`HostHeap::keeps`]).
+///
+/// At 1, a slot the title rewrote with another texture of the same
+/// dimension went null until the texture pass had uploaded the new one:
+/// 8,663 such writes in run nb1 (none kept), where the old base kept every
+/// texture-to-texture write while the slot held a host copy (88,266 in run
+/// b6x, `VICTORY_KEEP_OTHER_VIEWS`): a torso, a wall, a building black, then
+/// back, as a material's texture streamed in at a new address.
 fn keep_shown() -> u8 {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
         return if on { 2 } else { 0 };
     }
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
 }
 
 /// Slots that showed a texture and were written with a view of another,
-/// since the start, by [`Kin`] (moved, sized, other, none), and those of
-/// them that kept what they showed.
-static REWRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// since the start, by [`Kin`] (moved, sized, other, none of a texture,
+/// none of a buffer: [`Kin::None`] is mostly a table's slot written with a
+/// buffer view, which is no texture lost), and those of them that kept
+/// what they showed.
+static REWRITTEN: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
-fn rewritten(kin: Kin, kept: bool) {
+/// Counts a slot that showed a texture written with a view of `kin` to it,
+/// of a texture (`texture`) or not, which kept what it showed or not.
+fn rewritten(kin: Kin, kept: bool, texture: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let class = match kin {
         Kin::Moved | Kin::Same => 0,
         Kin::Sized => 1,
         Kin::Other => 2,
-        Kin::None => 3,
+        Kin::None if texture => 3,
+        Kin::None => 4,
     };
     REWRITTEN[class].fetch_add(1, Relaxed);
-    REWRITTEN[4].fetch_add(u64::from(kept), Relaxed);
-    let n: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
+    REWRITTEN[5].fetch_add(u64::from(kept), Relaxed);
+    let n: u64 = REWRITTEN[..5].iter().map(|n| n.load(Relaxed)).sum();
     if n.is_multiple_of(5000) {
         tracing::info!(
-            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN)",
+            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension, {} with a buffer view; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN={})",
             REWRITTEN[0].load(Relaxed),
             REWRITTEN[1].load(Relaxed),
             REWRITTEN[2].load(Relaxed),
             REWRITTEN[3].load(Relaxed),
-            REWRITTEN[4].load(Relaxed)
+            REWRITTEN[4].load(Relaxed),
+            REWRITTEN[5].load(Relaxed),
+            keep_shown()
         );
     }
 }
@@ -5060,8 +5316,8 @@ fn same_bytes(old: u64, new: u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn pop_causes() -> [u64; 4] {
     use std::sync::atomic::Ordering::Relaxed;
-    let all: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
-    let kept = REWRITTEN[4].load(Relaxed);
+    let all: u64 = REWRITTEN[..5].iter().map(|n| n.load(Relaxed)).sum();
+    let kept = REWRITTEN[5].load(Relaxed);
     [all.saturating_sub(kept), kept, LATE[3].load(Relaxed), STALE[0].load(Relaxed)]
 }
 
@@ -5466,7 +5722,8 @@ mod tests {
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
     }
 
-    /// 2D textures and arrays have a neutral stand-in, others a null view.
+    /// Every kind of texture view a title names has a stand-in of its own
+    /// kind; multisampled views and buffers get a null view.
     #[test]
     fn a_texture_not_there_yet_has_a_neutral_stand_in() {
         let Some(host) = host() else { return };
@@ -5482,11 +5739,196 @@ mod tests {
                 .unwrap();
             let at = heap.GetCPUDescriptorHandleForHeapStart();
             let view = |dimension| View::Shader(0, Some([98, dimension, 5768, 0, 0, 1, 0, 1, 0, 0]));
-            assert!(neutral_for(&view(4), at).is_some());
-            assert!(neutral_for(&view(5), at).is_some());
-            assert!(neutral_for(&view(9), at).is_none());
-            assert!(neutral_for(&view(8), at).is_none());
+            // 1D, 1D array, 2D, 2D array, 3D, cube, cube array.
+            for dimension in [2, 3, 4, 5, 8, 9, 10] {
+                assert!(neutral_for(&view(dimension), at).is_some(), "dimension {dimension}");
+            }
+            for dimension in [1, 6, 7] {
+                assert!(neutral_for(&view(dimension), at).is_none(), "dimension {dimension}");
+            }
             assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
+    }
+
+    /// Each stand-in holds opaque mid grey in every slice: a null view's
+    /// alpha 0 made alpha-tested surfaces vanish, the old stand-in's half
+    /// alpha left them to the test's threshold.
+    #[test]
+    fn the_stand_ins_are_opaque_grey_in_every_slice() {
+        let Some(host) = host() else { return };
+        for (kind, slices) in [(Neutral::Line, 1), (Neutral::Flat, 1), (Neutral::Cube, 6), (Neutral::Volume, 1)] {
+            let texture = neutral(kind).expect("a stand-in");
+            assert_eq!(read_texels(host, texture, slices), vec![[0x80, 0x80, 0x80, 0xff]; slices as usize], "{kind:?}");
+        }
+    }
+
+    /// The first texel of each of the first `slices` subresources of
+    /// `texture` (1x1 R8G8B8A8), read back through a copy.
+    fn read_texels(host: &crate::host::Host, texture: &ID3D12Resource, slices: u32) -> Vec<[u8; 4]> {
+        const SLICE: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+        let device = &host.device;
+        // SAFETY: plain creation, recording and a waited-for copy into a
+        // readback buffer that is mapped only after it.
+        unsafe {
+            let mut back: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: SLICE * u64::from(slices),
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut back,
+                )
+                .unwrap();
+            let back = back.unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).unwrap();
+            for slice in 0..slices {
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: slice },
+                };
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: u64::from(slice) * SLICE,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: 1,
+                                Height: 1,
+                                Depth: 1,
+                                RowPitch: D3D12_TEXTURE_DATA_PITCH_ALIGNMENT,
+                            },
+                        },
+                    },
+                };
+                list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            list.Close().unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).unwrap();
+            let texels = (0..slices as usize)
+                .map(|slice| std::ptr::read(data.cast::<u8>().add(slice * SLICE as usize).cast::<[u8; 4]>()))
+                .collect();
+            back.Unmap(0, None);
+            texels
+        }
+    }
+
+    /// The record words of `view`, written at the start of `slot` (a
+    /// title descriptor of 16 bytes): what the title's heap would hold.
+    fn write_record(slot: &mut [u32; 4], view: View) -> u64 {
+        let [i, generation] = super::super::words_for(view);
+        slot[..3].copy_from_slice(&[VIEW_TAG, i, generation]);
+        slot.as_mut_ptr() as u64
+    }
+
+    /// A 64x64 BC7 2D texture's view placed at `address`.
+    fn placed_2d(address: u64, format: u32) -> View {
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1], desc[10], desc[11]) = (format, 4, address as u32, (address >> 32) as u32);
+        View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+    }
+
+    /// A slot written with a texture the texture pass has yet to upload
+    /// shows the stand-in meanwhile: no view of ours reads zeros between
+    /// the write and that pass. The slot is still the pass's to make.
+    #[test]
+    fn a_texture_slot_shows_the_stand_in_until_its_pass() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let mut slot = [0u32; 4];
+        // An address no other test and no title uses.
+        let handle = write_record(&mut slot, placed_2d(0x7fee_3000_0000, 98));
+        assert!(heap.mirror(3, handle, false).is_some());
+        assert!(heap.shows_none(3), "the pass makes it");
+        let shown = heap.kept_in(3).expect("a stand-in, not a null view");
+        assert_eq!(shown.as_raw(), neutral(Neutral::Flat).unwrap().as_raw());
+        // A buffer view left for its draw stays null.
+        let mut words = [0u32; 4];
+        let mut buffer = placed_2d(0x7fee_3001_0000, 98);
+        if let View::Placed(_, resource, desc) = &mut buffer {
+            (resource[0], desc[1]) = (1, 1);
+        }
+        let handle = write_record(&mut words, buffer);
+        heap.mirror(4, handle, false);
+        assert!(heap.kept_in(4).is_none());
+    }
+
+    /// A view of a texture object made without a description is of the
+    /// texture's own dimension: a slot that showed a 2D texture and is
+    /// written with one can go on showing it, one of a 3D texture cannot.
+    #[test]
+    fn a_view_without_a_description_is_of_its_textures_dimension() {
+        let flat = crate::resource::test_texture(3, 64, 64, 1);
+        let volume = crate::resource::test_texture(4, 16, 16, 16);
+        let old = placed_2d(0x7fee_3100_0000, 98);
+        assert_eq!(kin(&old, &View::Shader(flat as usize, None)), Kin::Other);
+        assert_eq!(kin(&View::Shader(flat as usize, None), &old), Kin::Other);
+        assert_eq!(kin(&old, &View::Shader(volume as usize, None)), Kin::None);
+    }
+
+    /// A slot that shows a texture and is written with a view of another
+    /// texture of its dimension goes on showing the one it holds until the
+    /// new one is made (the old base's `VICTORY_KEEP_OTHER_VIEWS`); one that
+    /// holds no host copy of it shows the stand-in.
+    #[test]
+    fn a_slot_rewritten_with_another_texture_shows_the_old_one_meanwhile() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let Some(texture) = make_neutral(Neutral::Flat) else { return };
+        // Another texture of the same dimension: not of the old one's
+        // proportions, so neither moved nor sized.
+        let other = |address: u64| {
+            let mut view = placed_2d(address, 98);
+            if let View::Placed(_, resource, _) = &mut view {
+                (resource[4], resource[6]) = (128, 32);
+            }
+            view
+        };
+        for (index, holds) in [(5u32, true), (6, false)] {
+            let mut slot = [0u32; 4];
+            let address = 0x7fee_3200_0000 + u64::from(index) * 0x10_0000;
+            let handle = write_record(&mut slot, placed_2d(address, 98));
+            let shown = record_key(handle);
+            // The slot shows that texture (made from its record, holding
+            // its host copy, or nothing).
+            heap.made.set(index, shown);
+            heap.keep(index, holds.then(|| texture.clone()));
+            let old = view_at(shown as u32, (shown >> 32) as u32).unwrap();
+            let new = other(address + 0x8_0000);
+            assert_eq!(kin(&old, &new), Kin::Other);
+            write_record(&mut slot, new);
+            assert!(heap.mirror(index, handle, false).is_some());
+            if holds {
+                assert_eq!(heap.made.get(index), Some(shown), "goes on showing the old texture");
+                assert_eq!(heap.kept_in(index).map(|r| r.as_raw()), Some(texture.as_raw()));
+            } else {
+                assert!(heap.shows_none(index));
+                let stand_in = neutral(Neutral::Flat).unwrap();
+                assert_eq!(heap.kept_in(index).map(|r| r.as_raw()), Some(stand_in.as_raw()));
+            }
         }
     }
 
@@ -5934,64 +6376,128 @@ mod tests {
 
     /// The queue of textures picked by index serves the slots looked at
     /// before first, then the newest write and the oldest in turns; a
-    /// slot whose memory is not there is looked at again after
-    /// 1, 2, 4 frames up to the limit; and what the pass reports about a
-    /// slot written again meanwhile is dropped.
+    /// slot whose memory is not there is looked at again at a later frame
+    /// once 16, 32, 64 ms ... have gone by, up to the cap; and what the
+    /// pass reports about a slot written again meanwhile is dropped.
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
+        const ANY: u64 = u64::MAX;
         let mut q = TextureQueue::default();
         // Slots 10..18 written in frames 1..9, slot 5 last.
         for i in 0..8u32 {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, ANY, 100).into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
-        // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        assert_eq!(q.due(9, ANY, 2).len(), 2);
+        assert_eq!(q.census(9, ANY), [9, 9, 0, 0, 8]);
+        // Slot 17's memory is not mapped: looked at again at a later frame
+        // once 16, 32, 64 and 64 ms (the cap here) have gone by.
+        let write = |q: &TextureQueue, index: u32| q.due(ANY, ANY, 100).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
-        let mut frame = 9;
-        for wait in [1, 2, 4, 4] {
-            q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
-            frame += wait;
+        let (mut frame, mut now) = (9, 1000);
+        for wait in [16, 32, 64, 64] {
+            q.later(17, w17, frame, now, 64);
+            assert!(!q.due(frame, ANY, 100).iter().any(|d| d.0 == 17), "not again in its frame");
+            assert!(!q.due(frame + 1, now + wait - 1, 100).iter().any(|d| d.0 == 17), "nor before its time");
+            frame += 1;
+            now += wait;
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert_eq!(q.due(frame, now, 100)[0].0, 17);
         }
-        assert_eq!(q.census(9)[2], 1);
+        assert_eq!(q.census(9, ANY)[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
+        assert!(!q.due(ANY, ANY, 100).iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
-        q.partly(16, w16, 12, 4096);
+        q.partly(16, w16, 12, 0, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert_eq!(q.due(12, ANY, 100)[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
-        q.later(16, w16, 13, 4);
+        q.later(16, w16, 13, now, 64);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert_eq!(q.due(13, ANY, 100)[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
-        q.partly(15, w15, 20, 8192);
+        q.partly(15, w15, 20, 0, 8192);
         q.written(15, 14, 0, true);
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, ANY, 100).iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, ANY, 100).iter().any(|d| d.0 == 98));
+        assert!(q.due(16, ANY, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// The longest wait between two looks at a slot whose memory is away
+    /// follows this heap's own passes: four of them, but no less than
+    /// 250 ms and no more than a second (the most until the time between
+    /// them is known). At 3 frames a second a slot waiting for its memory
+    /// is looked at again within a second, where up to 256 frames (85 s)
+    /// were counted before.
+    #[test]
+    fn looks_wait_by_the_clock_up_to_four_of_the_heaps_passes() {
+        let mut q = TextureQueue::default();
+        assert_eq!(q.look_cap(), 1000);
+        for t in 0..20 {
+            q.passed(10_000 + t * 100);
+        }
+        assert_eq!(q.look_cap(), 400);
+        for t in 0..40 {
+            q.passed(20_000 + t * 20);
+        }
+        assert_eq!(q.look_cap(), 250);
+        for t in 0..20 {
+            q.passed(30_000 + t * 333);
+        }
+        assert_eq!(q.look_cap(), 1000);
+        q.written(7, 1, 0, false);
+        let w = q.due(1, 0, 10)[0].1;
+        let (mut frame, mut now) = (1, 100_000);
+        for _ in 0..12 {
+            q.later(7, w, frame, now, q.look_cap());
+            frame += 1;
+            now += 333;
+        }
+        q.later(7, w, frame, now, q.look_cap());
+        assert!(q.due(frame + 1, now + 999, 10).is_empty());
+        assert_eq!(q.due(frame + 1, now + 1000, 10)[0].0, 7);
+    }
+
+    /// A slot uploaded whole and waiting for another look at its memory
+    /// does not wait for its memory, nor for an upload: a write of it
+    /// starts a wait of its own. A notice of memory that makes a waiting
+    /// slot due is told apart from its next look.
+    #[test]
+    fn rechecks_are_no_waits_and_notices_are_told_apart_from_looks() {
+        let mut q = TextureQueue::default();
+        q.written(3, 1, 0, false);
+        let w = q.due(1, 0, 10)[0].1;
+        q.recheck(3, w, 2, 500, (0x1000, 64), 7, 0, 1);
+        assert_eq!(q.census(2, 500)[2], 0, "not waiting for its memory");
+        assert!(q.since(3).is_none(), "no wait of a write's");
+        q.written(3, 5, 0, false);
+        let (_, waited, away, by_notice) = q.since(3).unwrap();
+        assert!(!waited && away == 0 && !by_notice, "a wait of its own");
+        // Its memory away at a look, then a notice: made due by that.
+        let w = q.due(5, 0, 10)[0].1;
+        q.later(3, w, 5, 1000, 1000);
+        assert_eq!(q.census(6, 0)[2], 1);
+        assert!(!q.since(3).unwrap().3);
+        q.changed(3, 6, 7);
+        let (_, waited, away, by_notice) = q.since(3).unwrap();
+        assert!(waited && away == 1000 && by_notice);
     }
 
     /// Slots held back for lack of room on the card are not handed out
-    /// until their frame, keep their place, are not counted as waiting
+    /// until their time, keep their place, are not counted as waiting
     /// for their memory, and all come back at once when the card has room;
     /// a slot written again meanwhile is the title's new write.
     #[test]
@@ -6000,25 +6506,25 @@ mod tests {
         for i in 0..4u32 {
             q.written(20 + i, 1, 0, false);
         }
-        let due = q.due(1, 100);
+        let due = q.due(1, 0, 100);
         assert_eq!(due.len(), 4);
-        // The card is full: slots 20 and 21 are held back until frame 101.
+        // The card is full: slots 20 and 21 are held back until 5 s.
         for &(index, write) in due.iter().filter(|d| d.0 < 22) {
-            q.hold(index, write, 101);
+            q.hold(index, write, 5000);
         }
-        let now: Vec<u32> = q.due(2, 100).into_iter().map(|d| d.0).collect();
+        let now: Vec<u32> = q.due(2, 1000, 100).into_iter().map(|d| d.0).collect();
         assert!(!now.contains(&20) && !now.contains(&21));
         assert!(now.contains(&22) && now.contains(&23));
-        assert_eq!(q.census(2)[2], 0, "held slots do not wait for their memory");
-        // Due again at their frame, in the order they had.
-        assert_eq!(q.due(101, 100), due);
+        assert_eq!(q.census(2, 1000)[2], 0, "held slots do not wait for their memory");
+        // Due again at their time, in the order they had.
+        assert_eq!(q.due(3, 5000, 100), due);
         // Slot 21 is written again while held: due as written.
         q.written(21, 3, 0, false);
-        assert!(q.due(3, 100).iter().any(|d| d.0 == 21));
+        assert!(q.due(3, 1000, 100).iter().any(|d| d.0 == 21));
         // Room again at frame 5: slot 20 is due at once, and only it was
         // still held as it was.
         assert_eq!(q.room(5), 1);
-        assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
+        assert!(q.due(5, 1000, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
     }
 
@@ -6147,7 +6653,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, u64::MAX, 8).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fed_0000_0000u64;
         let mut desc = [0u32; 16];
@@ -6157,7 +6663,7 @@ mod tests {
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
         assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let (queued, write) = heap.texture_slots_due(u64::MAX, u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
@@ -6227,7 +6733,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, u64::MAX, 8).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fee_0000_0000u64;
         let view = |address: u64, width: u32| {
@@ -6237,7 +6743,7 @@ mod tests {
         };
         let len = crate::resource::placed_bytes(&[3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0]).unwrap();
         assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let (queued, write) = heap.texture_slots_due(u64::MAX, u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
@@ -6321,7 +6827,7 @@ mod tests {
             return; // no host GPU
         };
         let frame = 100;
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, u64::MAX, 8).0.into_iter().map(|d| d.0).collect() };
         let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
         assert!(is_texture_view(&texture));
         heap.queue_texture(2, true, false, frame);
@@ -6606,12 +7112,10 @@ mod bake_flip_tests {
             let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
             pending.push(PendingListFlip {
                 id: id1,
-                origin: (1, 1),
                 flip: Flip { after: 0, heap, index: 7, handle: 0, key: 11, late: Some(1), asked: 0 },
             });
             pending.push(PendingListFlip {
                 id: id2,
-                origin: (2, 1),
                 flip: Flip { after: 0, heap, index: 8, handle: 0, key: 12, late: Some(1), asked: 0 },
             });
             PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
@@ -6633,7 +7137,6 @@ mod bake_flip_tests {
             for (id, idx) in [(id1, 10), (id2, 11)] {
                 pending.push(PendingListFlip {
                     id,
-                    origin: (3, 1),
                     flip: Flip { after: 0, heap, index: idx, handle: 0, key: 20, late: Some(1), asked: 0 },
                 });
             }

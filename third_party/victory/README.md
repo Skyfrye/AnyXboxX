@@ -9,9 +9,10 @@ deformation's integer views read through descriptor tables too
 tracer's per-instruction lane guards at joins, a list's dynamic descriptor
 slots given back when it has run on the card (and the card waited for once
 before a draw is dropped for want of them), blocking fence waits, and the
-bake's own pass looking at pages written since. Kept this fork's way, cool_fox's
-behind a switch, all off: `VICTORY_BAKE_SYNC=1` (bake uploads in a list of
-their own, waited for), `VICTORY_MOVIE_PLANES=1`, `VICTORY_SCENE_INPUTS=1`,
+bake's own pass looking at pages written since, and since then cool_fox's
+synchronous bake as the only way a bake is served (bake uploads in a list of
+their own, waited for; `VICTORY_BAKE_SYNC` is gone). Kept this fork's way,
+cool_fox's behind a switch, all off: `VICTORY_MOVIE_PLANES=1`, `VICTORY_SCENE_INPUTS=1`,
 `VICTORY_RT_RESOLVE=0` / `VICTORY_ACTIVATE_RAYS=0` (those pipelines left out),
 `VICTORY_INDIRECT_REST=0`, `VICTORY_DSTORAGE_STAGING_MB=256`, and the earlier
 `VICTORY_RESIDENCY=1`. `Play-VIctory.cmd` is cool_fox's Windows launcher with

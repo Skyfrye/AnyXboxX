@@ -1997,6 +1997,22 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+/// A shader-visible title view heap of `count` descriptors in memory of
+/// its own, with its host heap when there is a host device (tests).
+#[cfg(test)]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    // (The plain description, then no placement: the heap allocates.)
+    #[repr(C)]
+    struct Plain(HeapDesc, Placement);
+    let plain = Plain(
+        HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 0 },
+        Placement { address: 0, size: 0 },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(create_heap(std::ptr::null(), &plain.0, &HEAP_IIDS[0], &mut out), crate::object::S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

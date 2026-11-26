@@ -9525,6 +9525,21 @@ impl Meter {
                     u8::from(crate::descriptor::host::show_new_later()),
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
+                {
+                    // Over the frames since the last such line.
+                    static LAST: std::sync::Mutex<(u64, [u64; 2])> = std::sync::Mutex::new((0, [0; 2]));
+                    let now = crate::descriptor::host::STAND_INS.each_ref().map(|n| n.load(Ordering::Relaxed));
+                    let frame = crate::frame::current();
+                    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                    let frames = frame.saturating_sub(last.0).max(1) as f64;
+                    let [grey, null] = [0, 1].map(|i| now[i].saturating_sub(last.1[i]) as f64 / frames);
+                    *last = (frame, now);
+                    tracing::info!(
+                        "texture slots made to wait for their upload, a frame lately: {grey:.1} showing the stand-in (VICTORY_STAND_IN=0: none), {null:.1} null; since the start: {}, {}",
+                        now[0],
+                        now[1]
+                    );
+                }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");

@@ -151,6 +151,12 @@ pub(crate) fn send(job: &Arc<Job>) {
     QUEUE.1.notify_one();
 }
 
+/// How many uploads are on their way here now (a bake draw counts those it
+/// was recorded ahead of: `crate::draw`).
+pub(crate) fn on_their_way() -> usize {
+    IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Waits until every upload currently on its way here has finished copying
 /// and run its completion callbacks (queuing slot flips into `FLIPS`).
 /// Returns how many jobs were waited for.

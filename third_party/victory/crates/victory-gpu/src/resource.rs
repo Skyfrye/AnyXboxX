@@ -1653,6 +1653,42 @@ pub(crate) fn title_fills(this: This) -> bool {
     !this.is_null() && fills(&resource(this).desc)
 }
 
+/// [`fills`] of a texture placed in memory with the description `desc`
+/// (a view's resource words).
+#[cfg(windows)]
+pub(crate) fn placed_fills(desc: &[u32; 14]) -> bool {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    fills(&d)
+}
+
+/// The shader view dimension (`D3D12_SRV_DIMENSION`) D3D12 gives a view of
+/// texture `this` made without a description: 1D, 2D (multisampled) or 3D,
+/// and an array of the first two when it has more than one slice. 0: a
+/// buffer, or nothing.
+#[cfg(windows)]
+pub(crate) fn own_view_dimension(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    own_dimension(&resource(this).desc)
+}
+
+/// [`own_view_dimension`] of a texture described by `desc`.
+fn own_dimension(desc: &ResourceDesc) -> u32 {
+    // (`D3D12_RESOURCE_DIMENSION` in, `D3D12_SRV_DIMENSION` out.)
+    const TEXTURE_1D: u32 = 2;
+    const TEXTURE_2D: u32 = 3;
+    let array = desc.depth_or_array_size > 1;
+    match desc.dimension {
+        TEXTURE_1D => 2 + u32::from(array),
+        TEXTURE_2D if desc.sample_count > 1 => 6 + u32::from(array),
+        TEXTURE_2D => 4 + u32::from(array),
+        TEXTURE_3D => 8,
+        _ => 0,
+    }
+}
+
 /// Whether `this` is a texture whose host copy is not made yet (and may
 /// still be): a descriptor slot written with a view of it waits
 /// (`crate::descriptor::make_waiting`).
@@ -3545,6 +3581,47 @@ pub(crate) fn test_buffer(width: u64) -> This {
     out
 }
 
+/// A title texture object of `dimension` (`D3D12_RESOURCE_DIMENSION`),
+/// `width` x `height` with `slices` slices (or depth), one level of
+/// R8G8B8A8_UNORM, which the title fills.
+#[cfg(test)]
+pub(crate) fn test_texture(dimension: u32, width: u64, height: u32, slices: u16) -> This {
+    const R8G8B8A8_UNORM: u32 = 28;
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: slices,
+        mip_levels: 1,
+        format: R8G8B8A8_UNORM,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3564,6 +3641,40 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    /// A view of a texture object made without a description has the
+    /// dimension D3D12 gives it from the texture (a slot written with
+    /// one is told apart from a slot of another dimension by it).
+    #[test]
+    fn a_view_without_a_description_has_its_textures_dimension() {
+        let d = |dimension, slices, samples| ResourceDesc {
+            dimension,
+            depth_or_array_size: slices,
+            sample_count: samples,
+            ..texture(64, 64, 28, 1)
+        };
+        assert_eq!(own_dimension(&d(2, 1, 1)), 2);
+        assert_eq!(own_dimension(&d(2, 4, 1)), 3);
+        assert_eq!(own_dimension(&d(3, 1, 1)), 4);
+        assert_eq!(own_dimension(&d(3, 6, 1)), 5);
+        assert_eq!(own_dimension(&d(3, 1, 4)), 6);
+        assert_eq!(own_dimension(&d(3, 2, 4)), 7);
+        assert_eq!(own_dimension(&d(4, 8, 1)), 8);
+        assert_eq!(own_dimension(&buffer(256)), 0);
+    }
+
+    /// A texture placed in memory that the host renders to is not one the
+    /// title fills: by the flags of its resource words.
+    #[test]
+    fn placed_textures_are_told_title_filled_by_their_flags() {
+        let mut words = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        assert!(placed_fills(&words));
+        words[12] = 0x4;
+        assert!(!placed_fills(&words));
+        words[12] = 0;
+        words[0] = 1;
+        assert!(!placed_fills(&words));
     }
 
     type Release = extern "system" fn(This) -> u32;
