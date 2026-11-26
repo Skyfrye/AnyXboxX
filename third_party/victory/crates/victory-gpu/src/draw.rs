@@ -2239,16 +2239,27 @@ impl State {
     /// not sent yet has its upload recorded into the bake's own list `list`
     /// and is shown with the bake's other slots ([`BakeSync`]) once that has
     /// run.
-    fn flush_for_bake(&self, list: &HostList, host: &crate::descriptor::host::HostHeap, sync: &mut BakeSync) {
+    ///
+    /// Returns the time it waited for the card (settles), which is no time
+    /// of the bake's pass ([`State::bake_textures`]).
+    fn flush_for_bake(
+        &self,
+        list: &HostList,
+        host: &crate::descriptor::host::HostHeap,
+        sync: &mut BakeSync,
+    ) -> std::time::Duration {
         static RESCUED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
         let drained = crate::texture::ahead::drain();
         let mut settled = false;
+        let mut waited = std::time::Duration::ZERO;
         let mut flipped = 0usize;
         for _ in 0..4 {
             let need_settle = host.needs_gpu_settle_for_bake();
             if need_settle {
                 settled = true;
+                let waiting = std::time::Instant::now();
                 crate::host::settle_for_fence();
+                waited += waiting.elapsed();
             }
             flipped += host.texture_views_remade();
             flipped += host.texture_slots_flip();
@@ -2328,6 +2339,7 @@ impl State {
                 );
             }
         }
+        waited
     }
 
     /// Whether a graphics draw whose stages have the hashes `shaders` is a
@@ -2405,7 +2417,7 @@ impl State {
             return;
         };
         if is_bake {
-            self.bake_textures(heap, host, frame, first, bake_ms);
+            let _ = self.bake_textures(heap, host, frame, first, bake_ms);
             return;
         }
         if !(first && early_ms > 0) {
@@ -2432,7 +2444,14 @@ impl State {
     /// ahead grey, and with `VICTORY_THIN=1` a list recorded on another
     /// thread could reach the card with the bake ahead of its uploads. What
     /// a bake samples stays in the title's textures for the scene. The cost:
-    /// one wait for the card per bake draw, while the title loads.
+    /// one wait for the card per bake draw, while the title loads; that wait
+    /// is not charged to the frame's bake budget, which is the passes' own
+    /// time (charged, it ate the budget and the later bakes of a heavy frame
+    /// had no pass at all).
+    ///
+    /// Returns whether its pass served every slot that was due (none was
+    /// due, or the pass reached all), and whether the bake was recorded with
+    /// every slot of its heap showing its own texture ([`State::bake_left`]).
     fn bake_textures(
         &self,
         heap: &crate::descriptor::Heap,
@@ -2440,12 +2459,12 @@ impl State {
         frame: u64,
         first: bool,
         bake_ms: u64,
-    ) {
+    ) -> [bool; 2] {
         let began = std::time::Instant::now();
         let exact = bake_exact();
         let mut bake_slot = BAKE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
         let Some(gpu) = crate::host::host() else {
-            return;
+            return [false; 2];
         };
         if bake_slot.is_none() {
             match gpu.new_list() {
@@ -2454,11 +2473,11 @@ impl State {
             }
         }
         let Some(BakeList(bake_list)) = bake_slot.as_ref() else {
-            return;
+            return [false; 2];
         };
         let mut sync = BakeSync { publish: Vec::new(), keep: Vec::new() };
         crate::texture::BAKING.set(exact);
-        self.flush_for_bake(bake_list, host, &mut sync);
+        let mut waited = self.flush_for_bake(bake_list, host, &mut sync);
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let run_pass = left > 0
             && (first
@@ -2467,7 +2486,9 @@ impl State {
                     let (writes, noted) = host.texture_news();
                     noted || BAKE_SERVED.load(Ordering::Relaxed) != writes + 1
                 });
-        let mut served = true;
+        // With the frame's bake budget spent, slots due now get no pass: not
+        // served (it counted as served, and the warning missed those bakes).
+        let mut served = left > 0 || !host.texture_slots_any_due(frame, crate::host::now_ms());
         if run_pass {
             let n = EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
@@ -2487,12 +2508,15 @@ impl State {
             PASS_BUDGET.set(None);
         }
         crate::texture::BAKING.set(false);
+        let waiting = std::time::Instant::now();
         if bake_list.has_recorded_work() {
             bake_list.close();
             gpu.execute_sync_internal(bake_list);
             bake_list.reset();
+            waited += waiting.elapsed();
         } else if !sync.publish.is_empty() {
             crate::host::settle_for_fence();
+            waited += waiting.elapsed();
         }
         for (index, handle, key) in sync.publish {
             let _ = host.publish_uploaded_slot(index, handle, key);
@@ -2503,20 +2527,27 @@ impl State {
         if run_pass && served && exact {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
-        Self::bake_left(host, served);
-        BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+        let whole = Self::bake_left(host, served);
+        BAKED_MS.fetch_add(began.elapsed().saturating_sub(waited).as_millis() as u64, Ordering::Relaxed);
+        [served, whole]
     }
 
     /// Counts a bake draw recorded while slots of its heap still showed a
     /// stand-in for a texture on its way: behind a flip, a list's flip or an
-    /// upload ahead, or left due by a pass that ran out of its budget
-    /// (`served` false). A line at the first such and at each power of two.
-    fn bake_left(host: &crate::descriptor::host::HostHeap, served: bool) {
+    /// upload ahead, left due by a pass that ran out of its budget or had
+    /// none left (`served` false), or in the queue showing no texture of
+    /// theirs, due or not (waiting for their memory, a full card, a table's
+    /// grace: [`HostHeap::queued_without_texture`]). A line at the first such
+    /// and at each power of two. Returns whether there was none.
+    ///
+    /// [`HostHeap::queued_without_texture`]: crate::descriptor::host::HostHeap::queued_without_texture
+    fn bake_left(host: &crate::descriptor::host::HostHeap, served: bool) -> bool {
         let [flips, listed] = host.stand_ins_left();
         let ahead = crate::texture::ahead::on_their_way();
+        let queued = host.queued_without_texture();
         let all = BAKES_LEFT[0].fetch_add(1, Ordering::Relaxed) + 1;
-        if flips == 0 && listed == 0 && ahead == 0 && served {
-            return;
+        if flips == 0 && listed == 0 && ahead == 0 && queued == 0 && served {
+            return true;
         }
         let n = BAKES_LEFT[1].fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_power_of_two() {
@@ -2526,10 +2557,12 @@ impl State {
                 flips,
                 list_flips = listed,
                 uploads_ahead = ahead,
+                queued_without_their_texture = queued,
                 pass_served_all = served,
                 "a draw of the title's decoration bake was recorded while slots of its heap still showed a stand-in"
             );
         }
+        false
     }
 
     /// The queue's side of the card accounting line
@@ -5288,6 +5321,37 @@ mod bake_tests {
         assert!(!state.is_bake_draw([OTHER, OTHER]), "three targets");
     }
 
+    /// A bake drawn once the frame's bake budget is spent gets no pass, and
+    /// is told to have left the slots that are due: it counted as served,
+    /// and the warning of bakes that read stand-ins missed it. (No list is
+    /// recorded, so nothing is sent.)
+    #[test]
+    fn a_bake_past_its_budget_is_told_to_leave_its_due_slots() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let h = crate::descriptor::test_view_heap(16);
+        let heap = crate::descriptor::heap(h);
+        let Some(host) = heap.host() else { return };
+        let texture = crate::resource::test_texture(3, 4, 4, 1);
+        let handle = heap.handle(7).unwrap();
+        crate::descriptor::create_srv(std::ptr::null(), texture, std::ptr::null(), handle);
+        let frame = crate::frame::current();
+        assert!(host.texture_slots_any_due(frame, crate::host::now_ms()));
+        // (Queued and showing the stand-in: counted as such for the warning.)
+        assert_eq!(host.queued_without_texture(), 1);
+        let mut state = State::default();
+        state.heaps = [h as usize, 0];
+        // (The frame's other bakes took the whole budget.)
+        BAKED_MS.store(1500, Ordering::Relaxed);
+        let before = BAKES_LEFT[1].load(Ordering::Relaxed);
+        let [served, whole] = state.bake_textures(heap, host, frame, false, 1500);
+        assert!(!served, "a slot was due and had no pass");
+        assert!(!whole);
+        assert!(BAKES_LEFT[1].load(Ordering::Relaxed) > before);
+        BAKED_MS.store(0, Ordering::Relaxed);
+    }
+
     /// How a draw is taken for a bake: by a program, or by its targets
     /// alone, which are counted ([`BAKES_BY_TARGETS`]) and logged by pixel
     /// shader: a false match in gameplay would make every such draw wait for
@@ -5360,7 +5424,7 @@ mod bake_tests {
         assert_eq!(host.stand_ins_left()[1], 1);
         let mut state = State::default();
         state.heaps = [h as usize, 0];
-        state.bake_textures(heap, host, crate::frame::current(), true, 1500);
+        let _ = state.bake_textures(heap, host, crate::frame::current(), true, 1500);
         assert!(host.made(5), "shown once the bake's list has run");
         let copy = crate::resource::host_resource(texture).unwrap();
         assert_eq!(host.shown_resource(5).map(|r| r.as_raw()), Some(copy.as_raw()));

@@ -2277,6 +2277,20 @@ impl HostHeap {
         (TextureQueue::in_order(due, max), census)
     }
 
+    /// Whether a slot of the queue is due at `frame` and time `now`.
+    pub(crate) fn texture_slots_any_due(&self, frame: u64, now: u64) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).slots.values().any(|w| w.is_due(frame, now))
+    }
+
+    /// Slots of the queue that show no texture of theirs now (the stand-in,
+    /// or a null view): what a bake that picks one by index reads, whether
+    /// the slot is due or waits (for its memory, a full card, a table's
+    /// grace).
+    pub(crate) fn queued_without_texture(&self) -> usize {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.slots.keys().filter(|&&index| self.made.get(index) == Some(0)).count()
+    }
+
     /// Up to `max` slots a pass before a bake takes at `frame` and `now`
     /// beyond those due then ([`TextureQueue::all_due_ahead`]): due within
     /// `frames` frames and `ms` milliseconds, those waiting for a look at
