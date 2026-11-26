@@ -2353,12 +2353,9 @@ impl State {
     /// (The pixel shaders' hashes alone were asked unless
     /// `VICTORY_BAKE_SYNC=1`: a permutation not in [`BAKE_PIXEL_SHADERS`]
     /// got no pass before it at all.)
-    fn is_bake_draw<'a>(&self, shaders: impl IntoIterator<Item = &'a str>) -> bool {
-        self.bake_draw(shaders).is_some()
-    }
-
-    /// [`State::is_bake_draw`], and how: `Some(true)` by a program,
-    /// `Some(false)` by the targets alone.
+    ///
+    /// `None`: no bake; `Some(true)`: one by a program, `Some(false)`: by
+    /// the targets alone ([`BAKES_BY_TARGETS`]).
     fn bake_draw<'a>(&self, shaders: impl IntoIterator<Item = &'a str>) -> Option<bool> {
         if bake_shaders(shaders) {
             Some(true)
@@ -2384,7 +2381,7 @@ impl State {
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
     /// frame's first draw with a view heap set, and with a larger budget
     /// of its own before every draw of the title's bake
-    /// ([`State::is_bake_draw`], [`State::bake_textures`]).
+    /// ([`State::bake_draw`], [`State::bake_textures`]).
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
@@ -5303,22 +5300,22 @@ mod bake_tests {
     fn bake_draws_are_found_by_any_of_their_programs_or_their_targets() {
         const OTHER: &str = "0000000000000000";
         let mut state = State::default();
-        assert!(state.is_bake_draw([OTHER, "089d6271be6650ef"]));
-        assert!(state.is_bake_draw(["d4111a6e6ea49d91", OTHER]));
-        assert!(state.is_bake_draw([OTHER, "c0a7fe77b1862e10"]));
-        assert!(!state.is_bake_draw([OTHER, OTHER]));
+        assert!(state.bake_draw([OTHER, "089d6271be6650ef"]).is_some());
+        assert!(state.bake_draw(["d4111a6e6ea49d91", OTHER]).is_some());
+        assert!(state.bake_draw([OTHER, "c0a7fe77b1862e10"]).is_some());
+        assert!(state.bake_draw([OTHER, OTHER]).is_none());
         let target = |width: u64, height: u32| crate::resource::test_texture(3, width, height, 1) as usize;
         state.targets = (0..4).map(|_| target(512, 512)).collect();
-        assert!(state.is_bake_draw([OTHER, OTHER]));
+        assert!(state.bake_draw([OTHER, OTHER]).is_some());
         state.depth = target(512, 512);
-        assert!(!state.is_bake_draw([OTHER, OTHER]), "a draw that tests depth is no bake");
+        assert!(state.bake_draw([OTHER, OTHER]).is_none(), "a draw that tests depth is no bake");
         state.depth = 0;
         state.targets[0] = target(1024, 512);
-        assert!(!state.is_bake_draw([OTHER, OTHER]), "not square");
+        assert!(state.bake_draw([OTHER, OTHER]).is_none(), "not square");
         state.targets[0] = target(256, 256);
-        assert!(!state.is_bake_draw([OTHER, OTHER]), "too small");
+        assert!(state.bake_draw([OTHER, OTHER]).is_none(), "too small");
         state.targets = (0..3).map(|_| target(512, 512)).collect();
-        assert!(!state.is_bake_draw([OTHER, OTHER]), "three targets");
+        assert!(state.bake_draw([OTHER, OTHER]).is_none(), "three targets");
     }
 
     /// A bake drawn once the frame's bake budget is spent gets no pass, and
