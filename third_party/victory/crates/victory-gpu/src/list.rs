@@ -2487,6 +2487,58 @@ static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
 #[cfg(windows)]
 static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 
+/// Work of ours for the host list of a title list, at its place among the
+/// title's commands ([`record_external`]).
+#[cfg(windows)]
+pub(crate) type External = Box<dyn FnOnce(&crate::host::HostList) + Send>;
+
+/// Whether `this` is one of our command lists, and if so whether its calls
+/// are written down (`VICTORY_THIN`, [`thin`]). `None` for anything else,
+/// also memory that cannot be read.
+#[cfg(windows)]
+pub(crate) fn list_kind(this: This) -> Option<bool> {
+    let mut word = [0; size_of::<usize>()];
+    if this.is_null() || !crate::host::read_into(this.cast(), &mut word) {
+        return None;
+    }
+    let table = usize::from_ne_bytes(word);
+    let is = |t: &Table<160>| table == t.0.as_ptr() as usize;
+    if is(&LIST_FUNCTIONS) || is(&NEWER_LIST_FUNCTIONS) {
+        Some(false)
+    } else if is(&THIN_FUNCTIONS) || is(&NEWER_THIN_FUNCTIONS) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Records `work` at this place of title list `this` (`crate::external`):
+/// run now on its host list, or, for a list whose calls are written down,
+/// when the threads that translate it get there. False, and `work`
+/// dropped, if `this` is not one of our lists or records nothing now (it is
+/// closed, or there is no host GPU).
+#[cfg(windows)]
+pub(crate) fn record_external(this: This, work: External) -> bool {
+    match list_kind(this) {
+        Some(true) => thin::external(this, work),
+        Some(false) => run_external(this, work),
+        None => false,
+    }
+}
+
+/// Runs `work` on the host list of `this`, a list of ours with one; the
+/// title's bindings are set again after it, the library having set its own.
+#[cfg(windows)]
+fn run_external(this: This, work: External) -> bool {
+    let mut ran = false;
+    with_state(this, |host, state| {
+        work(host);
+        state.after_external(host);
+        ran = true;
+    });
+    ran
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
