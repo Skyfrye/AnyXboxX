@@ -1,14 +1,17 @@
-//! The priority bands of the process's threads, from the top:
+//! The priority bands of the process's threads:
 //!
-//! 1. ours that a frame waits for (the submitting thread, the relay, the
-//!    list threads), at the priorities they give themselves;
+//! 1. ours that a frame waits for, at the priorities they give themselves:
+//!    the submitting thread above normal; the relay and the list threads at
+//!    normal, so the title's threads above normal (and the streaming thread
+//!    xmem lifts while it maps) run before them;
 //! 2. the title's, in the title's own order, but none below
 //!    [`TITLE_FLOOR`] ([`title`]);
 //! 3. our background work, at [`BACKGROUND`], below every thread of the
 //!    title: the pipeline workers (but the two that make passes over the
-//!    screen, which a draw waits for), the pipeline library's saves and its
-//!    trim, the texture store. The D3D runtime runs its own background
-//!    threads, the shaders the driver makes again, there too
+//!    screen, and a worker while it makes a pipeline a draw asked for, at
+//!    below normal: [`Raised`]), the pipeline library's saves once out of
+//!    their lock, its trim, the texture store. The D3D runtime runs its own
+//!    background threads, the shaders the driver makes again, there too
 //!    (`background.rs`).
 //!
 //! A process gives its threads seven priorities (idle, lowest, below normal,
