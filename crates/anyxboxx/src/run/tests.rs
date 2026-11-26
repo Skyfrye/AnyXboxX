@@ -49,7 +49,7 @@ fn tuned_settings_are_set_by_default_and_can_be_turned_off() {
 #[test]
 fn the_tuned_set_is_victorys_play_script_set() {
     // VIctory's scripts/play.ps1 (checked line by line in tests/test_anyxboxx_run.py).
-    assert_eq!(TUNED.len(), 17);
+    assert_eq!(TUNED.len(), 16);
     assert!(TUNED.contains(&("VICTORY_RELAY", "2")));
     assert!(TUNED.contains(&("VICTORY_CARD_STEPS", "2")));
     assert!(TUNED.contains(&("VICTORY_THIN", "1")));

@@ -61,7 +61,7 @@ def rust_table(name):
 
 def test_the_rust_tuned_table_is_play_ps1s_set():
     assert rust_table("TUNED") == play_settings()
-    assert len(play_settings()) == 17
+    assert len(play_settings()) == 16
 
 
 def test_the_linux_table_is_the_tuned_set_then_the_linux_additions():
