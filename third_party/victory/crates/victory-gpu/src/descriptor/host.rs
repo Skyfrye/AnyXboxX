@@ -637,6 +637,10 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
 /// stand-in meanwhile (`VICTORY_STAND_IN=0`: it is null, as before, and
 /// reads zeros). Only of a texture the title fills: one the host renders
 /// to or writes is made at the next pass and has no colour to stand for.
+/// The switch is for this wait alone: a slot behind a flip (shown after its
+/// upload, or after the lists sent before it) shows the stand-in either
+/// way, which is now opaque and of every dimension, where the old one was
+/// 2D alone with half alpha.
 fn stands_in(view: &View) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_STAND_IN").is_none_or(|v| v != "0")) {
@@ -660,6 +664,14 @@ pub(crate) static STAND_INS: [std::sync::atomic::AtomicU64; 2] = [const { std::s
 /// [`neutral_for`] gave) or made null.
 fn stood_in(shown: Option<&ID3D12Resource>) {
     STAND_INS[usize::from(shown.is_none())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    STOOD_IN_HERE.set(STOOD_IN_HERE.get() + 1);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`stood_in`]'s count on this thread, for a test.
+    static STOOD_IN_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
@@ -2897,7 +2909,7 @@ impl HostHeap {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 let kept = neutral_for(&view, self.at(index));
-                stood_in(kept.as_ref());
+                self.stood_in_anew(index, kept.as_ref());
                 self.put(index);
                 self.clear_twin(index);
                 LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
@@ -3642,6 +3654,19 @@ impl HostHeap {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// [`stood_in`] for slot `index`, made to show `shown` (what
+    /// [`neutral_for`] gave), unless it shows that stand-in already: a slot
+    /// left for its pass shows it from its write on ([`HostHeap::mirror`]),
+    /// and shown after its upload (`VICTORY_SHOW_AFTER=1`) the pass counted
+    /// it a second time. Called before the slot keeps `shown`.
+    fn stood_in_anew(&self, index: u32, shown: Option<&ID3D12Resource>) {
+        use windows::core::Interface;
+        let was = self.kept_in(index);
+        if shown.is_none() || was.as_ref().map(Interface::as_raw) != shown.map(Interface::as_raw) {
+            stood_in(shown);
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
     /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
     /// size, whose reads past it return zeros instead of reaching whatever
@@ -4096,7 +4121,7 @@ impl HostHeap {
                     self.quick_is(index, 0);
                     self.made.set(index, 0);
                     let kept = neutral_for(&view, self.at(index));
-                    stood_in(kept.as_ref());
+                    self.stood_in_anew(index, kept.as_ref());
                     self.put(index);
                     self.clear_twin(index);
                     self.keep(index, kept);
@@ -6218,6 +6243,25 @@ mod tests {
                 assert_eq!(heap.kept_in(index).map(|r| r.as_raw()), Some(stand_in.as_raw()));
             }
         }
+    }
+
+    /// A slot left for its pass shows the stand-in from its write, counted
+    /// then; shown after its upload (`VICTORY_SHOW_AFTER=1`), the pass made it
+    /// show the stand-in again and counted it a second time.
+    #[test]
+    fn a_slot_shown_after_its_upload_is_counted_once_for_its_stand_in() {
+        let Some(gpu) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, placed_2d(0x7fee_3500_0000, 98));
+        let before = STOOD_IN_HERE.get();
+        assert!(heap.mirror(2, handle, false).is_some());
+        assert_eq!(STOOD_IN_HERE.get(), before + 1, "the stand-in, at the write");
+        let list = gpu.new_list().unwrap();
+        heap.texture_slot_show_after(&list, 2, handle);
+        assert!(heap.shows_none(2));
+        assert_eq!(STOOD_IN_HERE.get(), before + 1, "not again at the pass");
+        drop(list);
     }
 
     /// A slot that goes on showing another record's texture while its new
