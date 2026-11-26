@@ -119,8 +119,12 @@ pub(crate) fn now() -> u64 {
 
 static TICK: AtomicU64 = AtomicU64::new(1);
 
-/// Buckets of the counting filter ([`FILTER`]), as bits.
-const FILTER_BITS: u32 = 16;
+/// Buckets of the counting filter ([`FILTER`]), as bits. A million: each
+/// slot watches two keys per 64 KiB block (its address and the physical
+/// page), and at 20,000 slots or more that is 100,000-200,000 pages. With
+/// 65,536 buckets the filter was 80-95 % full there, and most writes of
+/// memory no slot watches took the table's lock.
+const FILTER_BITS: u32 = 20;
 
 /// For each bucket, how many watches there are of pages in it: a change of
 /// pages whose buckets are all 0 concerns no slot and takes no lock. Raised
@@ -199,6 +203,8 @@ fn changed(pages: &[Page], teller: Teller) {
     if pages.is_empty() || WATCHED.load(Ordering::SeqCst) == 0 {
         return;
     }
+    #[cfg(test)]
+    TOLD_HERE.set(TOLD_HERE.get() + 1);
     // Most writes are of memory no slot watches (buffers): no lock for them.
     if !pages.iter().any(|p| FILTER[p.bucket()].load(Ordering::SeqCst) != 0) {
         count(UNWATCHED, 1);
@@ -223,10 +229,42 @@ fn changed(pages: &[Page], teller: Teller) {
     count(teller as usize, told);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// On this thread: changes told past the first checks ([`changed`]),
+    /// and lookups of what views show ([`contents`]), for tests.
+    static TOLD_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LOOKED_UP_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `[at, at + len)` changed and its bytes are in: told by `teller`, at the
+/// pages it shows ([`contents`]). Memory no view shows (most that we and
+/// the title write: buffers) is its own pages, its addresses: asked of the
+/// filter with no lock taken, no lookup of views and no list made. (Every
+/// write took the views' lock, walked their map and made a list, on the
+/// submitting thread among others.)
+fn tell(at: usize, len: usize, teller: Teller) {
+    if !crate::inplace::any_view(at, len) {
+        let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+        if (first..last).all(|block| FILTER[Page::at(block * PAGE).bucket()].load(Ordering::SeqCst) == 0) {
+            count(UNWATCHED, 1);
+            return;
+        }
+        let pages: Vec<Page> = (first..last).map(|block| Page::at(block * PAGE)).collect();
+        changed(&pages, teller);
+        return;
+    }
+    let mut pages = Vec::new();
+    contents(at, len, &mut pages);
+    changed(&pages, teller);
+}
+
 /// The pages `[at, at + len)` shows, by what they are (each 64 KiB block's
 /// physical page if a view shows it there, else the block's own), into
 /// `out`.
 fn contents(at: usize, len: usize, out: &mut Vec<Page>) {
+    #[cfg(test)]
+    LOOKED_UP_HERE.set(LOOKED_UP_HERE.get() + 1);
     crate::inplace::physical(at, at.saturating_add(len), |block, shown| {
         out.push(match shown {
             Some((section, index)) => Page::shown(section, index),
@@ -259,9 +297,7 @@ pub(crate) fn written(at: usize, len: usize) {
     if !on() || len == 0 || WATCHED.load(Ordering::SeqCst) == 0 {
         return;
     }
-    let mut pages = Vec::new();
-    contents(at, len, &mut pages);
-    changed(&pages, Teller::Ours);
+    tell(at, len, Teller::Ours);
 }
 
 /// Tells [`written`] of `[at, at + len)` when dropped: for a writer with
@@ -279,9 +315,7 @@ pub(crate) fn faulted(at: usize) {
     if !on() || WATCHED.load(Ordering::SeqCst) == 0 {
         return;
     }
-    let mut pages = Vec::new();
-    contents(at / PAGE * PAGE, PAGE, &mut pages);
-    changed(&pages, Teller::Fault);
+    tell(at / PAGE * PAGE, PAGE, Teller::Fault);
 }
 
 /// The kernel's write watch found pages of the title's own memory written:
@@ -934,6 +968,63 @@ mod tests {
         written(usize::MAX - 16, PAGE);
         assert_eq!(pages_of(usize::MAX - 16, 16), [Page::at(usize::MAX)]);
         assert!(watchers.moved().is_empty());
+    }
+
+    /// A copy of ours into title memory at submission (`Step::Copy`, a placed
+    /// copy) is told once, by the copy when its bytes are in: `wrote` told it
+    /// again (and the arenas' own writes, which no slot reads).
+    #[test]
+    fn a_copy_at_submission_is_told_once() {
+        TEST_ON.set(Some(true));
+        let at = own_memory(PAGE);
+        let mut watchers = Watchers::default();
+        watchers.watch(1, pages_of(at, PAGE), now(), Kept::Told);
+        let bytes = [9u8; 64];
+        let before = TOLD_HERE.get();
+        crate::host::copy_mapped(at as *mut u8, bytes.as_ptr(), bytes.len(), true);
+        crate::watch::wrote(at, bytes.len());
+        assert_eq!(TOLD_HERE.get(), before + 1);
+        assert_eq!(watchers.moved(), [1]);
+    }
+
+    /// A write of memory no view shows is told with no lookup of views, and
+    /// of memory no slot watches with no lock: its pages are its addresses.
+    /// Memory a view shows is looked up, and told at its physical page.
+    #[test]
+    fn writes_of_memory_no_view_shows_look_up_no_views() {
+        const SIZE: usize = PAGE;
+        TEST_ON.set(Some(true));
+        let (_, one, two) = kept_views(SIZE);
+        let at = own_memory(2 * PAGE);
+        let mut watchers = Watchers::default();
+        watchers.watch(1, pages_of(at, PAGE), now(), Kept::Told);
+        watch(&mut watchers, 2, one, SIZE);
+        assert!(!crate::inplace::any_view(at, 2 * PAGE));
+        assert!(crate::inplace::any_view(two, SIZE));
+        let (looked, told) = (LOOKED_UP_HERE.get(), TOLD_HERE.get());
+        // (Unless another test watches a page of the unwatched one's bucket.)
+        let shared = FILTER[Page::at(at + PAGE).bucket()].load(Ordering::SeqCst) != 0;
+        // Watched, and not.
+        written(at + 8, 8);
+        written(at + PAGE, 8);
+        assert_eq!(LOOKED_UP_HERE.get(), looked, "no lookup of views");
+        assert_eq!(TOLD_HERE.get(), told + 1 + u64::from(shared), "the unwatched page took no lock");
+        assert_eq!(watchers.moved(), [1]);
+        // Through the other view: looked up, and told at the page.
+        crate::watch::writing(two + 16, 16);
+        assert!(LOOKED_UP_HERE.get() > looked);
+        assert_eq!(watchers.moved(), [2]);
+    }
+
+    /// The filter keeps 200,000 watched pages (some 20,000 slots) mostly in
+    /// buckets of their own: a write of memory no slot watches seldom
+    /// shares one, and takes no lock. (With 65,536 buckets at most a third
+    /// of them had one of their own.)
+    #[test]
+    fn the_filter_has_room_for_the_pages_of_a_scene() {
+        let pages = (0..200_000usize).map(|n| Page::at(0x7f00_0000_0000 + n * 3 * PAGE));
+        let buckets: std::collections::HashSet<usize> = pages.map(Page::bucket).collect();
+        assert!(buckets.len() > 160_000, "{} buckets for 200,000 pages", buckets.len());
     }
 
     /// `bytes` of memory of our own (no view, not write-watched) that no

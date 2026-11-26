@@ -1180,9 +1180,11 @@ pub(crate) fn ask_once_end() {
 /// We wrote title memory `[at, at + len)` while a submission's one asking
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
+/// (The texture slots that read it are told by the copy itself, once its
+/// bytes are in: `crate::host::copy_mapped`. Told here too, every copy at
+/// submission was told twice, and the arenas' own writes, which no slot
+/// reads, once: a views lookup each.)
 pub(crate) fn wrote(at: usize, len: usize) {
-    // The slots that read it, at any view, whether an asking stands or not.
-    crate::pagegen::written(at, len);
     // Renderer port #7: with no asking standing there is nothing to note,
     // which is seen shared. (Standing, its number moves: alone, as before.)
     if port_journal() && (len == 0 || !journal().kept) {
@@ -1661,7 +1663,7 @@ fn known_views(first: usize, last: usize) -> bool {
 
 /// A bit per block of the address space, in pieces made when first needed
 /// and never let go.
-struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
+pub(crate) struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
 
 /// The bits of 4 GiB.
 type BitsPiece = [std::sync::atomic::AtomicU64; Bits::WORDS];
@@ -1671,7 +1673,7 @@ impl Bits {
     /// 128 TiB, what a process has.
     const PIECES: usize = 1 << 15;
 
-    const fn new() -> Bits {
+    pub(crate) const fn new() -> Bits {
         Bits([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
     }
 
@@ -1681,7 +1683,7 @@ impl Bits {
         unsafe { piece.as_ref() }
     }
 
-    fn set(&self, block: usize) {
+    pub(crate) fn set(&self, block: usize) {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
         let word = block / 64;
         let Some(place) = self.0.get(word / Bits::WORDS) else {
@@ -1784,7 +1786,7 @@ impl Bits {
         }
     }
 
-    fn clear(&self, block: usize) {
+    pub(crate) fn clear(&self, block: usize) {
         let word = block / 64;
         if let Some(piece) = self.piece(word) {
             // Ahead of the protection's change, and seen by whoever the
@@ -1794,7 +1796,7 @@ impl Bits {
     }
 
     /// Whether a bit of `[first, last)` is set.
-    fn any(&self, first: usize, last: usize) -> bool {
+    pub(crate) fn any(&self, first: usize, last: usize) -> bool {
         let mut block = first;
         while block < last {
             let word = block / 64;

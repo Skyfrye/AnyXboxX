@@ -398,11 +398,25 @@ pub fn title_memory_section_gone(section: usize) {
     }
 }
 
+/// A bit per 64 KiB block that a title view shows ([`Views::views`]), read
+/// with no lock: set before the view is noted, cleared after it is
+/// forgotten, so a block without its bit is shown by no view
+/// ([`any_view`]).
+static VIEW_BLOCKS: crate::watch::Bits = crate::watch::Bits::new();
+
+/// Whether a title view shows any of `[at, at + len)`, asked with no lock
+/// (for `crate::pagegen`, which tells most writes of memory no view shows:
+/// buffers).
+pub(crate) fn any_view(at: usize, len: usize) -> bool {
+    len != 0 && VIEW_BLOCKS.any(at / K64, at.saturating_add(len).div_ceil(K64))
+}
+
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     {
         let mut v = views_mut();
+        (at / K64..at.saturating_add(len).div_ceil(K64)).for_each(|block| VIEW_BLOCKS.set(block));
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
             let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
@@ -472,6 +486,8 @@ pub(crate) fn views_gone(at: usize, len: usize) {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
         };
+        // (No view is noted in another's blocks: their bits are its.)
+        (base / K64..base.saturating_add(bytes).div_ceil(K64)).for_each(|block| VIEW_BLOCKS.clear(block));
         for k in 0..bytes.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
             if let Some(pages) = v.pages.get_mut(&key) {
