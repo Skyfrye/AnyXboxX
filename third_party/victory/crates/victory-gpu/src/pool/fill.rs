@@ -152,6 +152,8 @@ static ZEROS_DUE: Mutex<Vec<Arc<HostTexture>>> = Mutex::new(Vec::new());
 pub(crate) fn placed(copy: &Arc<HostTexture>) {
     if copy.fill.zero.load(Ordering::Relaxed) == WAITING {
         lock(&ZEROS_DUE).push(copy.clone());
+        // After the push: a submission begun before it is held back too.
+        super::zeros_queued(&copy.texture);
     }
 }
 
@@ -227,13 +229,38 @@ pub(crate) static ZEROS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub(crate) fn front(host: &crate::host::Host, number: u64) -> Option<ID3D12CommandList> {
     let due = std::mem::take(&mut *lock(&ZEROS_DUE));
     if due.is_empty() {
+        let_finished_go(crate::host::submissions().1);
         return None;
     }
     front_of(host, number, due)
 }
 
+/// Lets go of the host copies the zeros lists that ran up to `finished`
+/// named (their textures and pieces are not held until the list is reused).
+fn let_finished_go(finished: u64) {
+    let mut fronts = lock(&FRONTS);
+    for front in fronts.iter_mut().filter(|f| f.number <= finished) {
+        front.kept.clear();
+    }
+}
+
+/// Host copies whose zeros were taken for a list that was not sent: back to
+/// waiting for the next submission's (`again`), or no zeros at all (there is
+/// no buffer of zeros to copy from).
+fn not_sent(zero: Vec<Arc<HostTexture>>, again: bool) {
+    let to = if again { WAITING } else { NONE };
+    for copy in &zero {
+        // (Nobody else moves a copy out of SENT.)
+        copy.fill.zero.store(to, Ordering::Release);
+    }
+    if again {
+        lock(&ZEROS_DUE).extend(zero);
+    }
+}
+
 /// [`front`] of the host copies `due`.
 fn front_of(host: &crate::host::Host, number: u64, due: Vec<Arc<HostTexture>>) -> Option<ID3D12CommandList> {
+    let source = source(host);
     let mut zero = Vec::with_capacity(due.len());
     for copy in due {
         // Held by nothing else: no view shows it and no list names it.
@@ -243,17 +270,27 @@ fn front_of(host: &crate::host::Host, number: u64, due: Vec<Arc<HostTexture>>) -
             }
             continue;
         }
+        // The submission first, then SENT: the copy queue, seeing SENT
+        // (`give_zeros_up`), must see this submission, not an older one that
+        // has finished, or its upload runs ahead of these zeros and is
+        // wiped by them.
+        copy.fill.zeroed_in.store(number, Ordering::Release);
         if copy.fill.zero.compare_exchange(WAITING, SENT, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            copy.fill.zeroed_in.store(number, Ordering::Release);
             zero.push(copy);
         }
     }
     if zero.is_empty() {
         return None;
     }
-    let source = source(host)?;
+    let Some(source) = source else {
+        not_sent(zero, false);
+        return None;
+    };
     let finished = crate::host::submissions().1;
     let mut fronts = lock(&FRONTS);
+    for front in fronts.iter_mut().filter(|f| f.number <= finished) {
+        front.kept.clear();
+    }
     let at = match fronts.iter().position(|f| f.number <= finished) {
         Some(at) => at,
         None => {
@@ -272,6 +309,8 @@ fn front_of(host: &crate::host::Host, number: u64, due: Vec<Arc<HostTexture>>) -
                 Ok(front) => fronts.push(front),
                 Err(e) => {
                     tracing::warn!(error = %e, "no host list for the zeros of textures cut where another lay");
+                    drop(fronts);
+                    not_sent(zero, true);
                     return None;
                 }
             }
@@ -305,6 +344,9 @@ fn front_of(host: &crate::host::Host, number: u64, due: Vec<Arc<HostTexture>>) -
     };
     if let Err(e) = recorded {
         tracing::warn!(error = %e, "the zeros of textures cut where another lay were not recorded");
+        // (The front's number is left as it was: its list holds nothing.)
+        drop(fronts);
+        not_sent(zero, true);
         return None;
     }
     front.number = number;
@@ -857,6 +899,48 @@ mod tests {
         assert!(front_of(host, u64::MAX, vec![copy.clone()]).is_none());
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Zeros taken for a list that was then not sent are not left marked
+    /// SENT (shown, yet never zeroed): they wait for the next submission's
+    /// again, or, with no buffer of zeros to copy from, are not wanted.
+    #[test]
+    fn zeros_that_were_not_sent_wait_again_or_are_dropped() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else { return };
+        let bench = Bench::new(&host.device);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let new = || {
+            let mut copy = HostTexture::for_tests(over_a_pattern(host, &bench, &desc).texture, 0);
+            copy.fill = Fill::for_tests(true, true);
+            copy.fill.zero.store(SENT, Ordering::Relaxed);
+            Arc::new(copy)
+        };
+        let (again, dropped) = (new(), new());
+        not_sent(vec![dropped.clone()], false);
+        assert_eq!(dropped.fill.zero.load(Ordering::Relaxed), NONE);
+        assert!(!lock(&ZEROS_DUE).iter().any(|c| Arc::ptr_eq(c, &dropped)));
+        not_sent(vec![again.clone()], true);
+        let mut due = lock(&ZEROS_DUE);
+        let at = due.iter().position(|c| Arc::ptr_eq(c, &again));
+        // (A submission of a test running beside this one may have taken it
+        // since: then its zeros went with that one.)
+        match at {
+            Some(at) => {
+                assert_eq!(again.fill.zero.load(Ordering::Relaxed), WAITING);
+                due.remove(at);
+            }
+            None => assert_eq!(again.fill.zero.load(Ordering::Relaxed), SENT),
+        }
     }
 
     /// Through the way lists go to the card: a host copy told of at its
