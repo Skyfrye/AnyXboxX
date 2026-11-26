@@ -1040,9 +1040,15 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
 /// ranges dropped because no pass took them; slots made due by such
-/// ranges; and made slots whose memory was found unmapped (made null).
+/// ranges; and made slots whose memory was found unmapped (let go: the
+/// stand-in, or null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Since the start: looks that found the memory of a slot's new record away
+/// while the slot went on showing a texture of another record
+/// ([`HostHeap::texture_slot_gone`]): left showing it.
+pub(crate) static KEPT_AWAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// When a view the title writes makes older views of other memory stale
 /// ([`Rule`]): where it starts in the block of their smallest levels, by
@@ -2716,16 +2722,33 @@ impl HostHeap {
     /// books, posters and sleeves for 0.3 to 2 s). Only when it is still
     /// away `AWAY_MS` after it was first found away
     /// (`VICTORY_TEXTURE_AWAY_MS`; 0: at once, as before).
-    pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+    ///
+    /// `handle`: the title's record the memory was looked up for. A slot
+    /// made from another record (one that goes on showing the texture it
+    /// held while the new one is not there yet, [`HostHeap::keeps`]) is
+    /// left as it is: the memory found away is not that of what it shows.
+    /// (It was let go all the same, three seconds on, and the slot read
+    /// zeros until the new texture's memory came: run nb1 had 56,498 slots
+    /// that waited for their memory, 19.6 s on average.)
+    pub(crate) fn texture_slot_gone(&self, index: u32, handle: u64) -> bool {
         const AWAY_MS: u64 = 3000;
         static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let wait = *WAIT.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(AWAY_MS)
         });
+        self.gone_after(index, handle, wait)
+    }
+
+    /// [`HostHeap::texture_slot_gone`], let go once `wait` ms went by.
+    fn gone_after(&self, index: u32, handle: u64, wait: u64) -> bool {
         let _made = self.made.lock(index);
         let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
             return false;
         };
+        if key != record_key(handle) {
+            KEPT_AWAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let now = crate::host::now_ms();
         {
             let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
@@ -3104,8 +3127,11 @@ impl HostHeap {
         }
     }
 
-    /// Makes host slot `index` null again, as it is before its view is
-    /// made: a null view of the kind it held. Under its lock ([`Made`]).
+    /// Makes host slot `index` show no texture of its own again, as it is
+    /// before its view is made: the [`neutral`] stand-in for a texture the
+    /// title fills ([`stands_in`]), else a null view of the kind it held.
+    /// (Null, a texture streamed out or made stale read zeros, black and
+    /// alpha 0, until its slot was made again.) Under its lock ([`Made`]).
     fn unmake(&self, index: u32) {
         self.quick_is(index, 0);
         let Some(key) = self.made.get(index) else {
@@ -3115,14 +3141,25 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.at(index)),
-            None => null_view(self.at(index)),
-        }
+        let kept = match view_at(key as u32, (key >> 32) as u32) {
+            Some(view) if !self.sampler && is_texture_view(&view) && stands_in(&view) => {
+                let shown = neutral_for(&view, self.at(index));
+                stood_in(shown.as_ref());
+                shown
+            }
+            Some(view) => {
+                null_for(&view, self.at(index));
+                None
+            }
+            None => {
+                null_view(self.at(index));
+                None
+            }
+        };
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 0);
-        self.keep(index, None);
+        self.keep(index, kept);
     }
 
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
@@ -6067,6 +6104,49 @@ mod tests {
                 assert_eq!(heap.kept_in(index).map(|r| r.as_raw()), Some(stand_in.as_raw()));
             }
         }
+    }
+
+    /// A slot that goes on showing another record's texture while its new
+    /// one is not there yet is not let go when the new texture's memory is
+    /// found away, however often and long that lasts (it was let go, three
+    /// seconds on, to a null view). One made from its own record is let go,
+    /// and shows the stand-in then, not zeros.
+    #[test]
+    fn a_kept_slot_is_not_let_go_for_its_new_textures_memory() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let Some(texture) = make_neutral(Neutral::Flat) else { return };
+        let address = 0x7fee_3300_0000u64;
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, placed_2d(address, 98));
+        let shown = record_key(handle);
+        heap.made.set(7, shown);
+        heap.keep(7, Some(texture.clone()));
+        // Rewritten with another texture of its dimension (neither moved
+        // nor sized): the slot goes on showing the old one.
+        let mut new = placed_2d(address + 0x8_0000, 98);
+        if let View::Placed(_, resource, _) = &mut new {
+            (resource[4], resource[6]) = (128, 32);
+        }
+        write_record(&mut slot, new);
+        assert!(heap.mirror(7, handle, false).is_some());
+        assert_eq!(heap.made.get(7), Some(shown));
+        // The new texture's memory found away, again and again, each time
+        // past the wait.
+        for _ in 0..2 {
+            assert!(!heap.gone_after(7, handle, 0));
+        }
+        assert_eq!(heap.made.get(7), Some(shown), "goes on showing the old texture");
+        assert_eq!(heap.kept_in(7).map(|r| r.as_raw()), Some(texture.as_raw()));
+        // A slot made from its own record: let go, to the stand-in.
+        let mut own = [0u32; 4];
+        let handle = write_record(&mut own, placed_2d(address + 0x10_0000, 98));
+        heap.made.set(6, record_key(handle));
+        heap.keep(6, Some(texture.clone()));
+        assert!(heap.gone_after(6, handle, 0));
+        assert!(heap.shows_none(6));
+        let stand_in = neutral(Neutral::Flat).unwrap();
+        assert_eq!(heap.kept_in(6).map(|r| r.as_raw()), Some(stand_in.as_raw()), "the stand-in, not a null view");
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.

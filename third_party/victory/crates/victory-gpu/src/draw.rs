@@ -2849,8 +2849,11 @@ impl State {
                     // Memory mapped there makes the slot due again
                     // (`crate::pagegen`), not only the next look.
                     host.texture_slot_watch_away(index, address as usize, len as usize);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    // Streamed out: what the slot showed is let go (not
+                    // while it shows the texture of another record).
+                    if let Some(handle) = heap.handle(index) {
+                        host.texture_slot_gone(index, handle);
+                    }
                     host.texture_slot_later(index, write, frame, now, cap);
                     continue;
                 }
