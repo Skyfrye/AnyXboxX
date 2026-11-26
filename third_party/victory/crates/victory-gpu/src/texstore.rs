@@ -106,36 +106,35 @@ fn store() -> Option<&'static Store> {
             );
             let (send, receive) = mpsc::channel::<Job>();
             let to = folder.clone();
-            std::thread::Builder::new()
-                .name("texture store".into())
-                .spawn(move || {
-                    let Ok(mut index) =
-                        std::fs::OpenOptions::new().create(true).append(true).open(to.join("index.txt"))
-                    else {
-                        return;
+            // (in the background band: below every thread of the title)
+            crate::bands::spawn_background("texture store", move || {
+                let Ok(mut index) =
+                    std::fs::OpenOptions::new().create(true).append(true).open(to.join("index.txt"))
+                else {
+                    return;
+                };
+                for job in receive {
+                    // (The store is made before this thread's first job.)
+                    let Some(store) = store() else {
+                        continue;
                     };
-                    for job in receive {
-                        // (The store is made before this thread's first job.)
-                        let Some(store) = store() else {
+                    let Some((blob, bytes, keys)) = kept(store, job) else {
+                        continue;
+                    };
+                    let path = to.join(format!("{blob:032x}.lv"));
+                    if !path.exists() {
+                        let part = to.join(format!("{blob:032x}.part"));
+                        if std::fs::write(&part, &bytes[..]).is_err() || std::fs::rename(&part, &path).is_err() {
                             continue;
-                        };
-                        let Some((blob, bytes, keys)) = kept(store, job) else {
-                            continue;
-                        };
-                        let path = to.join(format!("{blob:032x}.lv"));
-                        if !path.exists() {
-                            let part = to.join(format!("{blob:032x}.part"));
-                            if std::fs::write(&part, &bytes[..]).is_err() || std::fs::rename(&part, &path).is_err() {
-                                continue;
-                            }
-                            STATS[5].fetch_add(bytes.len() as u64, Relaxed);
                         }
-                        let text: String = keys.iter().map(|(k, e)| line_of(k, e) + "\n").collect();
-                        let _ = index.write_all(text.as_bytes());
-                        let _ = index.flush();
+                        STATS[5].fetch_add(bytes.len() as u64, Relaxed);
                     }
-                })
-                .ok()?;
+                    let text: String = keys.iter().map(|(k, e)| line_of(k, e) + "\n").collect();
+                    let _ = index.write_all(text.as_bytes());
+                    let _ = index.flush();
+                }
+            })
+            .ok()?;
             Some(Store {
                 folder,
                 index: Mutex::new(index),

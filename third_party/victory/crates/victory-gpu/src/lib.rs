@@ -20,6 +20,8 @@ mod ambient;
 #[cfg(all(windows, test))]
 mod background;
 #[cfg(windows)]
+pub mod bands;
+#[cfg(windows)]
 mod lightprobe;
 #[cfg(windows)]
 mod texlate;

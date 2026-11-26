@@ -18,7 +18,7 @@
 //! power budget.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use windows_sys::Win32::Foundation::{
         CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     };
@@ -35,7 +35,7 @@ mod tests {
 
     /// Calls `f` with the id and a handle (query rights, closed after) of
     /// each thread of this process whose name starts with `prefix`.
-    fn each_thread_named(prefix: &str, mut f: impl FnMut(u32, HANDLE)) {
+    pub(crate) fn each_thread_named(prefix: &str, mut f: impl FnMut(u32, HANDLE)) {
         // SAFETY: plain Win32 calls; the snapshot and thread handles are
         // closed below, the entry is sized as the call asks, and the
         // description is freed as `GetThreadDescription` says.

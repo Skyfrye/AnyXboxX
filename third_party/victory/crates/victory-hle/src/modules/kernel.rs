@@ -406,32 +406,39 @@ pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
     argv().list.get()
 }
 
-/// The title's thread priorities, but for the lowest two, which become
-/// "below normal". Six of the title's threads run at "idle", the streaming
-/// pager's among them; on the console they have what the rest of the title
-/// leaves of its cores. A PC's processors are also wanted by other programs
-/// and by our own workers (sixteen when pipelines are made): with every
-/// one of them busy such a thread ran once in four seconds or so, when the
-/// host's scheduler took pity, and the loading that waits for it with it
-/// (run stream-3: loads seen to be done 1.1 s late on average, 4.8 s at
-/// worst). `VICTORY_TITLE_PRIORITIES=0`: as the title sets them.
+/// The title's thread priorities in the title's band
+/// (`victory_gpu::bands::title`): as the title sets them, but none below
+/// "lowest", and every one above our background work (pipeline workers,
+/// the pipeline library's saves, the texture store), which runs at "idle".
+/// Six of the title's threads run at "idle", the streaming pager's among
+/// them; on the console they have what the rest of the title leaves of its
+/// cores. A PC's processors are also wanted by other programs and by our
+/// own workers: with every one of them busy such a thread ran once in four
+/// seconds or so, when the host's scheduler took pity, and the loading that
+/// waits for it with it (run stream-3: loads seen to be done 1.1 s late on
+/// average, 4.8 s at worst). The title's order is kept (its idle threads
+/// share "lowest" with its lowest ones). Always: `VICTORY_TITLE_PRIORITIES`
+/// is not read any more; at 0, as the default set had it, those threads
+/// stayed at idle, below our pipeline workers.
 fn title_priority(asked: i32) -> i32 {
-    const IDLE: i32 = -15;
-    const LOWEST: i32 = -2;
-    const BELOW_NORMAL: i32 = -1;
-    match asked {
-        IDLE..=LOWEST => BELOW_NORMAL,
-        other => other,
-    }
+    victory_gpu::bands::title(asked)
 }
 
 /// [`title_priority`].
 pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
-    static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
-    let priority = if as_set { priority } else { title_priority(priority) };
+    let given = title_priority(priority);
+    if given != priority {
+        static RAISED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !RAISED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                asked = priority,
+                given,
+                "a title thread's priority is raised into the title's band, above our background work (and so are later ones)"
+            );
+        }
+    }
     // SAFETY: the title passes a thread handle.
-    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, given) }
 }
 
 pub(crate) fn module() -> HleModule {
@@ -683,17 +690,21 @@ mod host {
 mod tests {
     use super::*;
 
-    /// The title's idle and lowest threads run below normal; the others as
-    /// it sets them.
+    /// The title's idle threads run at lowest, above our background work;
+    /// the others as it sets them, in its order.
     #[test]
-    fn no_title_thread_waits_for_idle_processors() {
+    fn no_title_thread_waits_for_our_background_work() {
         let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
-        assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
+        assert_eq!(given, [-2, -2, -1, 0, 1, 2, 15]);
+        assert!(given.iter().all(|&p| p > victory_gpu::bands::BACKGROUND));
         use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
         std::thread::spawn(|| {
             // SAFETY: plain calls on this thread.
             let thread = unsafe { GetCurrentThread() };
             assert_eq!(SetThreadPriority(thread, -15), 1);
+            // SAFETY: as above.
+            assert_eq!(unsafe { GetThreadPriority(thread) }, -2);
+            assert_eq!(SetThreadPriority(thread, -1), 1);
             // SAFETY: as above.
             assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
         })

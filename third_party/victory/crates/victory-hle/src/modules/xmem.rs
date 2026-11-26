@@ -1131,9 +1131,10 @@ fn lean() -> bool {
     *ON
 }
 
-/// The title's streaming thread runs below normal priority, as do sixteen
-/// workers of ours when pipelines are made; on the console nothing else
-/// wants its core. Called where that thread maps and submits: lifts a
+/// The title's streaming thread runs below normal priority (at "lowest", the
+/// floor of the title's band, where it asks for "idle": `kernel`'s
+/// `title_priority`); on the console nothing else wants its core. Called
+/// where that thread maps and submits: lifts a
 /// thread that is below normal to above it (`VICTORY_STREAM_PRIORITY=0`:
 /// left as the title set it).
 pub(crate) fn lift_thread() {

@@ -398,7 +398,8 @@ pub(crate) fn trim() {
         TRIMMED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
         crate::host::trail(|| format!("pipeline library: the mapped file's pages let go from memory ({len} bytes)"));
     };
-    if std::thread::Builder::new().name("victory-library-trim".into()).spawn(work).is_err() {
+    // (in the background band: below every thread of the title)
+    if crate::bands::spawn_background("victory-library-trim", work).is_err() {
         TRIMMED.store(false, Ordering::Relaxed);
     }
 }
@@ -714,7 +715,9 @@ pub(crate) fn pipeline(
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `SAVE_EVERY` has passed (or `now`). Saves along the way run
+/// in the background band, whichever worker makes them (a worker of passes
+/// over the screen too); `now` (the end of the run) as the caller runs.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -726,6 +729,7 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let _band = (!now).then(crate::bands::Lowered::new);
     let _saving = crate::timeline::span("pipeline: save the library and early list");
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");

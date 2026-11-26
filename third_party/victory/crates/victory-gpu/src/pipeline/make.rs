@@ -391,7 +391,7 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            (worker_count() / 4).max(1)
         }
     })
 }
@@ -507,10 +507,6 @@ fn next(screens_only: bool) -> Arc<Pending> {
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
-fn worker_count(asked: Option<usize>, processors: usize) -> usize {
-    worker_count_for(asked, processors, false)
-}
-
 fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
@@ -519,34 +515,50 @@ fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) 
     }
 }
 
+/// [`worker_count_for`] this host.
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        worker_count_for(
+            std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse().ok()),
+            std::thread::available_parallelism().map_or(2, |n| n.get()),
+            crate::residency::limited_host_ram(),
+        )
+    })
+}
+
+/// A worker's priority: the background band, below every thread of the
+/// title, the streaming pager's among them; those of passes over the screen,
+/// which a draw waits for up to [`screen_budget`], below normal.
+fn worker_priority(screens_only: bool) -> i32 {
+    use windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL;
+    if screens_only { THREAD_PRIORITY_BELOW_NORMAL } else { crate::bands::BACKGROUND }
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count_for(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-            crate::residency::limited_host_ram(),
-        );
-        tracing::info!(workers, "pipeline workers");
+        let workers = worker_count();
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        // (workers at idle priority, below the title's threads; those of
+        // passes over the screen below normal)
+        tracing::info!(
+            workers,
+            screens,
+            priority = worker_priority(false),
+            "pipeline workers"
+        );
         for i in 0..workers + screens {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
                     // SAFETY: a plain call on our own thread.
                     unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
+                        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                        SetThreadPriority(GetCurrentThread(), worker_priority(screens_only));
                     }
                     loop {
                         let p = next(screens_only);
@@ -627,15 +639,41 @@ mod tests {
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
-        assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
-        assert_eq!(worker_count(Some(0), 24), 1);
-        assert_eq!(worker_count(Some(20), 24), 20);
+        assert_eq!(worker_count_for(None, 1, false), 2);
+        assert_eq!(worker_count_for(None, 24, false), 16);
+        assert_eq!(worker_count_for(None, 64, false), 16);
+        assert_eq!(worker_count_for(Some(0), 24, false), 1);
+        assert_eq!(worker_count_for(Some(20), 24, false), 20);
         assert_eq!(worker_count_for(None, 8, true), 6);
         assert_eq!(worker_count_for(None, 16, true), 8);
         assert_eq!(worker_count_for(None, 24, true), 8);
         assert_eq!(worker_count_for(Some(12), 8, true), 12);
+    }
+
+    /// The workers run below every thread of the title, but those of passes
+    /// over the screen, which a draw waits for.
+    #[test]
+    fn workers_run_below_the_titles_threads() {
+        use windows_sys::Win32::System::Threading::{GetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_IDLE};
+        assert!(workers());
+        let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        let want = [(crate::bands::BACKGROUND, worker_count()), (THREAD_PRIORITY_BELOW_NORMAL, screens)];
+        let started = Instant::now();
+        loop {
+            let mut seen = Vec::new();
+            // SAFETY (in the closure): an open handle with query rights.
+            crate::background::tests::each_thread_named("victory-pipelines-", |_, h| {
+                seen.push(unsafe { GetThreadPriority(h) })
+            });
+            let of = |priority| seen.iter().filter(|&&p| p == priority).count();
+            if want.iter().all(|&(priority, n)| of(priority) == n) && seen.len() == worker_count() + screens {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "worker priorities: {seen:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The title's idle threads among them.
+        assert!(crate::bands::BACKGROUND < crate::bands::title(THREAD_PRIORITY_IDLE));
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
