@@ -5699,12 +5699,74 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
-#[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+/// bytes), each with the asking that last took it.
+static EXACT: Mutex<Exact<Arc<Shadow>>> = Mutex::new(Exact::new());
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The map of [`exact`]'s copies: by (start, bytes), each with the asking
+/// that last took it; the askings so far; how many copies were left after
+/// the last look for idle ones, and in which frame it was.
+///
+/// The idle ones were looked for at every copy made once there were 256:
+/// with the 4,400-4,700 that stay (every one a list or a slot holds), 440
+/// times a frame, each look a reference added and dropped on each buffer,
+/// under the one lock every asking of every thread takes (run nb1). Now
+/// they are looked for at the first copy made in a frame, or once the map
+/// has doubled since the last look: a look a frame, and never more looks
+/// than copies made.
+struct Exact<T> {
+    tick: u64,
+    map: BTreeMap<(u64, u64), (T, u64)>,
+    after: usize,
+    frame: u64,
+}
+
+impl<T: Clone> Exact<T> {
+    /// Copies kept before the idle ones are looked for, and the askings an
+    /// idle one stays for.
+    const MANY: usize = 256;
+    const LATELY: u64 = 512;
+
+    const fn new() -> Exact<T> {
+        Exact { tick: 0, map: BTreeMap::new(), after: 0, frame: 0 }
+    }
+
+    /// The copy of `key`, if there is one: asked for now.
+    fn get(&mut self, key: (u64, u64)) -> Option<T> {
+        self.tick += 1;
+        self.again(key)
+    }
+
+    /// The same for an asking counted already (looked for again after a
+    /// copy was made outside the lock).
+    fn again(&mut self, key: (u64, u64)) -> Option<T> {
+        let now = self.tick;
+        self.map.get_mut(&key).map(|(copy, used)| {
+            *used = now;
+            copy.clone()
+        })
+    }
+
+    /// `copy` is the one of `key` (asked for now, in `frame`); first, at the
+    /// first copy of a frame or once the map has doubled since the last
+    /// look, those `held` says no one holds and not asked for lately go.
+    fn insert(&mut self, key: (u64, u64), copy: T, frame: u64, held: impl Fn(&T) -> bool) {
+        let len = self.map.len();
+        if len >= Self::MANY && (frame != self.frame || len >= 2 * self.after) {
+            let now = self.tick;
+            self.map.retain(|_, (copy, used)| held(copy) || *used + Self::LATELY > now);
+            self.after = self.map.len();
+            self.frame = frame;
+        }
+        self.map.insert(key, (copy, self.tick));
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5721,40 +5783,39 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
-/// change every frame).
+/// change every frame). Its buffer is placed in a block made once
+/// (`crate::pool::copies`), and made outside the lock: the other threads'
+/// askings go on meanwhile.
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    let used = |shadow: &Arc<Shadow>| shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    if let Some(shadow) = EXACT.lock().unwrap_or_else(|e| e.into_inner()).get((address, len)) {
+        used(&shadow);
+        return Some(shadow);
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let host = host()?;
+    let bytes = len.next_multiple_of(256);
+    let (buffer, data) = crate::pool::copies::buffer(&host.device, bytes).or_else(|| host.shared_buffer(bytes))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut copies = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    // Made by another thread meanwhile: that one (this one was never used).
+    if let Some(theirs) = copies.again((address, len)) {
+        used(&theirs);
+        return Some(theirs);
+    }
+    // Held by the map alone (no list), its buffer by the copy alone (no
+    // slot shows it).
+    copies.insert((address, len), shadow.clone(), crate::frame::current(), |shadow| {
+        Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1
+    });
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -5771,10 +5832,11 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let placed = crate::pool::copies::line(frames).unwrap_or_default();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept; their buffers: {placed}",
         asked as f64 / frames,
         made as f64 / frames
     );
@@ -5969,4 +6031,318 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::Exact;
+
+    /// The copies of views' own bytes that a list or a slot holds stay; the
+    /// idle ones are looked for once a frame or once the map has doubled
+    /// since the last look, not at every copy made (with 4,500 held, that
+    /// was 4,500 looks, each a reference added and dropped, at each of 440
+    /// copies a frame).
+    #[test]
+    fn idle_copies_are_looked_for_once_the_map_has_doubled() {
+        let looks = std::cell::Cell::new(0u64);
+        let mut copies: Exact<u64> = Exact::new();
+        for i in 0..5_500u64 {
+            assert!(copies.get((i, 4)).is_none());
+            copies.insert((i, 4), i, 1, |_| {
+                looks.set(looks.get() + 1);
+                true
+            });
+        }
+        assert_eq!(copies.len(), 5_500, "the held ones stay");
+        assert!(looks.get() < 2 * 5_500, "{} looks for 5,500 copies made", looks.get());
+        assert_eq!(copies.get((7, 4)), Some(7));
+        // A new frame: one look at its first copy, none at the next ones.
+        let before = looks.get();
+        for i in 0..100u64 {
+            copies.insert((1 << 32 | i, 4), i, 2, |_| {
+                looks.set(looks.get() + 1);
+                true
+            });
+        }
+        assert_eq!(looks.get() - before, 5_500, "one look in the frame");
+
+        // Idle ones (no one holds them) go at the next look once not asked
+        // for lately; those asked for lately stay.
+        let mut idle: Exact<u64> = Exact::new();
+        for i in 0..256u64 {
+            idle.get((i, 4));
+            idle.insert((i, 4), i, 1, |_| false);
+        }
+        for _ in 0..Exact::<u64>::LATELY {
+            idle.get((1 << 40, 4));
+        }
+        idle.get((3, 4));
+        idle.get((9, 4));
+        idle.insert((1 << 40, 4), 0, 1, |_| false);
+        assert_eq!(idle.len(), 3, "the two asked for lately and the new one");
+        assert_eq!(idle.get((9, 4)), Some(9));
+    }
+}
+
+
+#[cfg(test)]
+mod exact_costs {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    use super::Shadow;
+
+    fn committed(device: &ID3D12Device, flags: D3D12_HEAP_FLAGS, bytes: u64) -> (ID3D12Resource, *mut u8) {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping.
+        unsafe {
+            device.CreateCommittedResource(&heap, flags, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made).unwrap();
+            made.as_ref().unwrap().Map(0, None, Some(&mut data)).unwrap();
+        }
+        (made.unwrap(), data.cast())
+    }
+
+    /// A copy made as before this base's fix: a committed buffer made not
+    /// resident, made resident and waited for until mapped.
+    fn as_before(device: &ID3D12Device, bytes: u64) -> (ID3D12Resource, *mut u8) {
+        let (b, data) = committed(device, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, bytes);
+        let pageable: ID3D12Pageable = windows::core::Interface::cast(&b).unwrap();
+        // SAFETY: a live resource of the device's.
+        unsafe { device.MakeResident(&[Some(pageable)]) }.unwrap();
+        crate::host::mapped(device).unwrap();
+        (b, data)
+    }
+
+    /// The map of copies as it was: every asking under one lock, a copy
+    /// made under it (as before, or placed in a block), and the idle ones
+    /// looked for at every copy made once there are 256.
+    #[allow(clippy::type_complexity)]
+    struct Before(Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)>, bool);
+
+    impl Before {
+        fn exact(&self, device: &ID3D12Device, address: u64, len: u64) -> Option<Arc<Shadow>> {
+            let mut guard = self.0.lock().unwrap();
+            let (tick, map) = &mut *guard;
+            *tick += 1;
+            let now = *tick;
+            if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+                *used = now;
+                shadow.used.store(crate::host::moment(), std::sync::atomic::Ordering::Relaxed);
+                return Some(shadow.clone());
+            }
+            if map.len() >= 256 {
+                map.retain(|_, (shadow, used)| {
+                    Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + 512 > now
+                });
+            }
+            let (buffer, data) = if self.1 {
+                crate::pool::copies::buffer(device, len.next_multiple_of(256)).unwrap()
+            } else {
+                as_before(device, len.next_multiple_of(256))
+            };
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+            map.insert((address, len), (shadow.clone(), now));
+            Some(shadow)
+        }
+    }
+
+    /// Eight threads ask `asks` times each, one asking in seven for a copy
+    /// not there (run nb1: 2,900 askings and 440 copies made a frame), the
+    /// others for one of 4,500 that are held: the threads' microseconds per
+    /// asking, and the wall's milliseconds.
+    fn askings(exact: &(dyn Fn(u64, u64) -> Option<Arc<Shadow>> + Sync), base: u64, asks: u64, every: u64) -> (f64, f64) {
+        let started = Instant::now();
+        let thread_us: f64 = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8u64)
+                .map(|t| {
+                    s.spawn(move || {
+                        let mut new = Vec::new();
+                        let started = Instant::now();
+                        for i in 0..asks {
+                            if every > 0 && i % every == 0 {
+                                new.push(exact(base + (1 << 36) + (t * asks + i) * 1024, 256));
+                            } else {
+                                let _ = exact(base + ((i * 31 + t) % 4_500) * 1024, 256);
+                            }
+                        }
+                        started.elapsed().as_secs_f64() * 1e6
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        (thread_us / (8 * asks) as f64, started.elapsed().as_secs_f64() * 1e3)
+    }
+
+    /// What copies of views' own bytes cost on the card here, the way they
+    /// were made and the way they are now, and what else a view's slot
+    /// costs (`cargo test -p victory-gpu --lib -- --ignored own_bytes_costs
+    /// --nocapture`, on the card: no `VICTORY_D3D12_WARP`).
+    #[test]
+    #[ignore = "a measurement on the card"]
+    fn own_bytes_costs_on_the_card() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let device = &host.device;
+        const N: usize = 300;
+        let per = |started: Instant, n: usize| started.elapsed().as_secs_f64() * 1e6 / n as f64;
+        // One copy at a time, as before and now.
+        let mut kept = Vec::new();
+        let started = Instant::now();
+        let mut steps = [0f64; 3];
+        for _ in 0..N {
+            let t = Instant::now();
+            let (b, _) = committed(device, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, 256);
+            steps[0] += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let pageable: ID3D12Pageable = windows::core::Interface::cast(&b).unwrap();
+            // SAFETY: a live resource of the device's.
+            unsafe { device.MakeResident(&[Some(pageable)]) }.unwrap();
+            steps[1] += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            crate::host::mapped(device).unwrap();
+            steps[2] += t.elapsed().as_secs_f64();
+            kept.push(b);
+        }
+        let before = per(started, N);
+        let [made_us, resident_us, mapped_us] = steps.map(|s| s * 1e6 / N as f64);
+        kept.clear();
+        let started = Instant::now();
+        for _ in 0..N {
+            kept.push(committed(device, D3D12_HEAP_FLAG_NONE, 256).0);
+        }
+        let resident = per(started, N);
+        kept.clear();
+        crate::pool::copies::reserve(device, 16_000);
+        let started = Instant::now();
+        let placed: Vec<_> = (0..N).map(|_| crate::pool::copies::buffer(device, 256).expect("a placed buffer")).collect();
+        let placed_us = per(started, N);
+        drop(placed);
+        let started = Instant::now();
+        let block = crate::pool::copies::reserve_one(device);
+        let block_ms = started.elapsed().as_secs_f64() * 1e3;
+        assert!(block, "a block");
+
+        // Eight threads asking, as before and now.
+        let old = Before(Mutex::new((0, BTreeMap::new())), false);
+        let old_held: Vec<_> = (0..4_500u64).map(|i| old.exact(device, 0x7000_0000_0000 + i * 1024, 256).unwrap()).collect();
+        let (old_ask, old_wall) = askings(&|a, l| old.exact(device, a, l), 0x7000_0000_0000, 2_000, 7);
+        drop(old_held);
+        drop(old);
+        // Placed, but the map as it was: what its lock and looks cost.
+        let half = Before(Mutex::new((0, BTreeMap::new())), true);
+        let half_held: Vec<_> = (0..4_500u64).map(|i| half.exact(device, 0x7400_0000_0000 + i * 1024, 256).unwrap()).collect();
+        let (half_ask, half_wall) = askings(&|a, l| half.exact(device, a, l), 0x7400_0000_0000, 2_000, 7);
+        drop(half_held);
+        drop(half);
+        let new_held: Vec<_> = (0..4_500u64).map(|i| super::exact(0x7800_0000_0000 + i * 1024, 256).unwrap()).collect();
+        let (new_ask, new_wall) = askings(&|a, l| super::exact(a, l), 0x7800_0000_0000, 2_000, 7);
+        let (hit_ask, _) = askings(&|a, l| super::exact(a, l), 0x7800_0000_0000, 2_000, 0);
+        let started = Instant::now();
+        let alone: Vec<_> = (0..N as u64).map(|i| super::exact(0x7c00_0000_0000 + i * 1024, 256)).collect();
+        let miss_alone = per(started, N);
+        drop(alone);
+        drop(new_held);
+        // Of a frame of run nb1: 2,900 askings, its 40,600 list calls.
+        let [old_frame, half_frame, new_frame] = [old_ask, half_ask, new_ask].map(|us| us * 2_900.0 / 1e3);
+
+        // A view's slot: made beside the heap, copied in, made in the heap.
+        let heap_of = |flags: D3D12_DESCRIPTOR_HEAP_FLAGS| -> ID3D12DescriptorHeap {
+            // SAFETY: plain creation.
+            unsafe {
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1024,
+                    Flags: flags,
+                    ..Default::default()
+                })
+            }
+            .unwrap()
+        };
+        let (cpu, visible) = (heap_of(D3D12_DESCRIPTOR_HEAP_FLAG_NONE), heap_of(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE));
+        // SAFETY: plain queries of live heaps.
+        let (step, from, to) = unsafe {
+            (
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+                cpu.GetCPUDescriptorHandleForHeapStart(),
+                visible.GetCPUDescriptorHandleForHeapStart(),
+            )
+        };
+        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV { FirstElement: 0, NumElements: 64, StructureByteStride: 0, Flags: D3D12_BUFFER_SRV_FLAG_RAW },
+            },
+        };
+        let (buffer, _) = committed(device, D3D12_HEAP_FLAG_NONE, 1 << 16);
+        let views = 20_000usize;
+        let at = |base: D3D12_CPU_DESCRIPTOR_HANDLE, i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + (i % 1024) * step };
+        let started = Instant::now();
+        for i in 0..views {
+            // SAFETY: a slot of the heap, a live buffer.
+            unsafe { device.CreateShaderResourceView(&buffer, Some(&raw), at(from, i)) };
+        }
+        let made_view = per(started, views);
+        let started = Instant::now();
+        for i in 0..views {
+            // SAFETY: slots of the heaps.
+            unsafe { device.CopyDescriptorsSimple(1, at(to, i), at(from, i), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        }
+        let copied_view = per(started, views);
+        let started = Instant::now();
+        for i in 0..views {
+            // SAFETY: a slot of the shader-visible heap, a live buffer.
+            unsafe { device.CreateShaderResourceView(&buffer, Some(&raw), at(to, i)) };
+        }
+        let made_in_visible = per(started, views);
+        let started = Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..views {
+            // SAFETY: a live buffer.
+            sum = sum.wrapping_add(unsafe { buffer.GetDesc().Width + buffer.GetGPUVirtualAddress() });
+            sum = sum.wrapping_add(u64::from(crate::host::references(&buffer)));
+        }
+        let queries = per(started, views);
+        eprintln!(
+            "own bytes on this card: one copy as before {before:.1} us (made not resident {made_us:.1}, MakeResident {resident_us:.1}, \
+             the mapped wait {mapped_us:.1}); committed and resident, no wait {resident:.1} us; placed in a block {placed_us:.2} us \
+             (a block made {block_ms:.2} ms); eight threads asking, 1 in 7 for a new copy: as before {old_ask:.2} us an asking \
+             ({old_wall:.0} ms wall), placed with the map as before {half_ask:.2} us ({half_wall:.0} ms wall), now \
+             {new_ask:.2} us ({new_wall:.0} ms wall), {hit_ask:.3} us asking only for copies \
+             there, {miss_alone:.2} us a new copy on one thread; a frame's 2,900 askings of run nb1: \
+             {old_frame:.0} ms of the threads before, {half_frame:.0} ms placed with the map as before, {new_frame:.1} ms now; \
+             a view made beside the heap {made_view:.3} us, \
+             copied in {copied_view:.3} us, made in the shader-visible heap {made_in_visible:.3} us; GetDesc, the address \
+             and a reference counted {queries:.3} us ({sum})"
+        );
+        assert!(placed_us * 10.0 < before, "placed {placed_us:.1} us against {before:.1} us before");
+        assert!(new_ask * 4.0 < old_ask, "an asking {new_ask:.2} us against {old_ask:.2} us before");
+    }
 }

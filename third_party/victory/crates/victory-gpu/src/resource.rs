@@ -2777,10 +2777,17 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
     {
-        tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-        texture = None;
+        match crate::host::resident(&host.device, t) {
+            // Waited for where a slot shows it (`crate::host::mapping::shown`).
+            Ok(()) => {
+                crate::host::mapping::made(&host.device, t, crate::host::mapping::What::Texture);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
+                texture = None;
+            }
+        }
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {

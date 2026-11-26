@@ -3080,7 +3080,11 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                // Its raw twin only where heaps have twins to copy it into
+                // (`raw_twins`; none on a host that caps its heaps, as
+                // NVIDIA's: 13,386 twins a frame made for nothing in run nb1).
+                let twin_at = (victory_shader::emit::raw_views() != 0).then(|| views.slot(at + 1));
+                let kept = make_twinned(&view, views.slot(at), twin_at)?;
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
@@ -3088,11 +3092,12 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
+                let twin_made = twin_at.is_some();
+                views.made.insert(words, ListView { view, at, twin, twin_made, stride_word, kept, listed });
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
+            if made.twin && made.twin_made && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
@@ -3202,6 +3207,7 @@ impl HostHeap {
                 },
             },
         };
+        crate::host::mapping::shown(buffer);
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device
@@ -3244,6 +3250,7 @@ impl HostHeap {
                 },
             },
         };
+        crate::host::mapping::shown(buffer);
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device.CreateUnorderedAccessView(
@@ -3315,6 +3322,7 @@ impl HostHeap {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
         };
+        crate::host::mapping::shown(buffer);
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -3386,6 +3394,7 @@ impl HostHeap {
             SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
         };
         let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
+        crate::host::mapping::shown(buffer);
         // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
         // zero location makes a null constant buffer view).
         unsafe {
@@ -4203,6 +4212,7 @@ fn buffer_srv(
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     }
     let host = host()?;
+    crate::host::mapping::shown(&shadow.buffer);
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -4326,6 +4336,7 @@ fn buffer_uav(
         return None;
     }
     let host = host()?;
+    crate::host::mapping::shown(&shadow.buffer);
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -4617,6 +4628,7 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            crate::host::mapping::shown(&shadow.buffer);
             if crate::port_cbv::on() {
                 // Renderer port 5: shaders read constant buffers as raw bytes
                 // through the twin; a constant buffer view there would be read
@@ -4713,6 +4725,7 @@ fn make_twinned(
                 {
                     show_prefilled(desc, prefilled);
                 }
+                crate::host::mapping::shown(texture);
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4774,6 +4787,7 @@ fn make_twinned(
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
+            crate::host::mapping::shown(texture);
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
@@ -6442,6 +6456,41 @@ mod tests {
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
     }
+
+    /// A list's own descriptor of a buffer view gets a raw twin only where
+    /// the heaps have twins to copy it into: on a host without them (NVIDIA
+    /// caps its heaps) every list made one for nothing, 13,386 a frame in
+    /// run nb1 ("raw twins of buffer views made per frame").
+    #[test]
+    fn listed_views_get_raw_twins_only_where_heaps_have_them() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut desc = [0u32; 16];
+        // A raw view of 64 dwords (R32 typeless, raw flag).
+        desc[..10].copy_from_slice(&[39, 1, 5768, 0, 0, 0, 64, 0, 1, 0]);
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let view = View::Placed(false, resource, desc);
+        let mut record = [0u32; 8];
+        crate::descriptor::record(record.as_mut_ptr() as u64, view);
+        let words = [record[0], record[1], record[2]];
+        let s0 = heap.dynamic(1).unwrap();
+        // On a thread of its own: its own descriptors.
+        let made = std::thread::scope(|s| {
+            s.spawn(|| {
+                heap.make_listed(0x5678, words, s0)?;
+                LIST_VIEWS.with(|views| views.borrow().as_ref().and_then(|v| v.made.get(&words).map(|m| (m.twin, m.twin_made))))
+            })
+            .join()
+            .unwrap()
+        });
+        let twins = victory_shader::emit::raw_views() != 0;
+        assert_eq!(made, Some((true, twins)), "a raw twin made: only with twins in the heaps ({twins})");
+        assert_eq!(heap.twins.get(s0 as usize).is_some(), twins);
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -6462,6 +6511,8 @@ struct ListView {
     /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
     at: u32,
     twin: bool,
+    /// Whether that raw twin was made (only where heaps have twins).
+    twin_made: bool,
     stride_word: u32,
     kept: Kept,
     listed: Listed,
