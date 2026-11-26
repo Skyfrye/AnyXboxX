@@ -89,6 +89,11 @@ impl<'a> Pass<'a> {
         Pass { list }
     }
 
+    /// The host list, for what is kept until it has run.
+    pub(crate) fn host_list(&self) -> &'a HostList {
+        self.list
+    }
+
     /// The host `ID3D12GraphicsCommandList` (no reference taken), with the
     /// state changes asked for so far recorded first.
     pub fn command_list(&self) -> *mut c_void {
@@ -157,4 +162,22 @@ pub fn record(list: *const c_void, work: impl FnOnce(&mut Pass) + Send + 'static
             work(&mut Pass::new(host));
         }),
     )
+}
+
+/// Runs `work` on a host list of its own and waits for the card to have run
+/// it: for a library's setup work (DLSS records some when its feature is
+/// made). What `work` returns, or `None` without a host GPU.
+pub(crate) fn run_now<T>(work: impl FnOnce(&Pass) -> T) -> Option<T> {
+    let host = crate::host::host()?;
+    let list = match host.new_list() {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(error = %e, "no host list for a library's setup");
+            return None;
+        }
+    };
+    let done = work(&Pass::new(&list));
+    list.close();
+    host.execute_sync_internal(&list);
+    Some(done)
 }
