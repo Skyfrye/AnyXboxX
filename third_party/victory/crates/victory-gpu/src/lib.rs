@@ -109,6 +109,8 @@ pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]
+mod vram;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod pagegen;

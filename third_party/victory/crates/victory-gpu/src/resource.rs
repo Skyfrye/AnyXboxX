@@ -1304,6 +1304,9 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// The texture block it lies in (`crate::pool`), if it does: the sweep
+    /// lets textures go by whole blocks (`crate::vram::plan`).
+    block: Option<u32>,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1892,12 +1895,24 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
-        }
+        Some([budget, used, ..]) => counted_in_use(used) < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// The card's memory in use as the texture queue ([`room`]) and the sweep
+/// ([`let_go_idle`]) count it, from what the system says is in use
+/// (`used`): as the system counts it, less the blocks on their way back to
+/// it ([`crate::vram::system_room`]; off: less the bytes free in texture
+/// blocks, which the system counts as used), with what is kept for card
+/// copies of title buffers not made yet (`crate::shadow::card_room_kept`)
+/// and for the render targets a world makes in its first frame
+/// ([`targets_room_kept`]).
+#[cfg(windows)]
+pub(crate) fn counted_in_use(used: u64) -> u64 {
+    let system = crate::vram::system_room();
+    let (free, back) = if system { (0, crate::pool::giving_back()) } else { (crate::pool::texture_room(), 0) };
+    crate::vram::counted(used, free, back, system) + crate::shadow::card_room_kept() + targets_room_kept()
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2242,30 +2257,112 @@ pub(crate) fn let_go_idle() {
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
-            crate::host::vram_keep(budget, used)
-        }
+        Some([budget, used, ..]) if keep => crate::host::vram_keep(budget, counted_in_use(used)),
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    // With a limit, the longest idle first.
+    // With a limit, the longest idle first; as the system counts
+    // (`crate::vram::system_room`), by what their going gives back to it:
+    // whole blocks (`crate::vram::plan`).
+    let by_blocks = most != u64::MAX && crate::vram::system_room();
     let mut by_age: Vec<(u64, usize)> = Vec::new();
+    let mut idle: Vec<crate::vram::Idle> = Vec::new();
     if most != u64::MAX {
         for &at in all.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+                continue;
+            }
+            if !by_blocks {
                 by_age.push((used & 0xffff_ffff, at));
+                continue;
+            }
+            // Only those that may go now (as below): a block is let go only
+            // with every texture in it. (One whose lock is held is in use.)
+            if crate::texture::host_wrote(at) {
+                continue;
+            }
+            let Ok(made) = r.host.made.try_lock() else { continue };
+            if let Some((host, _)) = made.as_ref()
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) == 1
+            {
+                idle.push(crate::vram::Idle { at, block: host.block, bytes: host.bytes, used: used & 0xffff_ffff });
             }
         }
         by_age.sort_unstable();
+    }
+    // Lets the host copy of `at` go if it may go still: its bytes.
+    let let_go = |at: usize| -> Option<u64> {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        // (Without its lock first: most were used lately or have none.)
+        let used = r.host.used.load(Relaxed);
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+            return None;
+        }
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let may_go = made.as_ref().is_some_and(|(host, _)| {
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                    && std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+            });
+            if may_go {
+                // Under the lock: the next use must not find the staging
+                // state of the texture let go (it says "uploaded").
+                crate::texture::unstage(at as This);
+                r.host.wanted.store(u32::MAX, Relaxed);
+                made.take()
+            } else {
+                None
+            }
+        };
+        let (host, _) = gone?;
+        r.host.gone.store(true, Relaxed);
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        let bytes = host.bytes;
+        crate::host::retire(host);
+        Some(bytes)
+    };
+    let began = std::time::Instant::now();
+    if by_blocks {
+        // The bytes given back to the system.
+        let mut gave = 0u64;
+        let lives = crate::pool::texture_lives();
+        for unit in crate::vram::plan(&idle, &lives, crate::pool::BLOCK) {
+            if gave >= most {
+                break;
+            }
+            let mut whole = true;
+            for &at in &unit.textures {
+                match let_go(at) {
+                    Some(b) => {
+                        went += 1;
+                        bytes += b;
+                        first.get_or_insert(at);
+                    }
+                    None => whole = false,
+                }
+            }
+            if !whole {
+                crate::vram::LET_GO[2].fetch_add(1, Relaxed);
+                continue;
+            }
+            gave += unit.gives;
+            crate::vram::LET_GO[0].fetch_add(1, Relaxed);
+            crate::vram::LET_GO[1].fetch_add(unit.gives, Relaxed);
+            if let Some(block) = unit.block {
+                crate::pool::drain(&[block]);
+            }
+        }
     }
     // Without one, while textures are kept for minutes, a part of them at
     // each look, the next one at the next: a play has over 100,000
@@ -2283,7 +2380,6 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
-    let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
         if bytes >= most {
             break;
@@ -2292,41 +2388,10 @@ pub(crate) fn let_go_idle() {
         if part == PART {
             FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
         }
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
-        // (Without its lock first: most were used lately or have none.)
-        let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
-            continue;
-        }
-        let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
-            } else {
-                None
-            }
-        };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+        if let Some(b) = let_go(at) {
             went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
-            }
-            crate::host::retire(host);
+            bytes += b;
+            first.get_or_insert(at);
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
@@ -2493,6 +2558,7 @@ impl HostTexture {
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        let block = crate::pool::block_of(&texture);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2507,6 +2573,7 @@ impl HostTexture {
             prefill: Default::default(),
             prefilled: Default::default(),
             flags,
+            block,
         }
     }
 
@@ -2534,6 +2601,7 @@ impl HostTexture {
             prefill: Default::default(),
             prefilled: Default::default(),
             flags,
+            block: None,
         }
     }
 }
