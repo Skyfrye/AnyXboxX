@@ -1032,7 +1032,9 @@ fn create() -> windows::core::Result<Host> {
         // 1,000-1,200 ms a frame, and 830-950 ms from the moment they
         // stopped (run 54, 08:32:01 to 08:32:06). Left as it is by default:
         // whether the card is slower with the shaders it then keeps is not
-        // known.
+        // known. Without Windows' Developer Mode the runtime refuses. The
+        // threads run at idle priority already, made so by the runtime
+        // (`crate::background`): nothing of ours lowers them further.
         if std::env::var_os("VICTORY_D3D12_BACKGROUND").is_some_and(|v| v == "0")
             && let Ok(device6) = device.cast::<ID3D12Device6>()
         {
@@ -1042,7 +1044,14 @@ fn create() -> windows::core::Result<Host> {
                 None,
                 None,
             );
-            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
+            match set {
+                Ok(()) => tracing::info!("the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)"),
+                Err(e) => tracing::info!(
+                    error = %e,
+                    "the host refused to switch its background shader work off (VICTORY_D3D12_BACKGROUND=0; \
+                     Windows' Developer Mode is needed): it goes on, on the runtime's threads at idle priority"
+                ),
+            }
         }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32

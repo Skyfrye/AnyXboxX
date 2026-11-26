@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(all(windows, test))]
+mod background;
 #[cfg(windows)]
 mod lightprobe;
 #[cfg(windows)]
