@@ -1351,6 +1351,11 @@ struct Hosted {
     wanted: std::sync::atomic::AtomicU32,
     /// The next host copy takes the place of one with fewer levels.
     grown: std::sync::atomic::AtomicBool,
+    /// The texture block its host copy lies in (`crate::pool`;
+    /// `crate::vram::OWN`: memory of its own; `crate::vram::NO_COPY`: no
+    /// copy), for the sweep's first look, which takes no lock
+    /// ([`let_go_idle`]). Set with the copy, under `made`'s lock.
+    block: std::sync::atomic::AtomicU32,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1514,6 +1519,7 @@ pub(crate) fn want_level(this: This, first: u32) {
     crate::texture::unstage(this);
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
+    r.host.block.store(crate::vram::NO_COPY, Relaxed);
     if let Some(old) = made.take() {
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
@@ -1826,6 +1832,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        r.host.block.store(host.block.unwrap_or(crate::vram::OWN), Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -2224,6 +2231,41 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// [`let_go_idle`] by whole blocks: of the idle host copies `candidates`
+/// (when last used, the title texture, its copy's block as read with no
+/// lock), those that may go now and whose going may give memory back to
+/// the system, with what [`crate::vram::plan`] needs. Only those
+/// [`crate::vram::worth_asking`] says are asked their lock and references,
+/// and the host GPU's writes are looked up once. The caller holds the
+/// table of resources.
+#[cfg(windows)]
+fn whole_units_idle(candidates: &[(u64, usize, u32)], lives: &[u32]) -> Vec<crate::vram::Idle> {
+    let blocks: Vec<u32> = candidates.iter().map(|c| c.2).collect();
+    let worth = crate::vram::worth_asking(&blocks, lives);
+    if !worth.contains(&true) {
+        return Vec::new();
+    }
+    let written = crate::texture::host_written_now();
+    let mut idle = Vec::new();
+    for (&(used, at, _), _) in candidates.iter().zip(&worth).filter(|(_, worth)| **worth) {
+        if written.contains(&at) {
+            continue;
+        }
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock the caller holds (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        // (One whose lock is held is in use.)
+        let Ok(made) = r.host.made.try_lock() else { continue };
+        if let Some((host, _)) = made.as_ref()
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) == 1
+        {
+            idle.push(crate::vram::Idle { at, block: host.block, bytes: host.bytes, used });
+        }
+    }
+    idle
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2296,7 +2338,9 @@ pub(crate) fn let_go_idle() {
     // whole blocks (`crate::vram::plan`).
     let by_blocks = most != u64::MAX && crate::vram::system_room();
     let mut by_age: Vec<(u64, usize)> = Vec::new();
-    let mut idle: Vec<crate::vram::Idle> = Vec::new();
+    // By whole blocks: the idle ones by their atomics alone (when last used,
+    // the block their copy lies in), with no lock.
+    let mut candidates: Vec<(u64, usize, u32)> = Vec::new();
     if most != u64::MAX {
         for &at in all.iter() {
             // SAFETY: as below.
@@ -2305,25 +2349,16 @@ pub(crate) fn let_go_idle() {
             if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
                 continue;
             }
-            if !by_blocks {
+            if by_blocks {
+                candidates.push((used & 0xffff_ffff, at, r.host.block.load(Relaxed)));
+            } else {
                 by_age.push((used & 0xffff_ffff, at));
-                continue;
-            }
-            // Only those that may go now (as below): a block is let go only
-            // with every texture in it. (One whose lock is held is in use.)
-            if crate::texture::host_wrote(at) {
-                continue;
-            }
-            let Ok(made) = r.host.made.try_lock() else { continue };
-            if let Some((host, _)) = made.as_ref()
-                && std::sync::Arc::strong_count(host) == 1
-                && crate::host::references(&host.texture) == 1
-            {
-                idle.push(crate::vram::Idle { at, block: host.block, bytes: host.bytes, used: used & 0xffff_ffff });
             }
         }
         by_age.sort_unstable();
     }
+    let lives = if by_blocks { crate::pool::texture_lives() } else { Vec::new() };
+    let idle = if by_blocks { whole_units_idle(&candidates, &lives) } else { Vec::new() };
     // Lets the host copy of `at` go if it may go still: its bytes.
     let let_go = |at: usize| -> Option<u64> {
         // SAFETY: a texture leaves the table before it is freed, under the
@@ -2346,6 +2381,7 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
+                r.host.block.store(crate::vram::NO_COPY, Relaxed);
                 made.take()
             } else {
                 None
@@ -2362,7 +2398,6 @@ pub(crate) fn let_go_idle() {
     if by_blocks {
         // The bytes given back to the system.
         let mut gave = 0u64;
-        let lives = crate::pool::texture_lives();
         for unit in crate::vram::plan(&idle, &lives, crate::pool::BLOCK) {
             if gave >= most {
                 break;
@@ -3067,6 +3102,7 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
+            block: std::sync::atomic::AtomicU32::new(crate::vram::NO_COPY),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).

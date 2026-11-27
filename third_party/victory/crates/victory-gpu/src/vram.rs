@@ -48,6 +48,38 @@ pub(crate) struct Idle {
     pub(crate) used: u64,
 }
 
+/// The block of a title texture's host copy as the sweep's first look
+/// reads it, with no lock (`crate::resource`): a block's number, or these.
+/// A copy with memory of its own.
+pub(crate) const OWN: u32 = u32::MAX - 1;
+/// No copy.
+pub(crate) const NO_COPY: u32 = u32::MAX;
+
+/// Of idle host copies, their blocks as read with no lock (`blocks`), the
+/// ones worth asking their lock and references: those with memory of their
+/// own, and those of blocks with as many idle copies as live pieces
+/// (`lives`, by block number). A copy in a block that holds one in use, or
+/// another texture, would give nothing back; one with no copy has nothing
+/// to give. (Every idle copy was asked, once a second under pressure, on the
+/// submitting thread, the bottleneck: 100,000 and more of them, with a
+/// global lock each. Round 2's review, item 7.)
+pub(crate) fn worth_asking(blocks: &[u32], lives: &[u32]) -> Vec<bool> {
+    let mut idle_in = vec![0u32; lives.len()];
+    for &block in blocks {
+        if let Some(n) = idle_in.get_mut(block as usize) {
+            *n += 1;
+        }
+    }
+    blocks
+        .iter()
+        .map(|&block| match block {
+            OWN => true,
+            NO_COPY => false,
+            block => idle_in.get(block as usize).is_some_and(|&n| lives.get(block as usize) == Some(&n)),
+        })
+        .collect()
+}
+
 /// Host copies the sweep lets go together, and the bytes that gives back
 /// to the system; `block`: the block they all lie in.
 #[derive(Debug, PartialEq)]
@@ -313,5 +345,20 @@ mod tests {
         let idle = [idle(1, Some(0), 64 << 10, 50), idle(2, Some(1), 64 << 10, 40)];
         let plan = plan(&idle, &lives, BLOCK);
         assert_eq!(plan.iter().map(|u| u.block).collect::<Vec<_>>(), vec![Some(1), Some(0)]);
+    }
+
+    /// The sweep's first look asks only the idle copies whose going may give
+    /// memory back: copies of their own, and those of blocks all of whose
+    /// pieces are idle copies; not those of a block with a piece in use, nor
+    /// textures with no copy. (Every idle copy was asked its lock and
+    /// references. Round 2's review, item 7.)
+    #[test]
+    fn the_sweep_asks_only_copies_whose_going_gives_memory_back() {
+        // Block 0: two pieces, both idle; block 1: three, two idle; block 2:
+        // one idle of none live (a stale number).
+        let lives = [2, 3, 0];
+        let blocks = [0, 1, OWN, 0, 1, NO_COPY, 2, 7];
+        assert_eq!(worth_asking(&blocks, &lives), vec![true, false, true, true, false, false, false, false]);
+        assert_eq!(worth_asking(&[], &lives), Vec::<bool>::new());
     }
 }

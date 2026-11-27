@@ -660,6 +660,12 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .is_some_and(|set| set.contains(&resource))
 }
 
+/// [`host_wrote`] of many at once: the resources the host GPU wrote, now
+/// (one look at the lock for the sweep, not one a texture).
+pub(crate) fn host_written_now() -> std::collections::HashSet<usize> {
+    HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
