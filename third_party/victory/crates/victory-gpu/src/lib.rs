@@ -17,7 +17,7 @@
 
 #[cfg(windows)]
 mod ambient;
-#[cfg(all(windows, test))]
+#[cfg(windows)]
 mod background;
 #[cfg(windows)]
 pub mod bands;

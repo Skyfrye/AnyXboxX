@@ -1058,6 +1058,8 @@ fn create() -> windows::core::Result<Host> {
                 ),
             }
         }
+        // Where the runtime's background threads run (`VICTORY_BACKGROUND_CORES`).
+        crate::background::confine();
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();

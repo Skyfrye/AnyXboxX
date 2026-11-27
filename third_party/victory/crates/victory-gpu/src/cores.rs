@@ -31,6 +31,47 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
     sets
 }
 
+/// The logical processors of group 0 (a bit each, for an affinity mask) of
+/// the `n` cores of the lowest numbers; 0 if the system says nothing.
+pub(crate) fn first_cores_mask(n: usize) -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut bytes = 0u32;
+    // SAFETY: as for `cpu_sets`.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above.
+    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    // (core, logical processor)
+    let mut all: Vec<(u8, u8)> = Vec::new();
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: the record's type is CpuSet (the only one there is).
+        let set = unsafe { &info.Anonymous.CpuSet };
+        if set.Group == 0 {
+            all.push((set.CoreIndex, set.LogicalProcessorIndex));
+        }
+        at += info.Size as usize;
+    }
+    mask_of_first_cores(&all, n)
+}
+
+/// [`first_cores_mask`] of (core, logical processor) pairs.
+fn mask_of_first_cores(all: &[(u8, u8)], n: usize) -> usize {
+    let mut cores: Vec<u8> = all.iter().map(|c| c.0).collect();
+    cores.sort_unstable();
+    cores.dedup();
+    let first = &cores[..n.min(cores.len())];
+    all.iter()
+        .filter(|c| first.contains(&c.0) && usize::from(c.1) < usize::BITS as usize)
+        .fold(0, |mask, c| mask | 1 << c.1)
+}
+
 /// The bytes of the last-level cache each processor set of group 0 shares,
 /// by set id (none known: empty).
 fn l3_of_sets() -> Vec<(u32, u32)> {
@@ -309,6 +350,23 @@ fn ask(what: &str, from: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first cores' logical processors, both of each core, by the
+    /// cores' numbers whatever the order the system says them in.
+    #[test]
+    fn the_first_cores_are_those_of_the_lowest_numbers() {
+        // Eight cores of two threads each (9800X3D), said core by core.
+        let eight: Vec<(u8, u8)> = (0..16).map(|p| (p / 2 * 2, p)).collect();
+        assert_eq!(mask_of_first_cores(&eight, 1), 0b11);
+        assert_eq!(mask_of_first_cores(&eight, 2), 0b1111);
+        assert_eq!(mask_of_first_cores(&eight, 99), 0xffff);
+        assert_eq!(mask_of_first_cores(&eight, 0), 0);
+        // Said in another order, threads of a core apart.
+        let apart: Vec<(u8, u8)> = (0..8).map(|p| (p % 4, p)).rev().collect();
+        assert_eq!(mask_of_first_cores(&apart, 1), 0b1_0001);
+        assert_eq!(mask_of_first_cores(&[], 1), 0);
+        assert_ne!(first_cores_mask(1), 0);
+    }
 
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
