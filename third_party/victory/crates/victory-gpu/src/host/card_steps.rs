@@ -479,13 +479,71 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, false)?;
     let (does, steps) = does_of(&written, runs);
     let mut behind = None;
-    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
+    let planned = plan(&does, stage(), true, &mut behind);
+    if planned != Err(BEHIND_PLACED) {
+        // Not cut: the submission's steps on the card are planned from the
+        // same, unless flights landed meanwhile ([`Planned`]).
+        Planned::keep(runs, written, does, steps, planned);
         return None;
     }
     let (placed, reader) = behind?;
     let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
     let cut = place(placed)? + 1;
     (place(reader)? >= cut).then_some(cut)
+}
+
+/// What [`cut_for`] found for a submission it did not cut: [`does_of`] and
+/// [`plan`] of its lists, for [`Host::take_steps`] to take instead of making
+/// them again (the two were 2% of the submitting thread's time each time,
+/// run s2-prof1). Taken at the submission's next look at its steps
+/// ([`Host::card_steps`]), and used only for the same lists (by address,
+/// [`HostList::epoch`] and number of steps) and the same ranges flights
+/// write. `VICTORY_PLAN_ONCE=0`: made again.
+struct Planned {
+    lists: Vec<(usize, u64, usize)>,
+    written: Vec<(usize, usize)>,
+    does: Vec<Does>,
+    steps: Vec<(usize, usize)>,
+    chosen: Result<Vec<(usize, u32)>, &'static str>,
+}
+
+/// What [`Planned::for_these`] gives.
+type PlannedSteps = (Vec<Does>, Vec<(usize, usize)>, Result<Vec<(usize, u32)>, &'static str>);
+
+thread_local! {
+    /// The submitting thread's [`Planned`].
+    static PLANNED: std::cell::RefCell<Option<Planned>> = const { std::cell::RefCell::new(None) };
+}
+
+impl Planned {
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PLAN_ONCE").is_none_or(|v| v != "0"))
+    }
+
+    /// The lists, by address and the number of what they hold now (a list
+    /// reset and taken again has another), each with its number of steps.
+    fn lists(runs: &[&HostList]) -> Vec<(usize, u64, usize)> {
+        runs.iter().map(|l| (std::ptr::from_ref::<HostList>(l) as usize, l.epoch(), l.deferred().copies.len())).collect()
+    }
+
+    fn keep(runs: &[&HostList], written: Vec<(usize, usize)>, does: Vec<Does>, steps: Vec<(usize, usize)>, chosen: Result<Vec<(usize, u32)>, &'static str>) {
+        if !Self::on() {
+            return;
+        }
+        let lists = Self::lists(runs);
+        PLANNED.with_borrow_mut(|p| *p = Some(Planned { lists, written, does, steps, chosen }));
+    }
+
+    /// What was kept, whatever it was for.
+    fn take() -> Option<Planned> {
+        PLANNED.with_borrow_mut(Option::take)
+    }
+
+    /// What it holds, if it was kept for these lists and flights' ranges.
+    fn for_these(self, runs: &[&HostList], written: &[(usize, usize)]) -> Option<PlannedSteps> {
+        (self.written == written && self.lists == Self::lists(runs)).then_some((self.does, self.steps, self.chosen))
+    }
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -732,6 +790,8 @@ impl Host {
     /// ([`stage`]), the list that does them. `None` if nothing is in the
     /// way or the old wait is due. Under the submission lock.
     pub(super) fn card_steps(&self, runs: &[&HostList]) -> Option<Taken> {
+        // (Whatever this submission does with it.)
+        let kept = Planned::take();
         if stage() == 0 || !relay_exact() {
             return None;
         }
@@ -749,7 +809,7 @@ impl Host {
         let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
-            self.take_steps(&written, runs)
+            self.take_steps(&written, runs, kept)
         };
         match taken {
             Ok(taken) => taken,
@@ -763,10 +823,17 @@ impl Host {
         }
     }
 
-    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList], kept: Option<Planned>) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let (does, steps, chosen) = match kept.and_then(|kept| kept.for_these(runs, written)) {
+            Some(planned) => planned,
+            None => {
+                let (does, steps) = does_of(written, runs);
+                let chosen = plan(&does, stage(), placed_order(), &mut None);
+                (does, steps, chosen)
+            }
+        };
+        let chosen = chosen?;
         if chosen.is_empty() {
             return Ok(None);
         }
