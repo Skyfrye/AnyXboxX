@@ -38,7 +38,7 @@
 //! copy queue (`VICTORY_RELAY_COPY=1`). Not measured under vkd3d-proton.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -136,7 +136,8 @@ pub(crate) fn take_times() {
 }
 
 /// Pairs for passes of ours, used in turn by blocks of [`BLOCK`]: some
-/// hundreds of blocks a frame, read every second.
+/// hundreds of blocks a frame. Read a quarter of the ring ahead of where
+/// pairs are taken ([`ahead`]), and all of them every second.
 const PAIRS: u32 = 65536;
 /// A list takes pairs this many at a time, and resolves those it used in
 /// one call when it is closed: a resolve of its own behind each pair cost
@@ -145,18 +146,108 @@ const PAIRS: u32 = 65536;
 const BLOCK: u32 = 8;
 /// Pairs for whole submissions, with their lists made ahead: some thirty a
 /// frame; one is taken again some fifteen frames later, when its lists
-/// have long run.
+/// have long run. A second's line alone read them only up to some 18
+/// frames a second (512 submissions); a quarter of the ring is read ahead of
+/// where they are taken ([`ahead`]), at any rate.
 const WHOLE: u32 = 512;
+
+/// The PC's side of the pairs: per pair, what it is out for, and the tick
+/// counts the card resolves into.
+struct Slots {
+    /// Per pair: in the low byte its kind's index plus one (0: not out, or
+    /// read), above it the times the pair was taken, so that a pair read as
+    /// it is taken again is never taken for the old one.
+    kinds: Box<[AtomicU32]>,
+    /// The mapping the card resolves into: two tick counts per pair.
+    back: usize,
+}
+
+/// What [`Slots::gather`] read.
+#[derive(Default, Debug, PartialEq)]
+struct Gathered {
+    /// By kind: ticks, pairs.
+    sums: [[u64; 2]; KINDS],
+    /// Pairs whose times made no sense (the second before the first, or a
+    /// second apart).
+    odd: u64,
+}
+
+impl Slots {
+    /// Slots for `pairs` pairs, whose tick counts are at `back` (16 bytes a
+    /// pair, zeroed, live as long as these).
+    fn new(pairs: u32, back: usize) -> Slots {
+        Slots {
+            kinds: (0..pairs).map(|_| AtomicU32::new(0)).collect(),
+            back,
+        }
+    }
+
+    /// The two tick counts of pair `at`.
+    fn stamps(&self, at: u32) -> [&AtomicU64; 2] {
+        // SAFETY: the mapping holds two aligned tick counts per pair; the
+        // card writes them whole, the PC through these.
+        [0, 1].map(|i| unsafe { &*((self.back + 16 * at as usize + 8 * i) as *const AtomicU64) })
+    }
+
+    /// Pair `at` is taken for `kind`: whether it was out and not read yet
+    /// (its times are lost).
+    fn out(&self, at: u32, kind: Kind) -> bool {
+        for stamp in self.stamps(at) {
+            stamp.store(0, Ordering::Relaxed);
+        }
+        let taken = |was: u32| Some(((was >> 8).wrapping_add(1) << 8) | (kind.index() as u32 + 1));
+        let was = self.kinds[at as usize].fetch_update(Ordering::AcqRel, Ordering::Relaxed, taken).unwrap_or(0);
+        was & 0xff != 0
+    }
+
+    /// The pairs of `range` the card has written are read into `into`, each
+    /// once; `most` ticks is a second.
+    fn gather(&self, range: std::ops::Range<u32>, most: u64, into: &mut Gathered) {
+        for at in range {
+            let was = self.kinds[at as usize].load(Ordering::Acquire);
+            let kind = (was & 0xff) as usize;
+            if kind == 0 {
+                continue;
+            }
+            let [from, to] = self.stamps(at).map(|s| s.load(Ordering::Relaxed));
+            if from == 0 || to == 0 {
+                continue;
+            }
+            // Taken again meanwhile (another time above the kind): those
+            // ticks may be the new pair's, read next time.
+            if self.kinds[at as usize].compare_exchange(was, was & !0xff, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                continue;
+            }
+            match to.checked_sub(from).filter(|&ticks| ticks < most) {
+                Some(ticks) => {
+                    let sums = &mut into.sums[(kind - 1).min(KINDS - 1)];
+                    sums[0] += ticks;
+                    sums[1] += 1;
+                }
+                None => into.odd += 1,
+            }
+        }
+    }
+}
+
+/// Of a ring of `len` pairs, when the pair `first` is taken: the quarter of
+/// the ring to read now, the one after the quarter `first` begins, if it
+/// begins one. Its pairs were taken three quarters of the ring ago, and
+/// their lists have run; read now they are not taken again unread.
+fn ahead(first: u32, len: u32) -> Option<std::ops::Range<u32>> {
+    let quarter = len / 4;
+    (first % quarter == 0).then(|| {
+        let next = (first / quarter + 1) % 4;
+        next * quarter..(next + 1) * quarter
+    })
+}
 
 struct Clock {
     heap: ID3D12QueryHeap,
     buffer: ID3D12Resource,
-    /// The mapping of `buffer`: two tick counts per pair.
-    back: usize,
     /// Card ticks per millisecond.
     per_ms: f64,
-    /// Per pair: 0 not out, else its kind's index plus one.
-    kinds: Box<[AtomicU8]>,
+    slots: Slots,
     /// For whole submissions: the list in front of one and the list behind.
     ends: Vec<(ID3D12CommandList, ID3D12CommandList)>,
     _allocator: ID3D12CommandAllocator,
@@ -176,9 +267,8 @@ static SUMS: [[AtomicU64; 2]; KINDS] = [const { [const { AtomicU64::new(0) }; 2]
 /// Since the last line: pairs read whose times made no sense (the second
 /// before the first, or a second apart).
 static ODD: AtomicU64 = AtomicU64::new(0);
-/// [`NEXT`] at the last gathering: more than [`PAIRS`] taken since then
-/// overwrote some before they were read.
-static GATHERED: AtomicU32 = AtomicU32::new(0);
+/// Since the last line: pairs taken again before they were read (their
+/// lists had not run, or the ring came round first).
 static OVERWRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Since the last line: resolves recorded (one per block of a list, one
 /// per submission).
@@ -244,9 +334,8 @@ fn make(host: &Host) -> windows::core::Result<Clock> {
         Ok(Clock {
             heap,
             buffer,
-            back: back as usize,
             per_ms: frequency.max(1) as f64 / 1e3,
-            kinds: (0..pairs).map(|_| AtomicU8::new(0)).collect(),
+            slots: Slots::new(pairs, back as usize),
             ends,
             _allocator: allocator,
         })
@@ -254,19 +343,24 @@ fn make(host: &Host) -> windows::core::Result<Clock> {
 }
 
 impl Clock {
-    /// The two tick counts of pair `at`.
-    fn stamps(&self, at: u32) -> [&AtomicU64; 2] {
-        // SAFETY: the mapping holds two aligned tick counts per pair; the
-        // card writes them whole, the PC through these.
-        [0, 1].map(|i| unsafe { &*((self.back + 16 * at as usize + 8 * i) as *const AtomicU64) })
-    }
-
     /// Pair `at` is taken for `kind`.
     fn out(&self, at: u32, kind: Kind) {
-        for stamp in self.stamps(at) {
-            stamp.store(0, Ordering::Relaxed);
+        if self.slots.out(at, kind) {
+            OVERWRITTEN.fetch_add(1, Ordering::Relaxed);
         }
-        self.kinds[at as usize].store(kind.index() as u8 + 1, Ordering::Release);
+    }
+
+    /// The pairs of `range` the card has written are added to the sums.
+    fn gather(&self, range: std::ops::Range<u32>) {
+        let mut read = Gathered::default();
+        self.slots.gather(range, (self.per_ms * 1e3) as u64, &mut read);
+        for (sums, read) in SUMS.iter().zip(read.sums) {
+            if read[1] > 0 {
+                sums[0].fetch_add(read[0], Ordering::Relaxed);
+                sums[1].fetch_add(read[1], Ordering::Relaxed);
+            }
+        }
+        ODD.fetch_add(read.odd, Ordering::Relaxed);
     }
 }
 
@@ -293,6 +387,9 @@ impl Pairs {
             _ => {
                 // (`PAIRS` is a multiple of `BLOCK`: a block never wraps.)
                 let first = NEXT.fetch_add(BLOCK, Ordering::Relaxed) % PAIRS;
+                if let Some(quarter) = ahead(first, PAIRS) {
+                    clock.gather(quarter);
+                }
                 self.0.push((first, 1));
                 first
             }
@@ -357,47 +454,19 @@ pub(crate) fn timing<T>(list: &ID3D12GraphicsCommandList, record: impl FnOnce(&m
 pub(crate) fn whole() -> Option<(ID3D12CommandList, ID3D12CommandList)> {
     let clock = clock()?;
     let i = NEXT_WHOLE.fetch_add(1, Ordering::Relaxed) % WHOLE;
+    if let Some(quarter) = ahead(i, WHOLE) {
+        clock.gather(PAIRS + quarter.start..PAIRS + quarter.end);
+    }
     RESOLVES.fetch_add(1, Ordering::Relaxed);
     clock.out(PAIRS + i, Kind::Submission);
     let (front, behind) = &clock.ends[i as usize];
     Some((front.clone(), behind.clone()))
 }
 
-/// Adds the pairs the card has written to the sums.
-fn gather(clock: &Clock) {
-    let most = (clock.per_ms * 1e3) as u64;
-    let next = NEXT.load(Ordering::Relaxed);
-    let taken = next.wrapping_sub(GATHERED.swap(next, Ordering::Relaxed));
-    OVERWRITTEN.fetch_add(u64::from(taken.saturating_sub(PAIRS)), Ordering::Relaxed);
-    for at in 0..PAIRS + WHOLE {
-        let kind = clock.kinds[at as usize].load(Ordering::Acquire);
-        if kind == 0 {
-            continue;
-        }
-        let [from, to] = clock.stamps(at).map(|s| s.load(Ordering::Relaxed));
-        if from == 0 || to == 0 {
-            continue;
-        }
-        if clock.kinds[at as usize].compare_exchange(kind, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-            continue;
-        }
-        match to.checked_sub(from).filter(|&ticks| ticks < most) {
-            Some(ticks) => {
-                let sums = &SUMS[usize::from(kind - 1).min(KINDS - 1)];
-                sums[0].fetch_add(ticks, Ordering::Relaxed);
-                sums[1].fetch_add(1, Ordering::Relaxed);
-            }
-            None => {
-                ODD.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
 /// Since the last call, by kind: milliseconds and pairs.
 fn take() -> Option<[(f64, u64); KINDS]> {
     let clock = CLOCK.get()?.as_ref()?;
-    gather(clock);
+    clock.gather(0..PAIRS + WHOLE);
     Some(std::array::from_fn(|k| {
         let [ticks, pairs] = [0, 1].map(|i| SUMS[k][i].swap(0, Ordering::Relaxed));
         (ticks as f64 / clock.per_ms, pairs)
@@ -522,6 +591,80 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.SetComputeRootUnorderedAccessView(0, sum.GetGPUVirtualAddress());
             list.Dispatch(groups, 1, 1);
         }
+    }
+
+    /// [`Slots`] of `pairs` pairs over memory of the test's own, which
+    /// stands for what the card resolves into.
+    fn slots(pairs: u32) -> (Slots, Vec<u64>) {
+        let mut back = vec![0u64; 2 * pairs as usize];
+        let slots = Slots::new(pairs, back.as_mut_ptr() as usize);
+        (slots, back)
+    }
+
+    /// The card has run pair `at`'s list: its two tick counts are in.
+    fn ran(slots: &Slots, at: u32, ticks: u64) {
+        let [from, to] = slots.stamps(at);
+        from.store(1000, Ordering::Relaxed);
+        to.store(1000 + ticks, Ordering::Relaxed);
+    }
+
+    /// A pair taken again before it was read is said to be (its times are
+    /// lost); one read first is not. A pair is read once.
+    #[test]
+    fn a_pair_taken_again_before_it_was_read_is_counted() {
+        let (slots, _back) = slots(16);
+        assert!(!slots.out(5, Kind::Compares));
+        assert!(slots.out(5, Kind::Compares), "taken again unread");
+        ran(&slots, 5, 40);
+        let mut read = Gathered::default();
+        slots.gather(0..16, 1 << 20, &mut read);
+        assert_eq!(read.sums[Kind::Compares.index()], [40, 1]);
+        assert!(!slots.out(5, Kind::Planes), "read before it was taken again");
+        // Not run yet: not read.
+        let mut again = Gathered::default();
+        slots.gather(0..16, 1 << 20, &mut again);
+        assert_eq!(again, Gathered::default());
+    }
+
+    /// A pair taken again for the same kind is another pair to a gathering
+    /// that looked at it before: what it holds then is the new pair's, and
+    /// the gathering does not take it for the old one (nor drop the new one,
+    /// as it did when the slot said only the kind).
+    #[test]
+    fn a_pair_taken_again_for_the_same_kind_is_told_apart() {
+        let (slots, _back) = slots(4);
+        let _ = slots.out(1, Kind::Clamps);
+        let seen = slots.kinds[1].load(Ordering::Acquire);
+        let _ = slots.out(1, Kind::Clamps);
+        assert_ne!(slots.kinds[1].load(Ordering::Acquire), seen);
+        // What a gathering that saw the old one does: nothing.
+        assert!(slots.kinds[1].compare_exchange(seen, seen & !0xff, Ordering::AcqRel, Ordering::Relaxed).is_err());
+    }
+
+    /// Taking pairs round and round a ring, as lists do whose lists run
+    /// soon, every pair is read before it is taken again, at any rate: a
+    /// quarter of the ring is read each time a quarter begins.
+    #[test]
+    fn the_ring_is_read_a_quarter_ahead_of_where_pairs_are_taken() {
+        assert_eq!(ahead(0, 64), Some(16..32));
+        assert_eq!(ahead(48, 64), Some(0..16));
+        assert_eq!(ahead(8, 64), None);
+        assert_eq!(ahead(PAIRS / 4 * 3, PAIRS), Some(0..PAIRS / 4));
+        assert_eq!(ahead(WHOLE / 4, WHOLE), Some(WHOLE / 2..WHOLE / 4 * 3));
+        let (slots, _back) = slots(64);
+        let mut read = Gathered::default();
+        for n in (0..64 * 5).step_by(8) {
+            let first = n % 64;
+            if let Some(quarter) = ahead(first, 64) {
+                slots.gather(quarter, 1 << 20, &mut read);
+            }
+            for at in first..first + 8 {
+                assert!(!slots.out(at, Kind::Submission), "pair {at} of lap {} taken again unread", n / 64);
+                ran(&slots, at, 1);
+            }
+        }
+        // All but the last lap's last three quarters came in before the line.
+        assert_eq!(read.sums[Kind::Submission.index()][1], 64 * 5 - 48);
     }
 
     /// A pair around a pass says how long the pass ran, and is read once;
