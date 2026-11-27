@@ -63,14 +63,14 @@ with the presented one.
 | `--no-barriers` | no unordered-access barriers |
 | `--merge-barriers` | joins barrier calls with no work between them |
 | `--buffers vram` / `sysmem` | all buffers in the card's / the PC's memory |
-| `--only-buffers <what>` | with `--buffers`: only the buffers all of these match: `name=<text>`, `min=<bytes>`, `max=<bytes>`, `seen=No`, `Cached` or `Combined`, `id=<a>..<b>`, or `!` and one of them (repeatable) |
+| `--only-buffers <what>` | with `--buffers`: only the buffers all of these match: `name=<text>`, `min=<bytes>`, `max=<bytes>`, `seen=No`, `Cached` or `Combined`, `id=<a>..<b>`, `ids=<a>,<b>,...` (one of these: the buffers `--flow` names for some dispatches), or `!` and one of them (repeatable) |
 | `--listing 3..7` | only writes the frame's buffers and those lists' commands |
 | `--one-submit` | one `ExecuteCommandLists`, with a full wait between the former ones |
 | `--only 3..7` | runs these lists; of the others only barriers |
 | `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |
 | `--skip-shader <text>` | leaves out what runs pipelines with the text in their name or DXIL hash (repeatable) |
 | `--shaders <folder>` | takes shaders from the folder where it has them: `<hash>.dxil`, by the hash the runtime names the title's shader by (a pass of ours: its own DXIL hash); with `--compare --shaders-b <folder>` a second set, turn by turn with the first |
-| `--retranslate <folder>` | only writes that folder: the capture's shaders translated by this build with the `VICTORY_*` switches of this run (`--view-limit`, `--raw-views`: the view heap's null slot and where raw views start, as the capture's shaders have them) |
+| `--retranslate <folder>` | only writes that folder: the capture's shaders translated by this build with the `VICTORY_*` switches of this run (`--view-limit`, `--raw-views`: the view heap's null slot and where raw views start, as the capture's shaders have them). As for a host of 64-lane waves with RDNA float settings, unless `VICTORY_HOST_WAVE=32` names an NVIDIA host's waves (the forms and roundings that host gets; `VICTORY_HOST_RDNA=0`/`1` then sets the float settings, off with 32 lanes) |
 | `--no-restore` | leaves what a loop changed, and makes no copies to restore from (of a capture that does not fit in the card's memory with them) |
 | `--pace <ms>` | a wait after each submission sent: the card stands idle between them, as in a game that prepares the next one |
 | `--awake` | keeps the card's clocks up with the loop of `VICTORY_CARD_AWAKE`, on any card: NVIDIA's too, where `VICTORY_CARD_AWAKE=1` leaves it off (as `=always`; the loop halved the drawing queue there, so an A/B with it on NVIDIA shows that cost) |

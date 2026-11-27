@@ -466,8 +466,20 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    // As for a host of 64-lane waves with RDNA float settings, unless `VICTORY_HOST_WAVE`
+    // names the host's wave (32 on NVIDIA: the forms of wave64 programs and the f16
+    // roundings that host gets); `VICTORY_HOST_RDNA=0`/`1` then decides the float settings
+    // (on with 64 lanes, off with 32 when unset).
+    let wave = crate::translate::host_wave::select(
+        std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
+        std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
+        |message| println!("{message}"),
+    )
+    .unwrap_or(64);
+    let rdna = std::env::var_os("VICTORY_HOST_RDNA").map_or(wave == 64, |v| v != "0");
+    println!("translating for host waves of {wave}, RDNA float settings {}", if rdna { "on" } else { "off" });
+    victory_shader::emit::set_host_max_wave(wave);
+    victory_shader::emit::set_host_rdna(rdna);
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();

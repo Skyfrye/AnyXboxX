@@ -280,7 +280,8 @@ impl Report {
 
 /// Whether `--only-buffers` means a buffer: all of `only` match it.
 /// `name=<text in its name>`, `min=<bytes>`, `max=<bytes>`,
-/// `seen=<how the CPU saw it>`, `id=<a>..<b>`; with `!` in front: that does not.
+/// `seen=<how the CPU saw it>`, `id=<a>..<b>`, `ids=<a>,<b>,...` (one of these); with `!` in
+/// front: that does not.
 fn chosen(r: &wire::Resource, only: &[String]) -> bool {
     only.iter().all(|f| {
         let (no, f) = match f.strip_prefix('!') {
@@ -298,6 +299,7 @@ fn chosen(r: &wire::Resource, only: &[String]) -> bool {
             "id" => value.split_once("..").is_some_and(|(a, b)| {
                 (a.parse().unwrap_or(0)..b.parse().unwrap_or(u32::MAX)).contains(&r.id)
             }),
+            "ids" => value.split(',').any(|id| id.trim().parse() == Ok(r.id)),
             _ => r.name.contains(value),
         };
         is != no
