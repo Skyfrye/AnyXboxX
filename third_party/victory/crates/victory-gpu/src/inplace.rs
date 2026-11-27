@@ -398,11 +398,25 @@ pub fn title_memory_section_gone(section: usize) {
     }
 }
 
+/// A bit per 64 KiB block that a title view shows ([`Views::views`]), read
+/// with no lock: set before the view is noted, cleared after it is
+/// forgotten, so a block without its bit is shown by no view
+/// ([`any_view`]).
+static VIEW_BLOCKS: crate::watch::Bits = crate::watch::Bits::new();
+
+/// Whether a title view shows any of `[at, at + len)`, asked with no lock
+/// (for `crate::pagegen`, which tells most writes of memory no view shows:
+/// buffers).
+pub(crate) fn any_view(at: usize, len: usize) -> bool {
+    len != 0 && VIEW_BLOCKS.any(at / K64, at.saturating_add(len).div_ceil(K64))
+}
+
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     {
         let mut v = views_mut();
+        (at / K64..at.saturating_add(len).div_ceil(K64)).for_each(|block| VIEW_BLOCKS.set(block));
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
             let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
@@ -436,7 +450,10 @@ pub(crate) fn physical(start: usize, end: usize, mut each: impl FnMut(usize, Opt
         .next_back()
         .filter(|(base, view)| *base + view.0 > first * K64)
         .map_or(first * K64, |(base, _)| *base);
-    for (&base, &(bytes, section, offset)) in v.views.range(from..last * K64) {
+    // (A range that runs to the end of the address space: its last block's
+    // end is past it.)
+    let stop = last.checked_mul(K64).unwrap_or(usize::MAX);
+    for (&base, &(bytes, section, offset)) in v.views.range(from..stop) {
         let (shown, past) = (base.div_ceil(K64), (base + bytes) / K64);
         while block < shown.min(last) {
             each(block * K64, None);
@@ -469,6 +486,8 @@ pub(crate) fn views_gone(at: usize, len: usize) {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
         };
+        // (No view is noted in another's blocks: their bits are its.)
+        (base / K64..base.saturating_add(bytes).div_ceil(K64)).for_each(|block| VIEW_BLOCKS.clear(block));
         for k in 0..bytes.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
             if let Some(pages) = v.pages.get_mut(&key) {
@@ -507,6 +526,25 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
         }
     }
     out
+}
+
+/// Whether some 64 KiB page of `[start, end)` is shown at more than `most`
+/// addresses, its own included.
+pub(crate) fn shown_in_more_than(start: usize, end: usize, most: usize) -> bool {
+    let v = views();
+    if start >= end || v.pages_twice == 0 {
+        return false;
+    }
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
+        let from = start.max(base) & !(K64 - 1);
+        for page in (from..end.min(base + bytes)).step_by(K64) {
+            if v.pages.get(&(section, offset + (page - base) as u64)).is_some_and(|shown| shown.len() > most) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that

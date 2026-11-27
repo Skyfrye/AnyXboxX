@@ -761,6 +761,11 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    // Tests: no submission's one asking begins between its look at whether
+    // one stands and its ranges going in; they would take that asking's
+    // place, and stand until it ended (`asking_turn`).
+    #[cfg(test)]
+    let _turn = asking_turn();
     ask_ahead_held(ranges, false);
 }
 
@@ -1035,6 +1040,48 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Tests: a turn at the submission's one asking, from [`ask_once`] to
+/// [`ask_once_end`]. There is one such asking in the process, as in a run,
+/// where only the submitting thread makes one, under the host's submission
+/// lock (`crate::host::Host::submit`, which takes this turn too). A test
+/// that makes one itself takes the turn first: in parallel, another test's
+/// submission ended or replaced it halfway. One way that lost writes: a
+/// submission that began after another's [`ask_rest`] had taken the
+/// journal's ranges, and ended before that put them back, found its own
+/// ranges standing at its next [`ask_once`], which then asked the kernel
+/// about none of them and answered from the journal, without the writes
+/// since (`port7_tests::no_write_is_lost_with_port_7`: "is not after").
+///
+/// Taken again by the thread that holds it, it is the turn already had.
+#[cfg(test)]
+pub(crate) fn asking_turn() -> AskingTurn {
+    static TURN: Mutex<()> = Mutex::new(());
+    if TURN_HELD.get() {
+        return AskingTurn(None);
+    }
+    let held = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    TURN_HELD.set(true);
+    AskingTurn(Some(held))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TURN_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`asking_turn`]'s, until dropped.
+#[cfg(test)]
+pub(crate) struct AskingTurn(#[allow(dead_code)] Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(test)]
+impl Drop for AskingTurn {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            TURN_HELD.set(false);
+        }
+    }
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
@@ -1180,9 +1227,11 @@ pub(crate) fn ask_once_end() {
 /// We wrote title memory `[at, at + len)` while a submission's one asking
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
+/// (The texture slots that read it are told by the copy itself, once its
+/// bytes are in: `crate::host::copy_mapped`. Told here too, every copy at
+/// submission was told twice, and the arenas' own writes, which no slot
+/// reads, once: a views lookup each.)
 pub(crate) fn wrote(at: usize, len: usize) {
-    // The slots that read it, at any view, whether an asking stands or not.
-    crate::pagegen::written(at, len);
     // Renderer port #7: with no asking standing there is nothing to note,
     // which is seen shared. (Standing, its number moves: alone, as before.)
     if port_journal() && (len == 0 || !journal().kept) {
@@ -1661,7 +1710,7 @@ fn known_views(first: usize, last: usize) -> bool {
 
 /// A bit per block of the address space, in pieces made when first needed
 /// and never let go.
-struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
+pub(crate) struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
 
 /// The bits of 4 GiB.
 type BitsPiece = [std::sync::atomic::AtomicU64; Bits::WORDS];
@@ -1671,7 +1720,7 @@ impl Bits {
     /// 128 TiB, what a process has.
     const PIECES: usize = 1 << 15;
 
-    const fn new() -> Bits {
+    pub(crate) const fn new() -> Bits {
         Bits([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
     }
 
@@ -1681,7 +1730,7 @@ impl Bits {
         unsafe { piece.as_ref() }
     }
 
-    fn set(&self, block: usize) {
+    pub(crate) fn set(&self, block: usize) {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
         let word = block / 64;
         let Some(place) = self.0.get(word / Bits::WORDS) else {
@@ -1784,7 +1833,7 @@ impl Bits {
         }
     }
 
-    fn clear(&self, block: usize) {
+    pub(crate) fn clear(&self, block: usize) {
         let word = block / 64;
         if let Some(piece) = self.piece(word) {
             // Ahead of the protection's change, and seen by whoever the
@@ -1794,7 +1843,7 @@ impl Bits {
     }
 
     /// Whether a bit of `[first, last)` is set.
-    fn any(&self, first: usize, last: usize) -> bool {
+    pub(crate) fn any(&self, first: usize, last: usize) -> bool {
         let mut block = first;
         while block < last {
             let word = block / 64;
@@ -2722,29 +2771,50 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// the title's next write (`crate::pagegen::arm`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Armed {
-    /// Every block is read-only by our hand, or known unmapped (its mapping
-    /// is told): the title's next write to any of it faults.
+    /// Every block is read-only by our hand at every view of its page
+    /// (clean), or known unmapped (its mapping is told): the title's next
+    /// write to any of it, through whichever view, faults.
     Whole,
     /// Some are left open for now (written just now and resting, or the
-    /// kernel or a change of mapping at work there): guarded at an asking
-    /// soon.
+    /// kernel or a change of mapping at work there), here or at another view
+    /// of their page: guarded at an asking soon.
     Soon,
     /// Some are not guarded here at all (other memory, a protection that
-    /// failed).
+    /// failed), or their page is shown at views the guards leave alone (more
+    /// than [`MANY_VIEWS`], or any other with `VICTORY_VIEW_GUARD=0`).
     Never,
 }
 
 /// See [`Armed`].
+///
+/// A block read-only here but not clean is not whole: another view of its
+/// page could not be made read-only ([`cover`]: it rests after a write, is
+/// left alone, or is being changed), and the title writes through that one
+/// with no fault. It was taken for whole, and the slot read then kept the
+/// bytes from before for as long as nobody guarded that view again (the
+/// texture "painted through another view": 102 of the 103 such of run nb1).
 pub(crate) fn armed(start: usize, end: usize) -> Armed {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return Armed::Whole;
     }
+    let most = if view_guard() { MANY_VIEWS } else { 1 };
+    if crate::inplace::shown_in_more_than(start, end, most) {
+        return Armed::Never;
+    }
     let g = guards_timed_shared();
     let rest = rest();
     let mut soon = false;
     for block in first..last {
-        if g.protected.contains(block) || g.absent.contains(block) {
+        if g.absent.contains(block) {
+            continue;
+        }
+        if g.protected.contains(block) {
+            // (A block the title's bytes were put in beside the guard is
+            // clean too, until an asking takes its bit: at the next.)
+            if !g.clean.contains(block) || BESIDE.any(block, block + 1) {
+                soon = true;
+            }
             continue;
         }
         if g.left_alone(block) || g.rests(block, rest) {
@@ -4552,6 +4622,8 @@ pub(crate) mod tests {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert_ne!(p, 0);
+        // (The submission's one asking is this test's until it ends.)
+        let _turn = asking_turn();
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
         ask_ahead(&ranges);
@@ -5045,12 +5117,25 @@ pub(crate) mod tests {
         }
         assert!(writes(one, one + BLOCK, true).is_some() && writes(two, two + BLOCK, true).is_some());
         put_count(one / BLOCK).store(0, std::sync::atomic::Ordering::Relaxed);
-        let put = |byte: u8| loop {
-            // SAFETY: a byte of the section's only page.
-            let done = put_beside(one / BLOCK, 1, |delta| unsafe { ((one + 100).wrapping_add(delta) as *mut u8).write(byte) });
-            // (Other tests hold changes of mapping.)
-            if done != Beside::Cannot {
-                return done;
+        // (Other tests hold changes of mapping now and then: again, for a
+        // while. It spun for good when the block stayed unguarded, eight
+        // minutes and more in a run of the whole suite.)
+        let put = |byte: u8| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                // SAFETY: a byte of the section's only page.
+                let done = put_beside(one / BLOCK, 1, |delta| unsafe { ((one + 100).wrapping_add(delta) as *mut u8).write(byte) });
+                if done != Beside::Cannot {
+                    return done;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "nothing put in for 10 s: guarded {}, mapping free {}, our view of the page {}",
+                    PROTECTED.any(one / BLOCK, one / BLOCK + 1),
+                    title_memory_reading_now().is_some(),
+                    crate::inplace::beside_page(one).is_some()
+                );
+                std::thread::yield_now();
             }
         };
         for round in 1..4 {
@@ -5321,6 +5406,25 @@ pub(crate) mod tests {
         assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
         assert!(!writable(two) && writable(two + BLOCK) && !writable(two + 2 * BLOCK));
         drop_views(section, &[one, two], SIZE);
+    }
+
+    /// A page shown in more than `MANY_VIEWS` views is guarded at each by
+    /// itself: memory there is never armed whole for a texture slot, which
+    /// looks at it by its digest instead (`crate::pagegen`).
+    #[test]
+    fn a_page_of_many_views_is_never_armed_whole() {
+        let (section, one, two) = two_views(BLOCK);
+        assert_eq!(writes(one, one + BLOCK, true).map(|_| ()), Some(()));
+        assert_eq!(armed(one, one + BLOCK), Armed::Whole);
+        let filler = one + (1 << 44);
+        for n in 0..MANY_VIEWS {
+            crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
+        }
+        // Guarded again, at this view alone.
+        assert_eq!(writes(one, one + BLOCK, true).map(|_| ()), Some(()));
+        assert_eq!(armed(one, one + BLOCK), Armed::Never);
+        title_memory_remapped(filler, MANY_VIEWS * BLOCK);
+        drop_views(section, &[one, two], BLOCK);
     }
 
     /// A page shown in more than `MANY_VIEWS` views is guarded at each by
@@ -6049,6 +6153,54 @@ mod port7_tests {
         askers_and_a_submission(2);
     }
 
+    /// The same beside another submission's one askings, as another test's
+    /// (or the host's) make them, of memory of their own: each takes its
+    /// turn ([`asking_turn`]), and no write is lost. (Without turns one that
+    /// began and ended inside this one's [`ask_rest`] left this one's ranges
+    /// standing, unasked, at its next asking: "is not after", in about one
+    /// run of the whole suite in five.)
+    #[test]
+    fn no_write_is_lost_beside_another_submission() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let done = &done;
+            s.spawn(move || {
+                // SAFETY: a reservation of our own, freed at the end.
+                let other = unsafe {
+                    VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+                } as usize;
+                assert_ne!(other, 0);
+                let mut round = 0u64;
+                while !done.load(Relaxed) {
+                    PORT_JOURNAL_IN_TEST.set(round % 3 != 0);
+                    let _turn = asking_turn();
+                    // SAFETY: committed memory of ours.
+                    unsafe { ((other + (round as usize % 8) * PAGE) as *mut u64).write_volatile(round) };
+                    ask_once(&[(other, other + 4 * PAGE), (other + 4 * PAGE, other + 8 * PAGE)]);
+                    let _ = writes(other, other + PAGE, false);
+                    ask_ahead_done();
+                    ask_once_end();
+                    round += 1;
+                }
+                // SAFETY: the reservation made above.
+                unsafe { VirtualFree(other as *mut _, 0, MEM_RELEASE) };
+            });
+            // (Also if a check fails: the other submission stops.)
+            struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Stop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Relaxed);
+                }
+            }
+            let _stop = Stop(done);
+            for _ in 0..3 {
+                askers_and_a_submission(1);
+                askers_and_a_submission(2);
+            }
+        });
+    }
+
     /// `port`: 1, renderer port #7 on in all threads; 2, in every other.
     fn askers_and_a_submission(port: u8) {
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
@@ -6110,6 +6262,9 @@ mod port7_tests {
                 let mut seed = 99;
                 for round in 0..400 {
                     PORT_JOURNAL_IN_TEST.set(port == 1 || round % 2 == 0);
+                    // The one asking is this round's until it ends, whatever
+                    // other tests' submissions do (`asking_turn`).
+                    let _turn = asking_turn();
                     let before: Vec<usize> = (0..3).map(|_| rng(&mut seed, HALF)).collect();
                     for &p in &before {
                         // SAFETY: committed memory of ours.
