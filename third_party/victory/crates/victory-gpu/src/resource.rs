@@ -2235,17 +2235,20 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// (when last used, the title texture, its copy's block as read with no
 /// lock), those that may go now and whose going may give memory back to
 /// the system, with what [`crate::vram::plan`] needs. Only those
-/// [`crate::vram::worth_asking`] says are asked their lock and references,
-/// and the host GPU's writes are looked up once. The caller holds the
-/// table of resources.
+/// [`crate::vram::worth_asking`] says are asked their lock and references;
+/// `written`: what the host GPU wrote ([`crate::texture::host_written_now`],
+/// looked up once). The caller holds the table of resources.
 #[cfg(windows)]
-fn whole_units_idle(candidates: &[(u64, usize, u32)], lives: &[u32]) -> Vec<crate::vram::Idle> {
+fn whole_units_idle(
+    candidates: &[(u64, usize, u32)],
+    lives: &[u32],
+    written: &std::collections::HashSet<usize>,
+) -> Vec<crate::vram::Idle> {
     let blocks: Vec<u32> = candidates.iter().map(|c| c.2).collect();
     let worth = crate::vram::worth_asking(&blocks, lives);
     if !worth.contains(&true) {
         return Vec::new();
     }
-    let written = crate::texture::host_written_now();
     let mut idle = Vec::new();
     for (&(used, at, _), _) in candidates.iter().zip(&worth).filter(|(_, worth)| **worth) {
         if written.contains(&at) {
@@ -2358,7 +2361,8 @@ pub(crate) fn let_go_idle() {
         by_age.sort_unstable();
     }
     let lives = if by_blocks { crate::pool::texture_lives() } else { Vec::new() };
-    let idle = if by_blocks { whole_units_idle(&candidates, &lives) } else { Vec::new() };
+    let written = if by_blocks { crate::texture::host_written_now() } else { Default::default() };
+    let idle = if by_blocks { whole_units_idle(&candidates, &lives, &written) } else { Vec::new() };
     // Lets the host copy of `at` go if it may go still: its bytes.
     let let_go = |at: usize| -> Option<u64> {
         // SAFETY: a texture leaves the table before it is freed, under the
@@ -2395,12 +2399,36 @@ pub(crate) fn let_go_idle() {
         crate::host::retire(host);
         Some(bytes)
     };
+    // Whether the host copy of `at` may go now, as `let_go` asks, with
+    // nothing taken: no lock waited for (one held is in use).
+    let may_go = |at: usize| -> bool {
+        // SAFETY: as in `let_go`.
+        let r = unsafe { &*(at as *const Resource) };
+        let used = r.host.used.load(Relaxed);
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || written.contains(&at) {
+            return false;
+        }
+        let Ok(made) = r.host.made.try_lock() else { return false };
+        made.as_ref()
+            .is_some_and(|(host, _)| std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1)
+    };
     if by_blocks {
         // The bytes given back to the system.
         let mut gave = 0u64;
         for unit in crate::vram::plan(&idle, &lives, crate::pool::BLOCK) {
             if gave >= most {
                 break;
+            }
+            // Every copy of it may go still, before the first goes: one of a
+            // block used again since the look would leave the others' pieces
+            // free inside a block the system still counts.
+            if !unit.textures.iter().all(|&at| may_go(at)) {
+                crate::vram::LET_GO[2].fetch_add(1, Relaxed);
+                continue;
+            }
+            // And no piece is cut from its block while they go.
+            if let Some(block) = unit.block {
+                crate::pool::drain(&[block]);
             }
             let mut whole = true;
             for &at in &unit.textures {
@@ -2414,15 +2442,16 @@ pub(crate) fn let_go_idle() {
                 }
             }
             if !whole {
+                // (Used meanwhile after all: the block takes pieces again.)
+                if let Some(block) = unit.block {
+                    crate::pool::undrain(block);
+                }
                 crate::vram::LET_GO[2].fetch_add(1, Relaxed);
                 continue;
             }
             gave += unit.gives;
             crate::vram::LET_GO[0].fetch_add(1, Relaxed);
             crate::vram::LET_GO[1].fetch_add(unit.gives, Relaxed);
-            if let Some(block) = unit.block {
-                crate::pool::drain(&[block]);
-            }
         }
     }
     // Without one, while textures are kept for minutes, a part of them at

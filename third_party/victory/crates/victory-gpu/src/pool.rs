@@ -496,6 +496,13 @@ impl<B: Clone> Pool<B> {
         }
     }
 
+    /// [`Pool::drain`] undone: `block` takes pieces again.
+    fn undrain(&mut self, block: usize) {
+        if let Some(b) = self.blocks.get_mut(block).and_then(Option::as_mut) {
+            b.draining = 0;
+        }
+    }
+
     /// Bytes of the blocks left to empty at `now`: memory on its way back
     /// to the system.
     fn giving_back(&self, now: u64) -> u64 {
@@ -656,6 +663,13 @@ pub(crate) fn drain(blocks: &[u32]) {
             DRAINED.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// A texture block left to empty ([`drain`]) whose textures did not all go
+/// after all (one was used meanwhile): it takes pieces again, and does not
+/// count as on its way back.
+pub(crate) fn undrain(block: u32) {
+    lock(&TEXTURES).undrain(block as usize);
 }
 
 /// The number of the block `texture` was placed in, if it was.
@@ -1261,6 +1275,29 @@ mod tests {
         assert!(pool.blocks[0].is_none(), "the block left to empty went back");
         assert!(pool.blocks[1].is_some(), "the other empty one is a spare");
         assert!(EMPTIED_BACK.load(Ordering::Relaxed) > back);
+    }
+
+    /// A block left to empty whose textures did not all go (one was used
+    /// again while they went) takes pieces again at once, is not on its way
+    /// back, and is kept like any other when it empties later.
+    #[test]
+    fn a_block_left_to_empty_in_vain_takes_pieces_again() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let a = pool.take_ripe(64 << 10, 65536, 0, Ripe::ALL, Some(0), make).unwrap().0;
+        assert!(pool.drain(0, 0));
+        pool.undrain(0);
+        assert_eq!(pool.giving_back(1), 0);
+        let b = pool.take_ripe(64 << 10, 65536, 1, Ripe::ALL, Some(0), make).unwrap().0;
+        assert_eq!(b.block, a.block, "taken from again");
+        pool.give(a, 2);
+        pool.give(b, 2);
+        pool.reclaim(2 + REST, SPARE_KEPT, false);
+        assert!(pool.blocks[0].is_some(), "kept as a spare");
     }
 
     /// For the memory line: what the blocks hold, by class, free, resting,

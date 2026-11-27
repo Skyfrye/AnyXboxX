@@ -130,8 +130,8 @@ pub(crate) fn plan(idle: &[Idle], lives: &[u32], block_bytes: u64) -> Vec<Unit> 
 }
 
 /// Since the start: units of [`plan`] let go whole, their bytes given back
-/// (blocks and textures of their own), and units begun that could not be
-/// let go whole (a copy in them was in use by then).
+/// (blocks and textures of their own), and units left (a copy in them was
+/// in use again: found so before any went, or, rarely, while they went).
 pub(crate) static LET_GO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// The counts of the last line, to say what changed since.
@@ -190,7 +190,7 @@ pub(crate) fn line() -> String {
          in them {} MB, resting {} MB, {} empty, {} left to empty, {classes}; host copies the title fills {} alive {} MB, {} MB of \
          them outside blocks; other host textures (targets, depth, unordered access, twins) {} MB; buffer copies' card sides {} MB, \
          their bytes from before {} MB, windows' {} MB. Since the last line: {} copies let go ({} MB), {} blocks let go whole ({} MB \
-         back), {} begun and left (a copy was used again), {} blocks left to empty ({} that did went back once empty), {} back to \
+         back), {} left (a copy was used again), {} blocks left to empty ({} that did went back once empty), {} back to \
          the system in all, {} made; {} texture passes \
          refused for want of room ({} since the start)",
         u8::from(system),
