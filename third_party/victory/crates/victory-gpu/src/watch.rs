@@ -761,6 +761,11 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    // Tests: no submission's one asking begins between its look at whether
+    // one stands and its ranges going in; they would take that asking's
+    // place, and stand until it ended (`asking_turn`).
+    #[cfg(test)]
+    let _turn = asking_turn();
     ask_ahead_held(ranges, false);
 }
 
@@ -1033,6 +1038,48 @@ pub(crate) fn once() -> bool {
     // against 573-647, the picture unchanged over four minutes);
     // `VICTORY_ASK_ONCE=0` asks per range, as before.
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Tests: a turn at the submission's one asking, from [`ask_once`] to
+/// [`ask_once_end`]. There is one such asking in the process, as in a run,
+/// where only the submitting thread makes one, under the host's submission
+/// lock (`crate::host::Host::submit`, which takes this turn too). A test
+/// that makes one itself takes the turn first: in parallel, another test's
+/// submission ended or replaced it halfway. One way that lost writes: a
+/// submission that began after another's [`ask_rest`] had taken the
+/// journal's ranges, and ended before that put them back, found its own
+/// ranges standing at its next [`ask_once`], which then asked the kernel
+/// about none of them and answered from the journal, without the writes
+/// since (`port7_tests::no_write_is_lost_with_port_7`: "is not after").
+///
+/// Taken again by the thread that holds it, it is the turn already had.
+#[cfg(test)]
+pub(crate) fn asking_turn() -> AskingTurn {
+    static TURN: Mutex<()> = Mutex::new(());
+    if TURN_HELD.get() {
+        return AskingTurn(None);
+    }
+    let held = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    TURN_HELD.set(true);
+    AskingTurn(Some(held))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TURN_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`asking_turn`]'s, until dropped.
+#[cfg(test)]
+pub(crate) struct AskingTurn(#[allow(dead_code)] Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(test)]
+impl Drop for AskingTurn {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            TURN_HELD.set(false);
+        }
+    }
 }
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
@@ -4575,6 +4622,8 @@ pub(crate) mod tests {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert_ne!(p, 0);
+        // (The submission's one asking is this test's until it ends.)
+        let _turn = asking_turn();
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
         ask_ahead(&ranges);
@@ -6091,6 +6140,54 @@ mod port7_tests {
         askers_and_a_submission(2);
     }
 
+    /// The same beside another submission's one askings, as another test's
+    /// (or the host's) make them, of memory of their own: each takes its
+    /// turn ([`asking_turn`]), and no write is lost. (Without turns one that
+    /// began and ended inside this one's [`ask_rest`] left this one's ranges
+    /// standing, unasked, at its next asking: "is not after", in about one
+    /// run of the whole suite in five.)
+    #[test]
+    fn no_write_is_lost_beside_another_submission() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let done = &done;
+            s.spawn(move || {
+                // SAFETY: a reservation of our own, freed at the end.
+                let other = unsafe {
+                    VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+                } as usize;
+                assert_ne!(other, 0);
+                let mut round = 0u64;
+                while !done.load(Relaxed) {
+                    PORT_JOURNAL_IN_TEST.set(round % 3 != 0);
+                    let _turn = asking_turn();
+                    // SAFETY: committed memory of ours.
+                    unsafe { ((other + (round as usize % 8) * PAGE) as *mut u64).write_volatile(round) };
+                    ask_once(&[(other, other + 4 * PAGE), (other + 4 * PAGE, other + 8 * PAGE)]);
+                    let _ = writes(other, other + PAGE, false);
+                    ask_ahead_done();
+                    ask_once_end();
+                    round += 1;
+                }
+                // SAFETY: the reservation made above.
+                unsafe { VirtualFree(other as *mut _, 0, MEM_RELEASE) };
+            });
+            // (Also if a check fails: the other submission stops.)
+            struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Stop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Relaxed);
+                }
+            }
+            let _stop = Stop(done);
+            for _ in 0..3 {
+                askers_and_a_submission(1);
+                askers_and_a_submission(2);
+            }
+        });
+    }
+
     /// `port`: 1, renderer port #7 on in all threads; 2, in every other.
     fn askers_and_a_submission(port: u8) {
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
@@ -6152,6 +6249,9 @@ mod port7_tests {
                 let mut seed = 99;
                 for round in 0..400 {
                     PORT_JOURNAL_IN_TEST.set(port == 1 || round % 2 == 0);
+                    // The one asking is this round's until it ends, whatever
+                    // other tests' submissions do (`asking_turn`).
+                    let _turn = asking_turn();
                     let before: Vec<usize> = (0..3).map(|_| rng(&mut seed, HALF)).collect();
                     for &p in &before {
                         // SAFETY: committed memory of ours.
