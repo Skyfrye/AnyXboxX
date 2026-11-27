@@ -209,10 +209,30 @@ Tried and not kept (2026-11-27):
 - The builder with only the shadows' walks finding anything (run p1): 18.8
   fps median, 22-23 steady, the eyes as without it.
 
-Not mended: the band of 16x16 blocks along the bottom of the picture in the
-prison cell (sky blue and streaks of the yard), and blocks by the diner's
-window: they are there with the builder on too (runs m1-rt, b1), so they are
-not the rays.
+The band of blocks along the bottom of the picture in the prison cell (sky
+blue and streaks of the yard), and the blocks and stripes of light on
+forearms and wrists by the diner's window, were there with the builder on
+too (runs m1-rt, b1): not the rays. They were tiles the indirect diffuse
+light's final gather (`indirect_diffuse_lighting:CS_FinalGather_*`) never
+ran: its two tile lists are indirect dispatches of one group per 8x4 tile
+along X, 67,440 and 47,760 of the 115,200 in the cell's frame (cap2), and the
+argument clamp cut a dispatch at the 65,535 groups a D3D12 dimension holds
+on every card but AMD's. The tiles past the cut, the last the title's
+classification put in the list (the lowest of the picture in the cell,
+others in the diner, frame by frame), kept what the gather wrote there
+frames before, which the temporal resolve
+(`CS_ScreenProbes_TemporalResolve_ReflectiveCaustics`) and the tiled
+lighting (`TL_PS_NoDir_*`) carried into the picture. The replays showed it:
+at the band's pixels no command of either gather wrote anything, where at
+pixels of the face it did. In the diner one class held up to some 95,000
+tiles a frame: nearly 30,000 were left out. Such dispatches now run in rows
+of at most 65,535 groups, which the program numbers as the console's
+(`crate::indirect::ROWS`, `victory_shader::emit::USER_GROUP_ROWS`;
+`VICTORY_GROUP_ROWS=0` as before). The program's two words come from the
+record through the command signature, which costs NVIDIA a wait of its own
+between two dispatches (15.7 against 0.85 microseconds, with a barrier
+between every two): only programs one of whose records asked for that many
+are run so, from a few frames after the first (the clamp notes them).
 
 It is off while the builder runs (`VICTORY_BVH_BUILDER=1`: see the card's
 time above; with quiet pages 14.1 fps median and 14-15 steady over the diner and the cell, run r1, against 24-27

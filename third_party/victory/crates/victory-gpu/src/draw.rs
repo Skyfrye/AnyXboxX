@@ -1520,8 +1520,12 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
-        // All of every group, unless the dispatch says otherwise.
-        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+        // All of every group, unless the dispatch says otherwise; and the
+        // groups as the host numbers them, unless it runs them in rows.
+        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X
+            || kind == victory_shader::emit::USER_GROUP_ROWS
+            || kind == victory_shader::emit::USER_GROUP_ROWS + 1
+        {
             return 0;
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
@@ -3477,6 +3481,21 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        // More than a dimension of the host holds (65,535 groups along X):
+        // in rows, which the program numbers as the console's groups
+        // (`crate::indirect::ROWS`; the next `bind` sets the words back).
+        let [x, y, z] = match (crate::indirect::rows(x, y), rows_words(p)) {
+            (Some((row, rows)), Some((param, words))) => {
+                // SAFETY: an open list; the root signature has the words.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstant(param, row, words[0]);
+                    list.list.SetComputeRoot32BitConstant(param, x, words[1]);
+                }
+                crate::host::note_rows(x);
+                [row, rows, z]
+            }
+            _ => [x, y, z],
+        };
         #[cfg(feature = "diagnostics")]
         self.dispatch_dump_when(list, p, None, true, true, &format!("groups {x} {y} {z}"));
         // SAFETY: an open list with everything set.
@@ -4614,14 +4633,15 @@ impl State {
     }
 
     /// Where the clamped record of `kind` at `arguments` of the copy `args`
-    /// is, from the open batch or a new one ([`batches`]). `None` if it
+    /// is, from the open batch or a new one ([`batches`]), for a program of
+    /// the tag `tag` (`crate::indirect::wide_tag`; 0: none). `None` if it
     /// cannot be clamped in one.
     fn batched(
         &mut self,
         list: &HostList,
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
-        kind: u32,
+        (kind, tag): (u32, u32),
     ) -> Option<(ID3D12Resource, u64)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
@@ -4630,12 +4650,12 @@ impl State {
             self.batch = None;
         }
         // A draw after dispatches waits for them.
-        if kind != DISPATCH {
+        if kind != DISPATCH && kind != crate::indirect::ROWS {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
         if let Some(b) = &mut self.batch
-            && let Some(at) = b.table.place(id, offset, kind)
+            && let Some(at) = b.table.place_tagged(id, offset, kind, tag)
         {
             return Some((b.scratch.clone(), at));
         }
@@ -4643,7 +4663,7 @@ impl State {
         let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let at = table.place(id, offset, kind)?;
+        let at = table.place_tagged(id, offset, kind, tag)?;
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         Some((scratch, at))
     }
@@ -4739,10 +4759,32 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // A dispatch of one record whose program numbers its groups as the
+        // console's whatever rows they run in: if one of its records asked
+        // for more groups along X than a dimension holds, clamped as one
+        // that may run in rows and run with the program's two words from
+        // the record (`crate::indirect::ROWS`; the host's own words are set
+        // back by the next `bind`); else clamped as a dispatch, under its
+        // tag, so that such a record is noted (`crate::indirect::wide_tag`).
+        let words = (kind == DISPATCH && max == 1 && count.is_none() && crate::indirect::in_rows())
+            .then(|| rows_words(p))
+            .flatten();
+        let (rows, tag) = match words.map(|w| (w, crate::indirect::wide_tag(p.pso.as_raw() as usize))) {
+            Some((words, Ok(()))) => (rows_signature(&p.root, words), 0),
+            Some((_, Err(tag))) => (None, tag),
+            None => (None, 0),
+        };
+        // (The dispatch's words in the record, for the dumps.)
+        #[cfg(feature = "diagnostics")]
+        let groups_at = if rows.is_some() { 8 } else { 0 };
+        let (clamped, signature) = match rows {
+            Some(rows) => (crate::indirect::ROWS, rows),
+            None => (kind, signature),
+        };
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            self.batched(list, &args, arguments, (clamped, tag))
         } else {
             None
         };
@@ -4809,7 +4851,7 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound_tagged(list, (&args.buffer, offset), count_arg, (clamped, step, records), tag)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -4851,7 +4893,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         if kind == DISPATCH {
-            self.dispatch_dump_when(list, p, Some((&bounded, at)), true, true, "groups indirect");
+            self.dispatch_dump_when(list, p, Some((&bounded, at + groups_at)), true, true, "groups indirect");
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
@@ -4882,7 +4924,7 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             self.after_dispatch(list, p);
             #[cfg(feature = "diagnostics")]
-            self.dispatch_dump(list, p, Some((&bounded, at)));
+            self.dispatch_dump(list, p, Some((&bounded, at + groups_at)));
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4942,6 +4984,43 @@ fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
     let (param, _) = stage.user_data?;
     let word = stage.translated().host.user_data.iter().find(|u| u.root == RootType::Other(kind))?;
     Some((param, word.index))
+}
+
+/// Where a compute pipeline's program has the two words of a dispatch run
+/// in rows (`victory_shader::emit::USER_GROUP_ROWS`, `crate::indirect::ROWS`):
+/// the root parameter, and the dwords in it of the row's groups and of the
+/// groups asked for.
+fn rows_words(p: &HostPipeline) -> Option<(u32, [u32; 2])> {
+    let (param, row) = compute_word(p, victory_shader::emit::USER_GROUP_ROWS)?;
+    let (_, asked) = compute_word(p, victory_shader::emit::USER_GROUP_ROWS + 1)?;
+    Some((param, [row, asked]))
+}
+
+/// The host command signature of a dispatch that may run in rows
+/// (`crate::indirect::ROWS`), for programs of the root signature `root`
+/// with their two words where [`rows_words`] says: the row's groups and
+/// the groups asked for, then the dispatch, from records as the clamp
+/// writes them. Made once for each root signature and place of the words
+/// (it changes root arguments, so it is the root signature's own).
+fn rows_signature(root: &ID3D12RootSignature, (param, words): (u32, [u32; 2])) -> Option<ID3D12CommandSignature> {
+    type Made = std::collections::HashMap<(usize, u32, [u32; 2]), (ID3D12RootSignature, ID3D12CommandSignature)>;
+    static MADE: std::sync::LazyLock<std::sync::Mutex<Made>> = std::sync::LazyLock::new(Default::default);
+    let key = (root.as_raw() as usize, param, words);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    // (Each holds its root signature: the address is not another's.)
+    if let Some((_, s)) = made.get(&key) {
+        return Some(s.clone());
+    }
+    let device = &crate::host::host()?.device;
+    let signature = match crate::indirect::rows_command_signature(device, root, (param, words)) {
+        Ok(signature) => signature,
+        Err(e) => {
+            once!(error = %e, "host command signature of a dispatch in rows refused: such dispatches run at most 65,535 groups along X");
+            return None;
+        }
+    };
+    made.insert(key, (root.clone(), signature.clone()));
+    Some(signature)
 }
 
 #[cfg(test)]

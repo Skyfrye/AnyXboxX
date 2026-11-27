@@ -413,6 +413,9 @@ struct Lower<'a> {
     one_cu: Option<u32>,
     /// With `one_cu`: the zero read from it (made in the entry block).
     one_cu_zero: Option<V>,
+    /// A compute program's group number along X and Y as the console numbers it, whatever
+    /// rows the host laid its groups out in ([`Self::group_rows`]), made in the entry block.
+    rows: Option<(V, V)>,
     /// A partial final group (`USER_DISPATCH_THREADS_X`) whose console waves are two host
     /// waves: the threads past the count stay for the exchange's group barriers, so they
     /// cannot leave at entry; this says which threads the console launched, and memory,
@@ -1620,6 +1623,17 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// The DXIL operation of a compute group's number (`groupId`).
+const GROUP_ID: u32 = 94;
+
+/// `VICTORY_GROUP_ROWS=0`: no compute program asks for the words of a dispatch laid out in
+/// rows (`shader.rs` `USER_GROUP_ROWS`), so the host runs at most 65,535 groups along X, as
+/// before.
+fn group_rows_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_ROWS").is_none_or(|v| v != "0"))
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -2376,6 +2390,7 @@ impl<'a> Lower<'a> {
             wave_base: None,
             one_cu,
             one_cu_zero: None,
+            rows: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -3005,13 +3020,17 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        // First of all: the count of threads below takes the group number as the console's.
+        if self.reads_group(counted) {
+            self.group_rows();
+        }
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
             let original = self.s.entry;
             let width = self.console_group().expect("compute thread count")[0];
             let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
-            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            let Val::I32(group) = self.compute_id("groupId.i32", GROUP_ID, 0) else {
                 unreachable!()
             };
             // (the paired form: each lane of the thread its own)
@@ -3293,10 +3312,10 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.compute_id("groupId.i32", GROUP_ID, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
-                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                let Val::I32(g) = self.compute_id("groupId.i32", GROUP_ID, 0) else {
                     unreachable!()
                 };
                 let n = self.s.m.i32(self.x.mesh_stride);
@@ -3358,16 +3377,62 @@ impl<'a> Lower<'a> {
         self.load_input(id, col)
     }
 
-    /// A component of a compute thread or group id, read in the entry block.
+    /// A component of a compute thread or group id, read in the entry block (`opcode`
+    /// [`GROUP_ID`]: the group's).
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, k) = (self.s.entry, self.s.m.i32(u32::from(c)));
-        let id = self
-            .s
-            .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[k]);
+        let id = match self.rows {
+            // The group's number as the console's, whatever rows the host laid them out in.
+            Some((x, y)) if opcode == GROUP_ID && c < 2 => [x, y][usize::from(c)],
+            _ => self.s.op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[k]),
+        };
         if c == 0 && let Some(zero) = self.one_cu_zero() {
             return Val::I32(self.s.m.bin(entry, Bin::Add, id, zero));
         }
         Val::I32(id)
+    }
+
+    /// Whether this is a compute program that reads its group's number (`counted`: the count
+    /// of threads reads it), whose groups the host may lay out in rows ([`Self::group_rows`]).
+    fn reads_group(&self, counted: bool) -> bool {
+        matches!(self.x.native.io, StageIo::Cs(_))
+            && self.s.mesh.is_none()
+            && group_rows_on()
+            && (counted || self.x.io.inputs.iter().any(|&(_, i)| matches!(i, Input::GroupId(_))))
+    }
+
+    /// The group number of a dispatch whose groups along X the host laid out in rows
+    /// (`shader.rs` `USER_GROUP_ROWS`): a D3D12 host runs at most 65,535 groups along a
+    /// dimension (more is cut there, or refused), where the console runs what it is asked;
+    /// the title's tile lists are dispatches of one group per tile, more than 65,535 of them
+    /// at 2560x1440. With words `row` (the groups of a row) and `asked` (the groups along X
+    /// asked for) the group in row `y` at `x` is the console's `y * row + x` along X and 0
+    /// along Y, and those past `asked` (the last row's end) leave at once: the whole group,
+    /// before anything, so no barrier waits for them. Without (`row` 0) the numbers are the
+    /// host's. Made in the entry block, which ends with that test; [`Self::compute_id`]
+    /// gives the numbers.
+    fn group_rows(&mut self) {
+        let original = self.s.entry;
+        let row = self.host_word(RootType::Other(super::shader::USER_GROUP_ROWS), 0, 0);
+        let asked = self.host_word(RootType::Other(super::shader::USER_GROUP_ROWS + 1), 0, 0);
+        let [x, y] = [0, 1].map(|c| {
+            let k = self.s.m.i32(c);
+            self.s.op(original, "groupId.i32", Attr::ReadNone, self.s.t.i32, GROUP_ID, &[k])
+        });
+        let m = &mut self.s.m;
+        let zero = m.i32(0);
+        // (`row` 0: `x` itself)
+        let before = m.bin(original, Bin::Mul, y, row);
+        let x = m.bin(original, Bin::Add, before, x);
+        let plain = m.cmp(original, pred::EQ, row, zero);
+        let y = m.select(original, plain, y, zero);
+        let inside = m.cmp(original, pred::IULT, x, asked);
+        let runs = m.bin(original, Bin::Or, plain, inside);
+        let (body, done) = (m.new_block(), m.new_block());
+        m.terminate(original, Term::CondBr(runs, body, done));
+        m.terminate(done, Term::Ret);
+        self.s.entry = body;
+        self.rows = Some((x, y));
     }
 
     /// The console runs a thread group on one CU, whose waves share its vector L0 cache: a

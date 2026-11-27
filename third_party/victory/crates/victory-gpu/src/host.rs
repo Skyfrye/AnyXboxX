@@ -1932,6 +1932,29 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// largest cost of one (told from 2^22 on), likewise.
 static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Indirect dispatch records run in rows (`crate::indirect::ROWS`: more
+/// than 65,535 groups along X), and the most groups along X one asked for,
+/// likewise.
+static ROWS_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A dispatch run in rows that the CPU laid out (a direct one of more than
+/// 65,535 groups along X, `asked` of them): noted as the clamps note theirs
+/// ([`ROWS_NOTES`]).
+pub(crate) fn note_rows(asked: u32) {
+    ROWS_NOTES[0].fetch_add(1, Ordering::Relaxed);
+    ROWS_NOTES[1].fetch_max(u64::from(asked), Ordering::Relaxed);
+}
+
+/// The words of a list's indirect-work budget buffer the clamps write: the
+/// budget, then their notes ([`MESH_GROUPS`], [`BUDGET_NOTES`],
+/// [`ROWS_NOTES`], and from word 7 the programs that asked for more groups
+/// along X than run, `crate::indirect::wide_tag`).
+const BUDGET_WORDS: usize = 8 + crate::indirect::WIDE_NOTES as usize;
+
+/// The programs whose indirect dispatches run in rows
+/// (`crate::indirect::noted_wide`), so far.
+static WIDE_PROGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -7770,7 +7793,8 @@ impl HostList {
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
             // asked for, the groups asked in all; the records refused, the
-            // largest cost; with the card's copy, as
+            // largest cost; dispatch records run in rows, the most groups
+            // asked along X; with the card's copy, as
             // the list's end copied them here): taken, then zeroed.
             let notes = Box::new(move || unsafe {
                 let words = at as *mut u32;
@@ -7780,7 +7804,15 @@ impl HostList {
                 let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
                 BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
-                for k in 0..5 {
+                let (rows, widest) = (words.add(5).read_volatile(), words.add(6).read_volatile());
+                ROWS_NOTES[0].fetch_add(u64::from(rows), Ordering::Relaxed);
+                ROWS_NOTES[1].fetch_max(u64::from(widest), Ordering::Relaxed);
+                let noted = words.add(7).read_volatile().min(crate::indirect::WIDE_NOTES);
+                for k in 0..noted as usize {
+                    let programs = crate::indirect::noted_wide(words.add(8 + k).read_volatile());
+                    WIDE_PROGRAMS.store(programs as u64, Ordering::Relaxed);
+                }
+                for k in 0..BUDGET_WORDS {
                     words.add(k).write_volatile(0);
                 }
             });
@@ -7815,8 +7847,8 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
-            Dest: at + offset,
+        let zeros: [_; BUDGET_WORDS] = std::array::from_fn(|k| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+            Dest: at + 4 * k as u64,
             Value: 0,
         });
         // SAFETY: an open list; the buffer is the list's own and in the
@@ -7856,7 +7888,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 4 * (BUDGET_WORDS as u64 - 1));
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -9896,8 +9928,11 @@ impl Meter {
             let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
             let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
             let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
+            let rows = ROWS_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+            let widest = ROWS_NOTES[1].swap(0, Ordering::Relaxed);
+            let programs = WIDE_PROGRAMS.load(Ordering::Relaxed);
             tracing::info!(
-                "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
+                "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22); {rows:.2} indirect dispatches a frame of more than 65,535 groups along X ran in rows, the widest {widest} ({programs} programs so far)"
             );
             crate::shadow::exact_line(frames);
             mapping::line(frames);
