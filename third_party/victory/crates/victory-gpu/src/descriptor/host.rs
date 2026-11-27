@@ -7185,12 +7185,12 @@ mod tests {
         assert_eq!(q.due(frame + 1, now + 1332, 10)[0].0, 7);
     }
 
-    /// The pass before a frame's first bake takes the writes of tables'
+    /// The pass before every bake of a frame takes the writes of tables'
     /// slots, due [`TABLED_GRACE`] frames on (it took them when its window
     /// was 12 frames; at 2 frames it left them, and a bake that picked one
     /// by index baked the stand-in into the title's texture for good), and
-    /// the slots due within its milliseconds; but a slot whose memory a
-    /// look found away only by that look's own time, not every time.
+    /// the slots due within its milliseconds at the first; but a slot whose
+    /// memory a look found away only by that look's own time, not every time.
     #[test]
     fn a_bake_takes_tables_writes_and_leaves_the_looks_to_their_time() {
         let mut q = TextureQueue::default();
@@ -7212,6 +7212,17 @@ mod tests {
         // A notice of its memory since: by the window, as any other.
         q.changed(2, frame, frame + 1);
         assert_eq!(ahead(&q, now), [2, 1]);
+        // A later bake of the frame takes a table's slot written after the
+        // first bake's pass too, but no look before its time. (At 2 frames
+        // it left it, and the later bake baked what the slot showed before.)
+        let mut q = TextureQueue::default();
+        q.written(1, frame, frame + TABLED_GRACE, false);
+        q.written(2, frame - 1, frame - 1, false);
+        let w = q.due(frame, now, 10).iter().find(|d| d.0 == 2).unwrap().1;
+        q.later(2, w, frame, now, q.look_cap());
+        let (frames, ms) = crate::draw::BAKE_AHEAD[1];
+        let later: Vec<u32> = TextureQueue::in_order(q.all_due_ahead(frame, now, frames, ms), 10).iter().map(|d| d.0).collect();
+        assert_eq!(later, [1], "the table's write, not the look before its time");
     }
 
     /// A slot uploaded whole and waiting for another look at its memory
