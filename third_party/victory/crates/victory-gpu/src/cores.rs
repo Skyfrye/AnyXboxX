@@ -287,6 +287,32 @@ pub(crate) fn settle() {
     );
 }
 
+/// Whether the threads the submitting thread hands its own work to, and
+/// waits for, run above normal priority as it does (`VICTORY_HELPERS_ABOVE=1`):
+/// the wide threads (its refreshes), those for the title's bytes under
+/// flights' writes, and the one of the heaps' records with those it shares
+/// its work with.
+///
+/// Why: the submitting thread was what the frame waited for (38 ms of a 40 ms
+/// frame in the opening, run p1-full2), and of that it waited for these
+/// threads' work (the refreshes on several threads, 10.4 ms; the heaps'
+/// records, 1.5-2.1 ms; run pt2). They ran at normal priority beside the
+/// title's threads, the list translators and the rest, some 11.7 of the 16
+/// threads' worth of work, and a woken helper could wait for a turn.
+fn helpers_above() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HELPERS_ABOVE"))
+}
+
+/// A helper of the submitting thread starts ([`helpers_above`]).
+pub(crate) fn raise_helper() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    if helpers_above() {
+        // SAFETY: this thread's own priority.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+    }
+}
+
 /// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
 /// one by one; 2 (the default): the threads they share their work with too;
 /// 3: those that work beside the rest as well (lists translated, descriptors
