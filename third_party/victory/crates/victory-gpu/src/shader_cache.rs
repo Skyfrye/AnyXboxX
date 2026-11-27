@@ -124,6 +124,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_GROUP_ROWS",
+            "VICTORY_LOOP_ONE_EXIT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -186,10 +187,46 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
+/// The programs `VICTORY_WAVE_PAIRED` names, by the 16 hex digits of their hash.
+fn paired_named() -> &'static [String] {
+    static NAMED: OnceLock<Vec<String>> = OnceLock::new();
+    NAMED.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_PAIRED")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16)
+            .collect()
+    })
+}
+
+/// Whether the program of hash `hash` (16 hex digits) is one `VICTORY_WAVE_PAIRED` names.
+pub(crate) fn paired_by_hash(hash: &str) -> bool {
+    paired_named().iter().any(|h| h == hash)
+}
+
+/// Whether `container` is one of the programs `VICTORY_WAVE_PAIRED` names.
+fn forced_paired(container: &[u8]) -> bool {
+    !paired_named().is_empty() && paired_by_hash(&blake3::hash(container).to_hex()[..16])
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // `VICTORY_WAVE_PAIRED=<hash>,...`: these programs (by the 16 hex digits the log names
+    // shaders by) take the paired form on a host of 32-lane waves, translated here each run and
+    // never from or into the cache, whose entries keep the form the rules give.
+    if forced_paired(container) {
+        victory_shader::emit::force_paired(true);
+        let done = translate(container);
+        victory_shader::emit::force_paired(false);
+        tracing::info!(
+            hash = &blake3::hash(container).to_hex()[..16],
+            "a console wave64 program takes the paired form, as asked (VICTORY_WAVE_PAIRED)"
+        );
+        return done;
+    }
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),

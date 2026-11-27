@@ -248,6 +248,153 @@ impl Module {
         }
     }
 
+    /// Loops whose iteration limit (the test the lowering adds at an unconditional back edge,
+    /// [`Module::limited_latch`]) leaves the program from the latch (`lower.rs` `abort_block`, a
+    /// return) get one block both ways out lead to: the loop's own exit edge and every edge of
+    /// the loop into that return (its latch's, and those of the loops in it) go to a new block,
+    /// from which a lane the limit stopped still leaves the program and the others go on to the
+    /// exit. Where the loop has one exit edge whose block dominates the latch and every such
+    /// edge, and leads to no loop header. Returns how many loops changed.
+    ///
+    /// The return was the loop's second way out, so the block after the loop did not
+    /// post-dominate it and the host compiler did not bring the lanes together there: lanes that
+    /// left the loop early ran the wave operations after it (a ballot, a first-lane read) without
+    /// the lanes still in it. The console leaves such a loop as one wave. In the water's tile
+    /// lists (`CS_TransmissionVolumetrics_GenerateTiles`, a wave64 program run as two host waves)
+    /// each half then counted part of its lanes and both wrote over the same places of the
+    /// list: 8x4-tile blocks of the water had no light through it (run wt1 and its replay).
+    ///
+    /// A lane the limit stops leaves the program as before. (Letting it go on to the exit
+    /// instead, with undefined values, lit the hair of the opening's cell orange: run ff1.)
+    pub(crate) fn one_loop_exit(&mut self) -> usize {
+        // Inner loops first, so that an outer one finds their ways into the return.
+        let depth_first = {
+            let tree = self.dominator_tree();
+            let mut depth = vec![0usize; self.blocks.len()];
+            for &b in &tree.order {
+                for &c in &tree.children[b] {
+                    depth[c] = depth[b] + 1;
+                }
+            }
+            let mut latches: Vec<(usize, usize)> = self
+                .limited
+                .iter()
+                .filter_map(|&l| match self.blocks[l].term {
+                    Some(Term::CondBr(_, header, _)) => Some((depth[header], l)),
+                    _ => None,
+                })
+                .collect();
+            latches.sort_by(|a, b| b.cmp(a));
+            latches.into_iter().map(|(_, l)| l).collect::<Vec<_>>()
+        };
+        let mut changed = 0;
+        for latch in depth_first {
+            let tree = self.dominator_tree();
+            let n = self.blocks.len();
+            // Entry and exit numbers in the dominator tree: `a` dominates `b` when `b`'s lie
+            // within `a`'s.
+            let (mut pre, mut post) = (vec![usize::MAX; n], vec![0usize; n]);
+            let mut clock = 0;
+            let mut stack = vec![(0usize, 0usize)];
+            if n > 0 {
+                pre[0] = 0;
+            }
+            while let Some(top) = stack.last_mut() {
+                let (b, k) = *top;
+                top.1 += 1;
+                match tree.children[b].get(k) {
+                    Some(&c) => {
+                        clock += 1;
+                        pre[c] = clock;
+                        stack.push((c, 0));
+                    }
+                    None => {
+                        clock += 1;
+                        post[b] = clock;
+                        stack.pop();
+                    }
+                }
+            }
+            let dominates = |a: usize, b: usize| {
+                pre[a] != usize::MAX && pre[b] != usize::MAX && pre[a] <= pre[b] && post[b] <= post[a]
+            };
+            let Some(Term::CondBr(_, header, abort)) = self.blocks[latch].term else {
+                continue;
+            };
+            if !dominates(header, latch) || header == abort || !matches!(self.blocks[abort].term, Some(Term::Ret)) {
+                continue;
+            }
+            // The natural loop of the back edge: the header and what reaches the latch without it.
+            let mut body = vec![false; n];
+            body[header] = true;
+            let mut work = vec![latch];
+            while let Some(b) = work.pop() {
+                if !body[b] {
+                    body[b] = true;
+                    work.extend(tree.preds[b].iter().copied());
+                }
+            }
+            // The loop's ways out: into the return (a lane the limit stopped, here or in a loop
+            // inside), and the others.
+            let (mut exits, mut stops, mut twice) = (Vec::new(), Vec::new(), false);
+            for b in (0..n).filter(|&b| body[b]) {
+                let to = successors(self.blocks[b].term);
+                twice |= to.iter().filter(|&&s| s == abort).count() > 1;
+                for &s in to.iter() {
+                    if s == abort {
+                        stops.push(b);
+                    } else if !body[s] {
+                        exits.push((b, s));
+                    }
+                }
+            }
+            let [(exiting, exit)] = exits[..] else { continue };
+            let header_of_loop = tree.preds[exit].iter().any(|&p| dominates(exit, p));
+            // (A join takes one value from a block: the exiting block must not stop lanes too.)
+            if twice
+                || header_of_loop
+                || stops.contains(&exiting)
+                || !stops.iter().all(|&b| dominates(exiting, b))
+            {
+                continue;
+            }
+            // The block both ways out lead to, and whether the limit stopped the lane.
+            let i1 = self.int(1);
+            let meet = self.new_block();
+            let stopped = self.phi(meet, i1);
+            let (no, yes) = (self.bool(false), self.bool(true));
+            let mut incoming = vec![(no, exiting)];
+            incoming.extend(stops.iter().map(|&b| (yes, b)));
+            self.set_phi(stopped, incoming);
+            self.terminate(meet, Term::CondBr(stopped, abort, exit));
+            let redirect = |term: Option<Term>, from: usize| match term {
+                Some(Term::Br(t)) if t == from => Some(Term::Br(meet)),
+                Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(
+                    c,
+                    if t == from { meet } else { t },
+                    if f == from { meet } else { f },
+                )),
+                t => t,
+            };
+            self.blocks[exiting].term = redirect(self.blocks[exiting].term, exit);
+            for &b in &stops {
+                self.blocks[b].term = redirect(self.blocks[b].term, abort);
+            }
+            // What the exit joined from the exiting block it now joins from the meeting.
+            for k in 0..self.blocks[exit].phis.len() {
+                let i = self.blocks[exit].phis[k] as usize;
+                if let Op::Phi(incoming) = &mut self.insts[i].op {
+                    for (_, from) in incoming.iter_mut().filter(|(_, from)| *from == exiting) {
+                        *from = meet;
+                    }
+                }
+            }
+            debug_assert!(matches!(self.blocks[latch].term, Some(Term::CondBr(_, h, m)) if h == header && m == meet));
+            changed += 1;
+        }
+        changed
+    }
+
     /// Per function: what a call of it does.
     pub(super) fn effects(&self) -> Vec<Effect> {
         self.funcs.iter().map(effect).collect()
@@ -1273,6 +1420,69 @@ mod tests {
         m.optimise(DEAD);
         assert_eq!(body(&m, b), 3, "the load, the add and the store");
         m.write();
+    }
+
+    /// A loop that leaves the program at its iteration limit (`one_loop_exit`) gets one block
+    /// both its exit edge and its latch's way into the return lead to, which sends a lane the
+    /// limit stopped on to the return and the others to the exit; a loop with two exits keeps
+    /// the return.
+    #[test]
+    fn a_limited_loop_leaves_through_its_own_exit() {
+        for exits in [1, 2] {
+            let Kit {
+                mut m,
+                b,
+                reads,
+                writes,
+                ..
+            } = kit();
+            let i32t = m.int(32);
+            let (zero, one) = (m.i32(0), m.i32(1));
+            let (head, latch, exit, abort) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+            m.terminate(b, Term::Br(head));
+            let count = m.phi(head, i32t);
+            let value = m.call(head, reads, vec![count, one]);
+            let done = m.cmp(head, pred::IULT, value, one);
+            m.terminate(head, Term::CondBr(done, exit, latch));
+            let next = m.bin(latch, Bin::Add, count, one);
+            let limit = m.i32(4096);
+            let ok = m.cmp(latch, pred::IULT, next, limit);
+            let other = if exits == 2 {
+                // A second way out, from the latch's own block.
+                let (side, more) = (m.new_block(), m.new_block());
+                let far = m.cmp(latch, pred::IULT, value, zero);
+                m.terminate(latch, Term::CondBr(far, side, more));
+                m.terminate(side, Term::Ret);
+                more
+            } else {
+                latch
+            };
+            m.terminate(other, Term::CondBr(ok, head, abort));
+            m.limited_latch(other);
+            m.set_phi(count, vec![(zero, b), (next, other)]);
+            let joined = m.phi(exit, i32t);
+            m.set_phi(joined, vec![(value, head)]);
+            m.call(exit, writes, vec![joined, one]);
+            m.terminate(exit, Term::Ret);
+            m.terminate(abort, Term::Ret);
+            let V::Inst(j) = joined else { unreachable!() };
+            if exits == 1 {
+                assert_eq!(m.one_loop_exit(), 1);
+                let Some(Term::CondBr(_, h, meet)) = m.blocks[latch].term else { panic!("the latch") };
+                assert_eq!(h, head);
+                assert!(matches!(m.blocks[head].term, Some(Term::CondBr(_, t, f)) if t == meet && f == latch));
+                assert!(matches!(m.blocks[meet].term, Some(Term::CondBr(_, t, f)) if t == abort && f == exit));
+                let &[stopped] = &m.blocks[meet].phis[..] else { panic!("one join") };
+                assert!(matches!(&m.insts[stopped as usize].op, Op::Phi(incoming)
+                    if incoming.iter().map(|&(_, b)| b).collect::<Vec<_>>() == [head, latch]));
+                assert!(matches!(&m.insts[j as usize].op, Op::Phi(incoming) if incoming[..] == [(value, meet)]));
+            } else {
+                assert_eq!(m.one_loop_exit(), 0);
+                assert!(matches!(m.blocks[other].term, Some(Term::CondBr(_, _, x)) if x == abort));
+                assert!(matches!(&m.insts[j as usize].op, Op::Phi(incoming) if incoming.len() == 1));
+            }
+            m.write();
+        }
     }
 
     #[test]

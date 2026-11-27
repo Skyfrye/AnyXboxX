@@ -226,6 +226,9 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Blocks that end a loop's iteration with its limit test: below it the loop goes on, at it
+    /// the program is left (`lower.rs` `abort_block`; [`Module::one_loop_exit`]).
+    limited: Vec<usize>,
 }
 
 impl Module {
@@ -384,6 +387,11 @@ impl Module {
         {
             self.tags.insert(i, tag);
         }
+    }
+
+    /// Notes that `block` ends in a loop's limit test whose other way leaves the program.
+    pub fn limited_latch(&mut self, block: usize) {
+        self.limited.push(block);
     }
 
     pub fn new_block(&mut self) -> usize {
