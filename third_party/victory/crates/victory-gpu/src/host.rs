@@ -9675,6 +9675,38 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// When the last frame was counted, and the ms between counted frames
+    /// since the last line of every 5 s ([`frame_times`]).
+    last: Option<std::time::Instant>,
+    times: Vec<f32>,
+}
+
+/// The line of every 5 s on how long frames took, from the ms between
+/// presented frames since the last one: a frame rate over seconds says
+/// nothing of the single frames that stand out (a wait of 30 ms in a frame
+/// of 40 is a hitch the eye sees, and a tenth of a frame on average).
+/// Counts over 50 and 100 ms, the longest, and those over 50 ms one by one,
+/// in order (the lows of a run come out of them; its window captures stall
+/// the title about a second each).
+fn frame_times(mut times: Vec<f32>) -> String {
+    if times.is_empty() {
+        return "frame times since the last such line: no frames".into();
+    }
+    let over = |ms: f32| times.iter().filter(|&&t| t > ms).count();
+    let (over50, over100) = (over(50.0), over(100.0));
+    let long: Vec<String> = times.iter().filter(|&&t| t > 50.0).map(|t| format!("{t:.0}")).collect();
+    times.sort_unstable_by(f32::total_cmp);
+    let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+    format!(
+        "frame times since the last such line: {} frames, median {:.1} ms, 95% under {:.1}, 99% under {:.1}; {over50} over 50 ms, \
+         {over100} over 100 ms, the longest {:.0} ms; over 50 ms: [{}]",
+        times.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        times[times.len() - 1],
+        long.join(", ")
+    )
 }
 
 impl Meter {
@@ -9689,6 +9721,8 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            last: None,
+            times: Vec::new(),
         }
     }
 
@@ -9722,6 +9756,10 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last.replace(now) {
+            self.times.push((now - last).as_secs_f32() * 1000.0);
+        }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -9741,6 +9779,7 @@ impl Meter {
         if five {
             self.logged = std::time::Instant::now();
         }
+        let times = if five { std::mem::take(&mut self.times) } else { Vec::new() };
         #[cfg(feature = "diagnostics")]
         let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };
         meter_lines(move || {
@@ -10002,6 +10041,7 @@ impl Meter {
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                     objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
                 );
+                tracing::info!("{}", frame_times(times));
                 #[cfg(feature = "diagnostics")]
                 {
                     let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -10075,6 +10115,19 @@ mod present_status_tests {
         assert!(meter.record_present(hwnd, S_OK));
         assert_eq!(meter.frames, 2);
         assert_eq!(meter.last_present, S_OK);
+        // The time between the two frames counted, not before the first.
+        assert_eq!(meter.times.len(), 1);
+    }
+
+    /// The frames that stand out are counted and named, in order.
+    #[test]
+    fn frame_times_count_the_long_frames() {
+        let mut times = vec![40.0f32; 96];
+        times.extend([55.0, 120.0, 1100.0, 70.0]);
+        let line = super::frame_times(times);
+        assert!(line.contains("100 frames, median 40.0 ms"), "{line}");
+        assert!(line.contains("4 over 50 ms, 2 over 100 ms, the longest 1100 ms; over 50 ms: [55, 120, 1100, 70]"), "{line}");
+        assert!(super::frame_times(Vec::new()).contains("no frames"));
     }
 }
 
