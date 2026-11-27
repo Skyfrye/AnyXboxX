@@ -565,7 +565,7 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     crate::ram::tick();
-    if crate::residency::pressured() {
+    if crate::residency::pressured() && !(keep_scratch() && !crate::residency::critical_commit()) {
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -2165,12 +2165,31 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
 }
 
+/// Whether the scratch chunks kept idle stay when the PC is short of free
+/// memory, and go only when it is short of commit
+/// (`VICTORY_SCRATCH_KEEP=1`; off: they go at every sweep under pressure,
+/// as before).
+///
+/// They are at most [`SPARE_MOST`] (128 MiB) where memory is short, and
+/// lists take them again within a frame or two: let go at the sweep of
+/// every second, they were made again by the threads that translate the
+/// title's lists, at the first scratch a list asked for. In the first
+/// cutscene the PC had 1.4 GB free from the scene's start on, every sweep
+/// let them go, and making them was 12-18% of those threads' translating
+/// (`CreateCommittedResource` and the mapping, profile s2-f1); the lists
+/// the line of submissions waits for were translated that much later.
+fn keep_scratch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SCRATCH_KEEP"))
+}
+
 /// Scratch chunks made, and their bytes, since the start (the book of
 /// frames, [`crate::framebook`]).
 pub(crate) static CHUNKS_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Lets go of the scratch chunks kept idle, when the system is short of
-/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
+/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]; with
+/// [`keep_scratch`] only when it is short of commit).
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
