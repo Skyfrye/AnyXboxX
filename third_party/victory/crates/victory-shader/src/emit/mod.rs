@@ -472,7 +472,9 @@ pub fn emit_with_retries(
 /// A console wave64 compute program on a host of 32-lane waves that no form in two host waves
 /// gives the host (it still asks for 64-lane waves, or does not translate) takes the paired
 /// form, each console wave run by one host wave ([`paired`]; `VICTORY_WAVE_PAIRS=0` turns it
-/// off). Which form such a program took is [`take_wave_form`]'s.
+/// off). So does one whose exact form in two host waves has them meet at
+/// [`MEETINGS_FOR_PAIRS`] group barriers or more beyond what the paired form needs. Which form
+/// such a program took is [`take_wave_form`]'s.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -482,8 +484,32 @@ pub fn emit(
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
     WAVE_FORM.set(None);
+    MEETINGS.set(0);
     let r = emit_forms(c, native, p, st, io, res);
+    // (the translation `emit_forms` gives is the last one it made)
+    let meetings = MEETINGS.get();
     let wave64_on_32 = native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
+    let exact_halves = WAVE_FORM.get().is_none_or(|f| f != WaveForm::PAIRED && !f.approximate());
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    if why && r.is_ok() && wave64_on_32 && meetings > 0 {
+        eprintln!("WAVE64-MEETINGS {meetings} in {:?}", WAVE_FORM.get().unwrap_or(WaveForm::HALVES).0);
+    }
+    if r.is_ok() && wave64_on_32 && exact_halves && meetings >= MEETINGS_FOR_PAIRS && pairs_on() {
+        let again = paired(c, native, p, io, res);
+        let paired_meetings = MEETINGS.get();
+        if why {
+            match &again {
+                Ok(_) => eprintln!("WAVE64-RETRY paired lanes for {meetings} meetings: {paired_meetings} meetings"),
+                Err(e) => eprintln!("WAVE64-RETRY paired lanes for {meetings} meetings: {e}"),
+            }
+        }
+        if let Ok((shader, _)) = again
+            && paired_meetings.saturating_add(MEETINGS_FOR_PAIRS) <= meetings
+        {
+            WAVE_FORM.set(Some(WaveForm::PAIRED));
+            return Ok(shader);
+        }
+    }
     // (a mask with lanes elsewhere is retried with mask operations on numbers first,
     // `translate`; the paired form comes after that)
     let retried_first = matches!(&r, Err(ShaderError::Unsupported { what, .. })
@@ -528,7 +554,21 @@ impl WaveForm {
 thread_local! {
     /// See [`take_wave_form`].
     static WAVE_FORM: std::cell::Cell<Option<WaveForm>> = const { std::cell::Cell::new(None) };
+    /// The group barriers where host waves meet of the last program [`emit_program`] translated
+    /// on this thread (`lower::Lowered::meetings`).
+    static MEETINGS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+
+/// The paired form instead of an exact one in two host waves ([`emit`]) where that one has the
+/// two waves meet at this many group barriers more than the paired form does. Each meeting
+/// stalls both host waves of the console wave on an LDS round trip (a loop repeats it); the
+/// paired form runs what a lane does twice in one host wave instead, at about twice the code.
+/// Measured on an RTX 5080, a cutscene frame replayed turn by turn: the title's work 42.5 ->
+/// 38.5 ms with the 31 programs this took then (a decal classification's waterfall loops 3.4 ms
+/// -> under 0.04, a program that now takes the paired form for its loops alone; three tiled
+/// cascade shadow programs 1.9 -> 0.6 ms); five of them ran 0.04 to 0.18 ms slower. With every console wave64 program paired that took the form, those whose
+/// halves meet at 17 group barriers or fewer, or nowhere, ran slower, up to twice.
+pub const MEETINGS_FOR_PAIRS: u32 = 32;
 
 /// The form the last program [`emit`] translated on this thread took, if it was a console
 /// wave64 compute program on a host of 32-lane waves (none after a refusal or for any other
@@ -1111,6 +1151,7 @@ fn emit_program(
         mesh_stride,
     })?;
     let wave_size = l.wave_size;
+    MEETINGS.set(l.meetings);
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,

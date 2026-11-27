@@ -619,3 +619,56 @@ fn a_loop_the_lanes_leave_one_by_one_is_not_where_two_host_waves_meet() {
     same_as_console("rounds until the own value", &got, &want);
     eprintln!("ran on the hardware device: a loop the lanes leave one by one, as on the console");
 }
+
+/// `n` counts over one console wave of 64 threads, summed: `v_cmp_gt_u32 vcc, 3i + 1, v0` and
+/// `s_bcnt1_i32_b64` of VCC, added into s14, which every thread stores. In two host waves each
+/// count needs both halves' masks: an exchange through LDS at two group barriers.
+fn counts_over_the_wave(n: u32) -> NativeProgram {
+    let mut w = vec![sop1(0x03, 14, k(0))]; // s_mov_b32 s14, 0
+    for i in 0..n {
+        w.extend([
+            vopc(0xC4, LIT, 0), // v_cmp_gt_u32 vcc, 3i + 1, v0: lanes 0..3i
+            3 * i + 1,
+            sop1(0x10, 15, VCC),    // s_bcnt1_i32_b64 s15, vcc
+            sop2(0x00, 14, 14, 15), // s_add_u32 s14, s14, s15
+        ]);
+    }
+    w.push(vop1(0x01, 9, 14)); // v_mov_b32 v9, s14
+    w.extend(stores([9, 0, 0, 0]));
+    native_of(&w, true, 64)
+}
+
+/// A program whose exact form in two host waves has them meet at many group barriers (two
+/// for each count over the wave) takes the paired form, which meets at none; one that meets
+/// at a few keeps the two host waves. Both give what the console's 64 lanes compute.
+#[test]
+fn a_program_whose_halves_meet_often_takes_the_paired_form() {
+    let halves = |native: &NativeProgram| {
+        let (shader, form) = emitted_32(native, false);
+        (shader.expect("two host waves"), form, super::super::MEETINGS.get())
+    };
+    let (few, many) = (counts_over_the_wave(2), counts_over_the_wave(24));
+    let (_, few_form, few_meetings) = halves(&few);
+    let (many_halves, many_form, many_meetings) = halves(&many);
+    assert_eq!((few_form, many_form), (Some(WaveForm::HALVES), Some(WaveForm::HALVES)), "the forms without pairs");
+    let threshold = super::super::MEETINGS_FOR_PAIRS;
+    assert!(few_meetings < threshold && many_meetings >= threshold + 2, "meetings: {few_meetings} and {many_meetings}");
+    assert_eq!(emitted_32(&few, true).1, Some(WaveForm::HALVES), "a few meetings keep two host waves");
+    let (chosen, form) = emitted_32(&many, true);
+    assert_eq!(form, Some(WaveForm::PAIRED), "emit's form for {many_meetings} meetings");
+    let chosen = chosen.expect("emit");
+    // (`paired` checks that emit's choice is the paired form)
+    assert!(paired(&many).dxil == chosen.dxil);
+    let want = |n: u32| -> Vec<u32> {
+        let total: u32 = (0..n).map(|i| (3 * i + 1).min(64)).sum();
+        (0..64u32).flat_map(|t| [total, t, t, t]).collect()
+    };
+    let _one = super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run(&chosen, [0; 4], 256) else { return };
+    same_as_console("24 counts over the wave, paired lanes", &got, &want(24));
+    let Some(got) = run(&many_halves, [0; 4], 256) else { return };
+    same_as_console("24 counts over the wave, two host waves", &got, &want(24));
+    let Some(got) = run(&emitted_32(&few, true).0.expect("emit"), [0; 4], 256) else { return };
+    same_as_console("2 counts over the wave, two host waves", &got, &want(2));
+    eprintln!("ran on the hardware device: counts over the wave in both forms as on the console");
+}
