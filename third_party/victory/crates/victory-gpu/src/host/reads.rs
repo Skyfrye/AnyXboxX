@@ -79,6 +79,10 @@ pub(super) fn on() -> bool {
 /// The most bytes a submission brings back this way.
 const MOST: usize = 16 << 20;
 
+/// The memory [`FETCH`] keeps for the parts it fetches, between reads: a
+/// longer fetch has memory of its own, let go after it.
+const KEPT: u64 = 1 << 20;
+
 /// Since the last frame-rate line: reads waited for per fence; flights in
 /// the air up to the last one waited for; microseconds waiting for the card;
 /// microseconds bringing back; bytes brought back; of them bytes put into
@@ -668,7 +672,7 @@ impl Host {
             return Err("no copy queue to fetch with");
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(1 << 20);
+            let size = total.next_multiple_of(64 << 10);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
@@ -742,6 +746,10 @@ impl Host {
                 put += merged as u64;
             }
         }
+        // A long fetch's memory is let go (it has run, and was waited for).
+        if f.buffer.as_ref().is_some_and(|b| b.2 > KEPT) {
+            f.buffer = None;
+        }
         Ok(put)
     }
 
@@ -751,6 +759,7 @@ impl Host {
             let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
             let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
             list.Close().ok()?;
+            // (At the priority of the relay's own copy queue.)
             let queue: ID3D12CommandQueue = self
                 .device
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
