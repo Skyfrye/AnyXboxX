@@ -1158,6 +1158,7 @@ impl Memory {
         if info.size >= 32 << 20 {
             tracing::info!(mb = info.size >> 20, at = ?ptr, "memory for the title from our allocator (a heap or a descriptor heap)");
         }
+        crate::ram::title_from_ours(layout.size() as i64);
         Ok(Memory {
             ptr,
             layout,
@@ -1170,8 +1171,11 @@ impl Drop for Memory {
     fn drop(&mut self) {
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
-            // SAFETY: allocated in `new` with this layout.
-            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+            _ => {
+                crate::ram::title_from_ours(-(self.layout.size() as i64));
+                // SAFETY: allocated in `new` with this layout.
+                unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
+            }
         }
     }
 }

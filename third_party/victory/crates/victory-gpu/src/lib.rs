@@ -87,6 +87,8 @@ pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
 #[cfg(windows)]
+mod ram;
+#[cfg(windows)]
 mod residency;
 pub mod resource;
 pub mod root;
@@ -147,6 +149,8 @@ pub fn frames_begun() -> u64 {
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use pagegen::title_physical_written;
+#[cfg(windows)]
+pub use ram::{title_allocation, title_from_ours};
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,

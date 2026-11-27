@@ -111,6 +111,7 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
         heap.give_back(apu, apu + layout.size() as u32);
         return None;
     }
+    victory_gpu::title_from_ours(layout.size() as i64);
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
@@ -130,6 +131,7 @@ fn heap_free(ptr: *mut u8) {
     heap.by_apu.remove(&block.apu);
     heap.give_back(block.apu, block.apu + block.layout.size() as u32);
     drop(heap);
+    victory_gpu::title_from_ours(-(block.layout.size() as i64));
     // SAFETY: allocated by `heap_alloc` with this layout.
     unsafe { std::alloc::dealloc(ptr, block.layout) };
 }

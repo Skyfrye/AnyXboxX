@@ -564,6 +564,7 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
+    crate::ram::tick();
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
@@ -1386,6 +1387,20 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Preludes made on their list's allocator (`VICTORY_SHARE_PRELUDE`) since
+/// the start.
+pub(crate) static SHARED_PRELUDES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`rec::recorded`]: what host lists' allocators keep, in calls.
+pub(crate) fn recorded() -> [u64; 2] {
+    rec::recorded()
+}
+
+/// Bytes of upload memory sends keep for the next submissions.
+pub(crate) fn sends_kept() -> u64 {
+    send::kept_bytes()
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -6860,6 +6875,7 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.list.closed();
     }
 
     /// In place of [`HostList::close`], for a list just taken (made, or reset
@@ -6941,6 +6957,7 @@ impl HostList {
         if self.left_open.swap(false, Ordering::AcqRel) {
             return;
         }
+        self.list.restart();
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -9501,6 +9518,11 @@ impl Host {
                 &mut buffer,
             )
         };
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::ram::track(b, crate::ram::Heap::ReadBack, size);
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -9581,6 +9603,11 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "an upload buffer".into());
+        }
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::ram::track(b, crate::ram::Heap::Upload, size);
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
@@ -10611,6 +10638,11 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "a shared buffer".into());
+        }
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::ram::track(b, crate::ram::Heap::Shared, size);
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
