@@ -17,7 +17,13 @@
 //! `sgpr <user-data index> <value>`, `table <user-data index> <heap slot>`,
 //! and one `view` line per heap slot in order:
 //! `view typed <dxgi format> <element bytes> <stride word> <hex dwords...>`,
-//! `view raw <hex dwords...>`, `view cbv <hex dwords...>`.
+//! `view raw <hex dwords...>`, `view cbv <hex dwords...>`; or with the dwords from a file
+//! (`<offset>` and `<bytes>` in hexadecimal): `view rawfile <path> <offset> <bytes>` (a raw
+//! UAV), `view rawsrvfile ...`, `view cbvfile ...`, and `view texufile <width> <height> <path>`
+//! (an RGBA32_UINT texture SRV, rows of texels without padding). A user-data entry of the
+//! whole view heap (`ResourceHeap`) is 0. `patch`, `append` and `debug` lines instrument the
+//! program at test time ([`Plan::patches`]). `VICTORY_ORACLE_WAVE=32` translates for a host of
+//! 32-lane waves. Each UAV's words also go to `<stem>.uav<n>.bin`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -154,12 +160,29 @@ enum PlanView {
         stride: u32,
     },
     Cbv(Vec<u32>),
+    /// An RGBA32_UINT texture SRV (width, height, texels as bits).
+    TexUint(u32, u32, Vec<[f32; 4]>),
+}
+
+/// `<bytes>` bytes from `<offset>` of the file, as dwords.
+fn file_words(path: &str, offset: &str, bytes: &str) -> Vec<u32> {
+    let all = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let at = usize::from_str_radix(offset, 16).unwrap();
+    let n = usize::from_str_radix(bytes, 16).unwrap();
+    all[at..at + n].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
 struct Plan {
     container: PathBuf,
     /// Replacement GFX10 code (a cut or instrumented copy, for bisecting).
     code: Option<(u32, PathBuf)>,
+    /// Words written over the container's own code at byte offsets (`patch <hex offset>
+    /// <hex words...>`), words after its end (`append <hex words...>`), and the table slot of
+    /// the raw UAV they may write (`debug <user-data index> <slot>`): an instrumented copy
+    /// made at test time, never kept in a file.
+    patches: Vec<(usize, Vec<u32>)>,
+    append: Vec<u32>,
+    debug: Option<(u8, u32)>,
     groups: [u32; 3],
     sgprs: Vec<(u32, u32)>,
     tables: Vec<(u32, u32)>,
@@ -180,6 +203,9 @@ fn parse_plan(text: &str) -> Plan {
     let mut plan = Plan {
         container: PathBuf::new(),
         code: None,
+        patches: Vec::new(),
+        append: Vec::new(),
+        debug: None,
         groups: [1, 1, 1],
         sgprs: Vec::new(),
         tables: Vec::new(),
@@ -197,6 +223,9 @@ fn parse_plan(text: &str) -> Plan {
                 plan.code = Some((slot.parse().unwrap(), PathBuf::from(path)));
             }
             Some("groups") => plan.groups = [n(1), n(2), n(3)],
+            Some("patch") => plan.patches.push((usize::from_str_radix(w[1], 16).unwrap(), hex(&w[2..]))),
+            Some("append") => plan.append.extend(hex(&w[1..])),
+            Some("debug") => plan.debug = Some((n(1) as u8, n(2))),
             Some("sgpr") => plan.sgprs.push((n(1), n(2))),
             Some("table") => plan.tables.push((n(1), n(2))),
             Some("address") => plan.addresses.push((n(1), u64::from_str_radix(w[2], 16).unwrap())),
@@ -217,6 +246,18 @@ fn parse_plan(text: &str) -> Plan {
                     stride: n(5),
                 },
                 "cbv" => PlanView::Cbv(hex(&w[2..])),
+                "rawfile" => PlanView::Raw(file_words(w[2], w[3], w[4]), false),
+                "rawsrvfile" => PlanView::Raw(file_words(w[2], w[3], w[4]), true),
+                "cbvfile" => PlanView::Cbv(file_words(w[2], w[3], w[4])),
+                "texufile" => {
+                    let (tw, th) = (n(2), n(3));
+                    let words = file_words(w[4], "0", &format!("{:x}", tw * th * 16));
+                    let texels = words
+                        .chunks_exact(4)
+                        .map(|c| [f32::from_bits(c[0]), f32::from_bits(c[1]), f32::from_bits(c[2]), f32::from_bits(c[3])])
+                        .collect();
+                    PlanView::TexUint(tw, th, texels)
+                }
                 other => panic!("unknown view {other}"),
             }),
             _ => {}
@@ -231,6 +272,7 @@ fn translate_with_code(
     container: &[u8],
     code: Vec<u8>,
     debug_slot: u32,
+    debug_user_data: Option<u8>,
 ) -> Result<super::HostShader, crate::ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
@@ -243,7 +285,11 @@ fn translate_with_code(
     native.code = code;
     // (the cut keeps the thread index in v255)
     native.vgprs = 256;
-    if let Some(t) = native.layout.iter().find(|p| p.root == RootType::Table) {
+    if let Some(t) = native
+        .layout
+        .iter()
+        .find(|p| p.root == RootType::Table && debug_user_data.is_none_or(|u| p.user_data == u))
+    {
         native.used.push(crate::native::UsedResource {
             kind: crate::native::ResourceType::Uav,
             root: RootType::Table,
@@ -263,16 +309,42 @@ fn translate_with_code(
     super::emit_with_retries(&c, &native, &p, &st, &io, &res)
 }
 
+/// The GFX10 code of the container's compute program.
+fn native_code(container: &[u8]) -> Result<Vec<u8>, String> {
+    let c = Container::parse(container).map_err(|e| e.to_string())?;
+    let dxil = c.part(FourCC::DXIL).ok_or("no DXIL part")?;
+    let native = crate::native_programs(dxil.data)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .ok_or("no compute program")?;
+    Ok(native.code)
+}
+
 /// Runs one plan; the UAV words in heap order.
 fn run_plan(host: &Host, plan: &Plan) -> Result<Vec<Vec<u32>>, String> {
     let bytes = std::fs::read(&plan.container).map_err(|e| e.to_string())?;
     let shader = match &plan.code {
-        None => translate(&bytes).map_err(|e| e.to_string())?,
+        None if plan.patches.is_empty() && plan.append.is_empty() => translate(&bytes).map_err(|e| e.to_string())?,
+        None => {
+            let mut code = native_code(&bytes)?;
+            for (at, words) in &plan.patches {
+                for (k, w) in words.iter().enumerate() {
+                    code[at + 4 * k..at + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+            code.extend(plan.append.iter().flat_map(|w| w.to_le_bytes()));
+            let (ud, slot) = plan.debug.map_or((None, 0), |(u, s)| (Some(u), s));
+            translate_with_code(&bytes, code, slot, ud).map_err(|e| e.to_string())?
+        }
         Some((slot, code)) => {
             let code = std::fs::read(code).map_err(|e| e.to_string())?;
-            translate_with_code(&bytes, code, *slot).map_err(|e| e.to_string())?
+            translate_with_code(&bytes, code, *slot, None).map_err(|e| e.to_string())?
         }
     };
+    if let Some(form) = super::take_wave_form() {
+        eprintln!("form: {}", form.0);
+    }
     let (root, pso) = host.compute_pipeline(&shader)?;
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
@@ -292,6 +364,7 @@ fn run_plan(host: &Host, plan: &Plan) -> Result<Vec<Vec<u32>>, String> {
                     .find(|a| a.0 == base + u.dword / 8)
                     .map(|a| if kind == super::USER_VIEW_ADDRESS { a.1 as u32 } else { (a.1 >> 32) as u32 })
             }
+            RootType::ResourceHeap => Some(0),
             _ => None,
         };
         ud[u.index as usize] = value.ok_or_else(|| format!("no plan value for user data {u:?}"))?;
@@ -303,7 +376,7 @@ fn run_plan(host: &Host, plan: &Plan) -> Result<Vec<Vec<u32>>, String> {
             PlanView::Typed { stride, .. } => *stride,
             PlanView::Raw(..) => 1,
             PlanView::Alias { stride, .. } => *stride,
-            PlanView::Cbv(_) => 0,
+            PlanView::Cbv(_) | PlanView::TexUint(..) => 0,
         })
         .collect();
     strides.resize(strides.len().max(256), 0);
@@ -370,6 +443,7 @@ fn run_plan(host: &Host, plan: &Plan) -> Result<Vec<Vec<u32>>, String> {
                 elem_bytes: *bytes,
             },
             PlanView::Cbv(data) => View::Cbv(data),
+            PlanView::TexUint(w, h, texels) => View::UintTexture(*w, *h, texels),
         })
         .collect();
     let made = host.dispatch(
@@ -409,6 +483,11 @@ fn oracle_run() {
     let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     let only = std::env::var("VICTORY_ORACLE_ONLY").ok();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // `VICTORY_ORACLE_WAVE`: the host's widest wave the translation takes (32: the forms of
+    // console wave64 programs for 32-lane hosts)
+    if let Some(w) = std::env::var("VICTORY_ORACLE_WAVE").ok().and_then(|v| v.parse().ok()) {
+        super::lower::TEST_HOST_WAVE.set(Some(w));
+    }
     let host = Host::new(warp).expect("host device");
     eprintln!("adapter: {:?}", host.adapter_name());
     let mut paths: Vec<_> = std::fs::read_dir(&out)
@@ -426,6 +505,8 @@ fn oracle_run() {
             Ok(uavs) => {
                 let mut t = String::new();
                 for (i, words) in uavs.iter().enumerate() {
+                    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    std::fs::write(out.join(format!("{s}.uav{i}.bin")), bytes).unwrap();
                     write!(t, "uav {i}").unwrap();
                     for w in words {
                         write!(t, " {w:08x}").unwrap();

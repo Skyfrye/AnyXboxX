@@ -1106,6 +1106,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32_UINT texture SRV (width, height, texels: each channel's bits as an `f32`).
+    UintTexture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
     Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1299,13 +1301,18 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
+                    View::Texture(..) | View::UintTexture(..) | View::Cube(..) => {
                         let (w, h, mut texels, faces, mips) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Texture(w, h, t) | View::UintTexture(w, h, t) => (w, h, t, 1, 1),
                             View::Cube(n, mips, t) => (n, n, t, 6, mips),
                             _ => unreachable!(),
                         };
-                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
+                        let mut desc = match *v {
+                            View::UintTexture(..) => {
+                                texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R32G32B32A32_UINT)
+                            }
+                            _ => texture(w, h, D3D12_RESOURCE_FLAG_NONE),
+                        };
                         desc.DepthOrArraySize = faces as u16;
                         desc.MipLevels = mips;
                         let tex = make(
