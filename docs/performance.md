@@ -172,6 +172,10 @@ These are not speed changes, but they change how textures reach the card, so the
 - **Stand-ins (`c028950b`).** A texture slot waiting for its upload shows an opaque stand-in, not zeros.
 - **`VICTORY_AMBIENT_SPECULAR=1.5` (`830ec9d9`).** With ray tracing off, reflections bounded by the light around them, so eyes are not lit white.
 - **Pipeline libraries (`53389734`).** A host pipeline library that another setup rejects is kept beside the new one, so neither setup starts with every pipeline to make: 0.1-1.5 fps for two minutes otherwise.
+- **Loops' iteration limit (`6b383feb`, `ce677898`, `VICTORY_LOOP_ONE_EXIT`, on).** The translator stops every loop after a number of iterations so that bad data cannot hang the card. A lane stopped at an unconditional back edge used to jump straight to a return, which gave the loop a second way out. The block after the loop then no longer post-dominated it, so the driver's compiler could not bring the lanes back together there, and the wave operations after the loop (ballots, first-lane reads, the exchanges of a wave64 program run as two 32-lane waves) saw only some of the lanes. The open world's water lost whole 8x4-tile groups of its transmitted light (dark blocks on the docks' water): its tile list is appended to with one atomic per console wave, and the two halves wrote over each other. Now both ways out of such a loop go to one new block, which sends a stopped lane on to the return and the others to the exit. A first form that let stopped lanes run on with undefined values lit the opening's hair orange and was replaced. About a fifth of the programs translate differently, so `TRANSLATOR_VERSION` is 4 and the first start after updating translates and builds them again. To do that ahead of play:
+  - `victory translate --warm all --jobs 16` with `VICTORY_HOST_WAVE=32` and `VICTORY_VIEW_LIMIT` set as the run's log says (999999 for a 1,000,000-view heap; about 90 s);
+  - one run with `VICTORY_PIPELINE_BOOK=1` and `VICTORY_PIPELINE_WORKERS=12`;
+  - then `victory warm --used`.
 
 ## Tried and left out
 
