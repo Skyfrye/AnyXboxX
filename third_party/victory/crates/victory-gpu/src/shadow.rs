@@ -3515,20 +3515,22 @@ pub(crate) fn memory() -> [u64; 6] {
 /// Since the last line: bytes copies' refreshes took (whole ranges of copies
 /// without a write watch; blocks found written; of those, ranges shaders' writes
 /// went into title memory in the last two frames, landed and now sent up again),
-/// refreshes of each kind, the largest whole range, and the last line's time.
-static UPLOADS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// refreshes of each kind, the largest whole range, the last line's time, and of
+/// the landed ones those whose writes went into title memory at this address (not
+/// only at another address of the same pages, `crate::watch::landed_here_lately`).
+static UPLOADS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Whether copies' refreshes are counted by kind and said every 5 s
 /// (`VICTORY_UPLOAD_SPLIT=1`; off by default: the look at what landed lately
 /// goes over every page of a refreshed range).
-fn upload_split_on() -> bool {
+pub(crate) fn upload_split_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_SPLIT").is_some_and(|v| v == "1"))
 }
 
 /// Counts a refresh of `range` bytes that took `bytes` ([`UPLOADS`]) and says
 /// every 5 s how the copies' uploads split.
-fn upload_split(bytes: usize, whole: bool, landed: bool, range: usize) {
+fn upload_split(bytes: usize, whole: bool, (landed, here): (bool, bool), range: usize) {
     let bytes = bytes as u64;
     if whole {
         UPLOADS[0].fetch_add(bytes, Ordering::Relaxed);
@@ -3540,24 +3542,28 @@ fn upload_split(bytes: usize, whole: bool, landed: bool, range: usize) {
         if landed {
             UPLOADS[2].fetch_add(bytes, Ordering::Relaxed);
         }
+        if here {
+            UPLOADS[7].fetch_add(bytes, Ordering::Relaxed);
+        }
     }
     let now = crate::host::now_us();
     let last = UPLOADS[6].load(Ordering::Relaxed);
     if now.saturating_sub(last) >= 5_000_000 && UPLOADS[6].compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         let frames = (now.saturating_sub(last) as f64 / 1e6 * 25.0).max(1.0);
         let mb = |i: usize| UPLOADS[i].swap(0, Ordering::Relaxed) as f64 / 1048576.0;
-        let (whole, written, landed) = (mb(0), mb(1), mb(2));
+        let (whole, written, landed, here) = (mb(0), mb(1), mb(2), mb(7));
         let (n_whole, n_written) = (UPLOADS[3].swap(0, Ordering::Relaxed), UPLOADS[4].swap(0, Ordering::Relaxed));
         let largest = UPLOADS[5].swap(0, Ordering::Relaxed) as f64 / 1048576.0;
         if last != 0 {
             tracing::info!(
-                "copies' uploads per frame (at 25 a second): {:.1} MB whole, copies without a write watch ({:.0} refreshes, the largest {:.1} MB); {:.1} MB of blocks found written ({:.0} refreshes), {:.1} MB of it in ranges shaders' writes landed in lately; texture passes with the card full since the start: {}",
+                "copies' uploads per frame (at 25 a second): {:.1} MB whole, copies without a write watch ({:.0} refreshes, the largest {:.1} MB); {:.1} MB of blocks found written ({:.0} refreshes), {:.1} MB of it in ranges shaders' writes landed in lately ({:.1} MB where they landed at this address, the rest at another address of the same pages only); texture passes with the card full since the start: {}",
                 whole / frames,
                 n_whole as f64 / frames,
                 largest,
                 written / frames,
                 n_written as f64 / frames,
                 landed / frames,
+                here / frames,
                 crate::draw::HEAP_TEXTURES_FULL.load(Ordering::Relaxed)
             );
         }
@@ -4533,7 +4539,15 @@ impl Shadow {
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 if upload_split_on() {
-                    upload_split(copied, false, copied != 0 && crate::watch::landed_lately(from, to - from, 2), to - from);
+                    upload_split(
+                        copied,
+                        false,
+                        (
+                            copied != 0 && crate::watch::landed_lately(from, to - from, 2),
+                            copied != 0 && crate::watch::landed_here_lately(from, to - from, 2),
+                        ),
+                        to - from,
+                    );
                 }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
@@ -4554,7 +4568,7 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         if upload_split_on() {
-            upload_split(to - from, true, false, to - from);
+            upload_split(to - from, true, (false, false), to - from);
         }
         to - from
     }
