@@ -537,19 +537,59 @@ enum To {
     Buffer(ID3D12Resource),
 }
 
+/// Whether the reads of a level that lie apart in their host copy as their
+/// places lie apart in the buffer between go as one copy
+/// (`VICTORY_STEPS_JOINED=0`: a copy each, as before).
+///
+/// The fills read the title's ring of constants, one constant buffer after
+/// the other: some 6,150 a frame in the world (run nbc-measure), each its own
+/// copy command of 424 bytes on the drawing queue, in front of the
+/// submission's lists. The same bytes in runs are a few copies.
+fn steps_joined() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STEPS_JOINED").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: reads asked for, and the copies they
+/// went in.
+static READS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `reads` (source, offset in it, place in the buffer between, bytes) in
+/// fewer copies: a read that follows the one before it in the same source
+/// (`same`), as far past its end as its place is past the other's place's
+/// end, and less than 256 bytes past it, joins it with the bytes between
+/// the two. Those land in the padding behind the other's place, which no
+/// place has: a level's places are given in order, each at the end of the
+/// last one rounded up to 256 bytes, so less than 256 bytes past a place's
+/// end there is no other place.
+pub(super) fn runs_of<T: Copy>(reads: &[(T, u64, u64, u64)], same: impl Fn(T, T) -> bool) -> Vec<(T, u64, u64, u64)> {
+    let mut out: Vec<(T, u64, u64, u64)> = Vec::with_capacity(reads.len());
+    for &(source, offset, at, len) in reads {
+        if let Some(last) = out.last_mut() {
+            let (end, place_end) = (last.1 + last.3, last.2 + last.3);
+            if same(last.0, source) && offset >= end && at >= place_end && offset - end == at - place_end && at - place_end < 256 {
+                last.3 = offset + len - last.1;
+                continue;
+            }
+        }
+        out.push((source, offset, at, len));
+    }
+    out
+}
+
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
 /// are copied into `between` (source, offset in it, offset in `between`,
 /// bytes), then `writes` out of it (destination, offset in it, offset in
 /// `between`, bytes). `between` is left readable as constants (and must be
 /// so, unless this is the `first` level), the others in the common state,
-/// as the submission's lists expect them.
+/// as the submission's lists expect them. The copies the reads went in.
 fn record(
     first: bool,
     list: &ID3D12GraphicsCommandList,
     between: &ID3D12Resource,
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
-) {
+) -> usize {
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();
@@ -562,6 +602,7 @@ fn record(
         }
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
+    READS[0].fetch_add(reads.len() as u64, Ordering::Relaxed);
     let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
     let mut barriers = vec![transition(between, dest, constants)];
     barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
@@ -584,6 +625,14 @@ fn record(
         } else {
             list.ResourceBarrier(&[transition(between, constants, dest)]);
         }
+        let joined;
+        let reads = if steps_joined() {
+            joined = runs_of(reads, |a, b| a.as_raw() == b.as_raw());
+            &joined[..]
+        } else {
+            reads
+        };
+        READS[1].fetch_add(reads.len() as u64, Ordering::Relaxed);
         for &(buffer, offset, at, len) in reads {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
@@ -594,6 +643,7 @@ fn record(
         if !done.is_empty() {
             list.ResourceBarrier(&done);
         }
+        reads.len()
     }
 }
 
@@ -839,6 +889,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        let timed = own.list.timed_begin(super::ours::Kind::Steps);
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
@@ -855,8 +906,9 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            let _ = record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
+        own.list.timed_end(timed);
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -931,9 +983,11 @@ pub(super) fn log(frames: f64) {
         return;
     }
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let [reads, copies] = [0, 1].map(|i| READS[i].swap(0, Ordering::Relaxed) as f64 / frames);
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {reads:.1} places read in {copies:.1} copies \
+         (VICTORY_STEPS_JOINED=0: a copy each)",
         stage(),
         d[0],
         d[1],
@@ -994,6 +1048,38 @@ mod tests {
 
     fn stuck(src: usize, len: usize) -> Does {
         Does::Fill { src, len, asked: false, to: false }
+    }
+
+    /// Reads of the ring of constants at their places go in one copy;
+    /// one of another source, one out of step with its place, one past the
+    /// padding or one that overlaps the one before do not join.
+    #[test]
+    fn reads_that_lie_as_their_places_lie_are_one_copy() {
+        let same = |a: u8, b: u8| a == b;
+        // Constant buffers of 424 bytes, 512 apart in the ring, at places
+        // 512 apart: one copy of all of them.
+        let ring: Vec<(u8, u64, u64, u64)> = (0..100).map(|i| (1, 9000 + 512 * i, 512 * i, 424)).collect();
+        assert_eq!(runs_of(&ring, same), [(1, 9000, 0, 512 * 99 + 424)]);
+        // Places whose bytes do not lie the same way apart in the source.
+        let apart = [(1, 0, 0, 424), (1, 1024, 512, 424)];
+        assert_eq!(runs_of(&apart, same), apart);
+        // Another source.
+        let other = [(1, 0, 0, 424), (2, 512, 512, 424)];
+        assert_eq!(runs_of(&other, same), other);
+        // Touching ends join; 256 bytes and more past the end do not.
+        assert_eq!(runs_of(&[(1, 0, 0, 256), (1, 256, 256, 64)], same), [(1, 0, 0, 320)]);
+        let far = [(1, 0, 0, 256), (1, 512, 512, 256)];
+        assert_eq!(runs_of(&far, same), far);
+        // Overlapping, and a place behind the one before.
+        let over = [(1, 0, 0, 512), (1, 256, 256, 512)];
+        assert_eq!(runs_of(&over, same), over);
+        let back = [(1, 512, 512, 256), (1, 0, 0, 256)];
+        assert_eq!(runs_of(&back, same), back);
+        // Each place's bytes are where they were in the one copy.
+        let (_, from, to, all) = runs_of(&ring, same)[0];
+        for (_, offset, at, len) in &ring {
+            assert!(*offset - from == *at - to && at + len <= to + all);
+        }
     }
 
     /// What is done on the card, as (place, level), in stage 2.
@@ -1232,7 +1318,7 @@ mod tests {
         let was = a_bytes.to_vec();
         let own = host.own_list().unwrap();
         // Within `a` (there and back), from `a` to `b`, and a read alone.
-        record(
+        let _ = record(
             true,
             &own.list.list,
             &own.between,
@@ -1240,7 +1326,7 @@ mod tests {
             &[(&a, 2000, 0, 100), (&a, 33, 256, 100), (&b, 77, 512, 7)],
         );
         // A level behind it, of what it wrote.
-        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
+        let _ = record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
         own.list.close();
         // A list behind it that uses the buffers in other ways.
         let next = host.new_list().unwrap();
@@ -1266,6 +1352,45 @@ mod tests {
         a_bytes[33..133].copy_from_slice(&was[33..133]);
         assert_eq!(a_bytes, &was[..]);
         // As the landing does: its next use records anew.
+        POOL.lock().unwrap().push(own);
+        let own = host.own_list().unwrap();
+        own.list.close();
+    }
+
+    /// Fills of a ring of constants, read in one copy, bring each place the
+    /// bytes of its own constant buffer; a place out of step with the ring
+    /// is a copy of its own. (`VICTORY_STEPS_JOINED=0`: 51 copies.)
+    #[test]
+    fn places_read_in_one_copy_hold_their_own_bytes() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let (a, a_data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: a mapping of 64 KiB.
+        let a_bytes = unsafe { std::slice::from_raw_parts_mut(a_data, 1 << 16) };
+        for (i, x) in a_bytes.iter_mut().enumerate() {
+            *x = (i * 7 + i / 251) as u8;
+        }
+        let own = host.own_list().unwrap();
+        // Fifty constant buffers of 424 bytes, 512 apart from 4096 on, at
+        // places 512 apart; and one more elsewhere.
+        let mut reads: Vec<(&ID3D12Resource, u64, u64, u64)> = (0..50).map(|i| (&a, 4096 + 512 * i, 512 * i, 424)).collect();
+        reads.push((&a, 40_001, 50 * 512, 300));
+        let copies = record(true, &own.list.list, &own.between, &reads, &[]);
+        assert_eq!(copies, if steps_joined() { 2 } else { 51 });
+        own.list.close();
+        let next = host.new_list().unwrap();
+        let (out, out_data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: an open list; live buffers.
+        unsafe { next.list.CopyBufferRegion(&out, 0, &own.between, 0, 51 * 512) };
+        next.close();
+        host.execute(&[&own.list, &next]);
+        // SAFETY: a mapping of 64 KiB, the copy has run.
+        let got = unsafe { std::slice::from_raw_parts(out_data, 1 << 16) };
+        for &(_, from, at, len) in &reads {
+            let (from, at, len) = (from as usize, at as usize, len as usize);
+            assert_eq!(got[at..at + len], a_bytes[from..from + len], "the place at {at}");
+        }
         POOL.lock().unwrap().push(own);
         let own = host.own_list().unwrap();
         own.list.close();

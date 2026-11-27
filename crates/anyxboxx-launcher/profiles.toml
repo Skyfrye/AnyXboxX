@@ -12,6 +12,9 @@
 #
 # Every variable named here is read by third_party/victory (checked by the launcher's tests). Values "0"
 # turn the switch off, as VIctory reads them.
+#
+# VICTORY_CARD_AWAKE = "1" keeps any card but NVIDIA's awake: on NVIDIA's the loop halved the drawing
+# queue, and "always" keeps them awake all the same.
 
 # ---------------------------------------------------------------------------------------------
 # Windows: the set VIctory's own launcher plays with (third_party/victory/scripts/play.ps1, without

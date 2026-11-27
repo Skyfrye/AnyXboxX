@@ -73,7 +73,7 @@ with the presented one.
 | `--retranslate <folder>` | only writes that folder: the capture's shaders translated by this build with the `VICTORY_*` switches of this run (`--view-limit`, `--raw-views`: the view heap's null slot and where raw views start, as the capture's shaders have them) |
 | `--no-restore` | leaves what a loop changed, and makes no copies to restore from (of a capture that does not fit in the card's memory with them) |
 | `--pace <ms>` | a wait after each submission sent: the card stands idle between them, as in a game that prepares the next one |
-| `--awake` | keeps the card's clocks up (`VICTORY_CARD_AWAKE=1`) |
+| `--awake` | keeps the card's clocks up with the loop of `VICTORY_CARD_AWAKE`, on any card: NVIDIA's too, where `VICTORY_CARD_AWAKE=1` leaves it off (as `=always`; the loop halved the drawing queue there, so an A/B with it on NVIDIA shows that cost) |
 | `--breadcrumbs` | the system's breadcrumbs (`VICTORY_D3D12_DRED=light`) |
 | `--debug-layer` | D3D12's debug layer; its errors in the report |
 

@@ -11,6 +11,22 @@
 //! card is never idle. Nothing is sent once no submission has gone out for
 //! a quarter of a second (a title that stands still; not a menu, which goes on
 //! drawing: the system's counter shows the compute queue at 100 % there too).
+//!
+//! Not on NVIDIA's cards (`VICTORY_CARD_AWAKE=always` keeps them awake all the
+//! same; `turns` too, to compare): there the drawing queue's work took twice
+//! as long beside the loop, and the clocks did not fall without it. On the
+//! RTX 5080, 28 submissions of draws and dispatches a frame took the card
+//! 83.6 ms alone and 175.4 ms with the loop (frames of 84.9 and 182.8 ms);
+//! with 260 us of the CPU's between submissions, as the submitting thread
+//! leaves them in the world, 83.6 and 175.2 ms; a light frame 8.5 and 18.1 ms
+//! (`host::ours::bench::bench_card_awake_beside_draws_and_dispatches`; again
+//! in review: 88.6 and 174.9 ms, with the gaps 88.6 and 177.4). The card
+//! runs the drawing queue and this compute queue by turns, not side by side,
+//! and each of the loop's dispatches holds it for its whole length. The
+//! bench's gaps are 0 and 260 us; the loop was made for gaps of 1.2-2.4 ms,
+//! which it does not try: that the clocks hold up across those without the
+//! loop is not shown, only that the loop costs NVIDIA's cards half the
+//! drawing queue whatever the gaps.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,10 +69,13 @@ fn wanted() -> bool {
 /// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
 const TURN_MS: u64 = 20_000;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
     Off,
+    /// On, but not on NVIDIA's cards.
     On,
+    /// On whatever the card.
+    Always,
     /// On and off by turns, to compare the two in one run (the log says when).
     ByTurns,
 }
@@ -65,26 +84,75 @@ fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
         Ok("1") => Mode::On,
+        Ok("always") => Mode::Always,
         Ok("turns") => Mode::ByTurns,
         _ => Mode::Off,
     })
 }
 
+/// NVIDIA's PCI vendor number.
+const NVIDIA: u32 = 0x10de;
+
+/// Whether the loop runs, asked for as `mode`, on a card of `vendor`.
+fn runs(mode: Mode, vendor: Option<u32>) -> bool {
+    match mode {
+        Mode::Off => false,
+        Mode::On => vendor != Some(NVIDIA),
+        Mode::Always | Mode::ByTurns => true,
+    }
+}
+
+/// The PCI vendor of `device`'s card, if the system names it.
+fn vendor(device: &ID3D12Device) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .ok()
+            .map(|d| d.VendorId)
+    }
+}
+
+/// Whether the loop runs, asked for as `mode`, on a card of `vendor`; said
+/// if it does not.
+fn keeps(mode: Mode, vendor: Option<u32>) -> bool {
+    let kept = runs(mode, vendor);
+    if !kept && mode != Mode::Off {
+        tracing::info!(
+            "the card is not kept awake (VICTORY_CARD_AWAKE=1): on NVIDIA's cards the drawing queue's work took twice as \
+             long beside the loop (VICTORY_CARD_AWAKE=always keeps it awake all the same)"
+        );
+    }
+    kept
+}
+
 /// A submission of the title's goes to `device`'s drawing queue.
 pub(super) fn sent(device: &ID3D12Device) {
-    if mode() == Mode::Off {
+    static KEPT: OnceLock<bool> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    noted(mode(), &KEPT, || vendor(device), || {
+        STARTED.call_once(|| {
+            // Runs as long as the process does.
+            std::mem::forget(start(device, wanted));
+        });
+    });
+}
+
+/// [`sent`], asked for as `mode`: whether the loop runs is found once, from
+/// the card's vendor (`vendor`, asked then), and kept in `kept`; if it does,
+/// the submission's moment is noted and `start` is called.
+fn noted(mode: Mode, kept: &OnceLock<bool>, vendor: impl FnOnce() -> Option<u32>, start: impl FnOnce()) {
+    if mode == Mode::Off || !*kept.get_or_init(|| keeps(mode, vendor())) {
         return;
     }
     let now = now_ms();
     let before = LAST.swap(now + 1, Ordering::Relaxed);
-    if mode() == Mode::ByTurns && before.saturating_sub(1) / TURN_MS != now / TURN_MS {
+    if mode == Mode::ByTurns && before.saturating_sub(1) / TURN_MS != now / TURN_MS {
         tracing::info!(on = now / TURN_MS % 2 == 1, "the card is kept awake, by turns");
     }
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        // Runs as long as the process does.
-        std::mem::forget(start(device, wanted));
-    });
+    start();
 }
 
 /// The thread that keeps the card busy; it ends when this is dropped.
@@ -207,6 +275,58 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What three submissions do to the loop, asked for as `mode` on a card
+    /// of `vendor`: how many times it was started (the real start runs
+    /// once), and how many times the vendor was asked.
+    fn three_sent(mode: Mode, vendor: Option<u32>) -> (u32, u32) {
+        let kept = OnceLock::new();
+        let (mut started, mut asked) = (0, 0);
+        for _ in 0..3 {
+            noted(
+                mode,
+                &kept,
+                || {
+                    asked += 1;
+                    vendor
+                },
+                || started += 1,
+            );
+        }
+        (started, asked)
+    }
+
+    /// Submissions with `VICTORY_CARD_AWAKE=1` start the loop on any card but
+    /// NVIDIA's, where they never do; with `always` or `turns` on NVIDIA's
+    /// too; without it never, and the card is not asked. The card's vendor
+    /// is asked once. (Before, `1` started it on NVIDIA's cards too.)
+    #[test]
+    fn submissions_start_the_loop_on_nvidia_only_when_asked_to_whatever_the_card() {
+        let (amd, intel, warp) = (Some(0x1002), Some(0x8086), Some(0x1414));
+        assert_eq!(three_sent(Mode::On, Some(NVIDIA)), (0, 1));
+        for other in [amd, intel, warp, None] {
+            assert_eq!(three_sent(Mode::On, other), (3, 1), "{other:x?}");
+        }
+        for vendor in [Some(NVIDIA), amd] {
+            assert_eq!(three_sent(Mode::Always, vendor), (3, 1));
+            assert_eq!(three_sent(Mode::ByTurns, vendor), (3, 1));
+            assert_eq!(three_sent(Mode::Off, vendor), (0, 0));
+        }
+    }
+
+    /// The host's card names its vendor: WARP's on WARP (run with the card
+    /// too: NVIDIA's on the RTX 5080).
+    #[test]
+    fn the_hosts_card_names_its_vendor() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let vendor = vendor(&host.device);
+        assert!(vendor.is_some());
+        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+            assert_eq!(vendor, Some(0x1414), "{vendor:x?}");
+        }
+    }
 
     /// Card memory the CPU maps holds what the CPU wrote, with the card kept
     /// awake meanwhile; the thread ends when it is let go.
