@@ -390,23 +390,27 @@ pub(crate) fn line(frames: f64) {
     // What the translating took to bind views: the views of lists asked for
     // and made (`crate::descriptor::host::HostHeap::make_listed`; the rest
     // were copied from the thread's own), the views made ready to be read
-    // (`crate::draw`'s `readable`).
-    static LAST_VIEWS: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    // (`crate::draw`'s `readable`), and the waits for dynamic descriptor
+    // slots (`crate::host::slots_or_wait`).
+    static LAST_VIEWS: Mutex<[u64; 6]> = Mutex::new([0; 6]);
     let [asked, made] = crate::descriptor::host::listed_counts();
     let [read, buffers] = crate::draw::readable_counts();
+    let [waits, waited] = crate::host::slot_waits();
     let g: Vec<f64> = {
-        let now = [asked, made, read, buffers];
+        let now = [asked, made, read, buffers, waits, waited];
         let mut last = held(&LAST_VIEWS);
         let g = now.iter().zip(last.iter()).map(|(n, l)| n.saturating_sub(*l) as f64 / frames).collect();
         *last = now;
         g
     };
     tracing::info!(
-        "views of lists per frame: {:.0} asked, {:.0} made; made ready to be read {:.0}, {:.0} of them of buffers",
+        "views of lists per frame: {:.0} asked, {:.0} made; made ready to be read {:.0}, {:.0} of them of buffers; waits for dynamic slots (VICTORY_SLOT_WAIT) {:.2}, {:.1} ms",
         g[0],
         g[1],
         g[2],
-        g[3]
+        g[3],
+        g[4],
+        g[5] / 1000.0
     );
 }
 

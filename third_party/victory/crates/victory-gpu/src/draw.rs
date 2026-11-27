@@ -2117,10 +2117,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = crate::host::slots_or_wait(|| host.dynamic(1)) else {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -2191,10 +2188,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = crate::host::slots_or_wait(|| host.dynamic(1)) else {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -4243,10 +4237,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = crate::host::slots_or_wait(|| host.dynamic(n)) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));

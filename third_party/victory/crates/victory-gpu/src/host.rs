@@ -3624,6 +3624,106 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether a list that finds no free dynamic descriptor slots waits for
+/// the flights in the air to land, one landing at a time and without the
+/// submission lock, until it finds them or nothing is in the air
+/// (`VICTORY_SLOT_WAIT=1`, with the relay; off: it settles every flight
+/// under the submission lock, [`settle_for_fence`], as before).
+///
+/// In the open world the title binds twice the tables of the first
+/// cutscene, and the dynamic slots (2^18 on NVIDIA, whose heaps hold a
+/// million views) ran out in every frame: the thread that translated the
+/// list took the submission lock and waited until the card had run all
+/// that was in the air, the submitting thread could send nothing
+/// meanwhile, and the other translating threads queued at that lock. They
+/// were 21 % of each translating thread's time in profile wp0 (save
+/// "mandy", standing), and the settles 9 to 17 ms of waiting for the card
+/// a frame. The slots come back when the flight that holds them lands
+/// (`crate::list::Detached::release_tables`); the first landing that
+/// frees enough of them is enough. What is drawn is the same: the table
+/// is made, in other slots (or, as before, not made if none come free by
+/// the time nothing is in the air).
+pub(crate) fn slot_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SLOT_WAIT"))
+}
+
+/// Waits for dynamic slots for [`slot_wait`] (since the last line of the
+/// log: the waits, and their microseconds).
+static SLOT_WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`SLOT_WAITS`] so far (for the line of the translating threads).
+pub(crate) fn slot_waits() -> [u64; 2] {
+    std::array::from_fn(|i| SLOT_WAITS[i].load(Ordering::Relaxed))
+}
+
+/// Dynamic descriptor slots as `take` gives them; if it gives none, after
+/// flights have landed ([`slot_wait`]) or after a settle
+/// ([`settle_for_fence`]), as it gives them then. Not from inside a
+/// submission.
+pub(crate) fn slots_or_wait(mut take: impl FnMut() -> Option<u32>) -> Option<u32> {
+    if let Some(first) = take() {
+        return Some(first);
+    }
+    if !(slot_wait() && late() && relay()) {
+        settle_for_fence();
+        return take();
+    }
+    let waiting = std::time::Instant::now();
+    let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+    let found = loop {
+        let landed = FINISHED.load(Ordering::Acquire);
+        if let Some(first) = take() {
+            break Some(first);
+        }
+        let mut line = line();
+        loop {
+            // (The landing that frees slots gives them back before it sets
+            // FINISHED and takes the line's lock to say so.)
+            if FINISHED.load(Ordering::Acquire) != landed {
+                break;
+            }
+            if line.line.is_empty() && !line.settling {
+                drop(line);
+                // As after a settle: nothing in the air holds slots now.
+                let first = take();
+                SLOT_WAITS[0].fetch_add(1, Ordering::Relaxed);
+                SLOT_WAITS[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                return first;
+            }
+            line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
+        }
+    };
+    SLOT_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    SLOT_WAITS[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+#[cfg(test)]
+mod slot_wait_tests {
+    /// Slots there are taken at once; without them, asked again once after
+    /// what frees them (here, with nothing in the air, nothing waits).
+    #[test]
+    fn slots_are_asked_again_after_what_frees_them() {
+        let mut asked = 0;
+        assert_eq!(
+            super::slots_or_wait(|| {
+                asked += 1;
+                Some(7)
+            }),
+            Some(7)
+        );
+        assert_eq!(asked, 1);
+        let mut asked = 0;
+        let got = super::slots_or_wait(|| {
+            asked += 1;
+            (asked > 1).then_some(9)
+        });
+        assert_eq!((got, asked), (Some(9), 2));
+        assert_eq!(super::slots_or_wait(|| None), None);
+    }
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
