@@ -111,14 +111,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
     let keep = crate::host::keep_freed() && !pressure;
-    let mut limit = spares(memory, keep);
+    // (Staging blocks are the PC's memory: they keep the rule by the card's
+    // room, never the texture blocks' count under its line, which came to 8
+    // where 2 were kept with the card short. Round 2's review, item 12.)
+    let staging = spares(memory, keep);
     if !system {
-        SPARES.store(limit, Ordering::Relaxed);
+        SPARES.store(staging, Ordering::Relaxed);
     }
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.rest(tick);
+        let limit = if system { kept_spares(counted, keep, pool.empty()) } else { staging };
         if system {
-            limit = kept_spares(counted, keep, pool.empty());
             SPARES.store(limit, Ordering::Relaxed);
         }
         pool.release(limit, true);
@@ -129,7 +132,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else if pressure {
             1
         } else {
-            limit
+            staging
         };
         pool.reclaim(tick, staging_limit, true);
     }
