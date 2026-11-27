@@ -1351,6 +1351,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Open, empty and reset since its last run, and left so for the title's
+    /// next reset of its list ([`HostList::leave_open`]): that reset has
+    /// nothing to reset.
+    left_open: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2130,6 +2134,13 @@ fn trim_spare_chunks() {
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     let_go_beside(freed);
+}
+
+/// Whether a host list just taken for a title's list is left open for the
+/// title's reset ([`HostList::leave_open`]; `VICTORY_LEAVE_OPEN=0`: closed).
+fn leave_open() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEAVE_OPEN").is_none_or(|v| v != "0"))
 }
 
 /// Whether what nothing names any more is let go on a thread of its own
@@ -4417,6 +4428,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                left_open: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6724,6 +6736,8 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        // (A list left open is closed as any other: its reset resets.)
+        self.left_open.store(false, Ordering::Release);
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6750,6 +6764,29 @@ impl HostList {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
+        }
+    }
+
+    /// In place of [`HostList::close`], for a list just taken (made, or reset
+    /// since its last run, and nothing recorded since) that the title's list
+    /// holds from now on until the title resets it: left open, and that reset
+    /// ([`HostList::reset`]) resets nothing; closed if it goes to the card
+    /// first ([`HostList::closed_if_left_open`]). The driver's close of such
+    /// an empty list was 2.5% of the submitting thread's time (run s2-prof1,
+    /// a fresh list for each list a submission took), and the title's reset
+    /// then reset it again. `VICTORY_LEAVE_OPEN=0`: closed, as before.
+    pub(crate) fn leave_open(&self) {
+        if !leave_open() || !self.untouched() {
+            self.close();
+            return;
+        }
+        self.left_open.store(true, Ordering::Release);
+    }
+
+    /// Closed if it was left open ([`HostList::leave_open`]).
+    pub(crate) fn closed_if_left_open(&self) {
+        if self.left_open.load(Ordering::Acquire) {
+            self.close();
         }
     }
 
@@ -6801,6 +6838,11 @@ impl HostList {
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
+        }
+        // Left open since it was made or reset, with nothing recorded: as
+        // it would be after the reset ([`HostList::leave_open`]).
+        if self.left_open.swap(false, Ordering::AcqRel) {
+            return;
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -11790,6 +11832,54 @@ mod window_mode_tests {
         assert!(super::is_borderless(" Borderless "));
         assert!(!super::is_borderless("windowed"));
         assert!(!super::is_borderless(""));
+    }
+}
+
+#[cfg(test)]
+mod leave_open_tests {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    /// Runs `list` (closed) on the host's queue and waits for it on a fence
+    /// of its own.
+    fn run(host: &super::Host, list: &super::HostList) {
+        // SAFETY: a closed list of ours; the fence is ours and waited for.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("a fence");
+            host.queue.ExecuteCommandLists(&[Some(list.list.cast().expect("a command list"))]);
+            host.queue.Signal(&fence, 1).expect("signalled");
+            while fence.GetCompletedValue() < 1 {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// A list taken for a title's list and left open, as a submission takes
+    /// a fresh one (`crate::list::detach`), takes the title's reset with
+    /// nothing to reset, records, closes and runs; one left open that goes
+    /// to the card first is closed. (Resetting a D3D12 list that is open
+    /// fails: a reset that did not know the list was left open ends the run.)
+    #[test]
+    fn a_list_left_open_takes_the_titles_reset_and_runs() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().expect("a list");
+        list.leave_open();
+        assert!(list.left_open.load(std::sync::atomic::Ordering::Relaxed), "an untouched list is left open");
+        list.reset();
+        assert!(!list.left_open.load(std::sync::atomic::Ordering::Relaxed));
+        list.close();
+        run(host, &list);
+        // Its next life: reset after it ran, taken again, submitted again
+        // without the title's reset.
+        list.reset();
+        list.leave_open();
+        list.closed_if_left_open();
+        assert!(!list.left_open.load(std::sync::atomic::Ordering::Relaxed));
+        run(host, &list);
+        list.reset();
+        list.close();
     }
 }
 
