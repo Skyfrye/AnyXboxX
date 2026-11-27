@@ -1928,33 +1928,44 @@ fn staged_from(resource: This) -> u32 {
 /// byte, and a texture uploaded again costs a staging buffer, a detiling and
 /// a copy more than this look.) `VICTORY_TEXTURE_SAME=0`: not asked.
 pub(crate) fn unchanged(resource: This, first: u32) -> bool {
+    unchanged_within(resource, first, |_| true).unwrap_or(false)
+}
+
+/// [`unchanged`], if `admit` lets it read the bytes it would: those the
+/// copy's last upload took, from the level the copy holds on, which may lie
+/// below `first` (a view of a texture's smaller levels whose copy holds it
+/// whole reads all of it). `None` if `admit` said no; nothing was read.
+pub(crate) fn unchanged_within(resource: This, first: u32, admit: impl FnOnce(u64) -> bool) -> Option<bool> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
-        return false;
+        return Some(false);
     }
     let Some(copy) = crate::resource::made_copy(resource) else {
-        return false;
+        return Some(false);
     };
     let Some((from, held)) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
-        return false;
+        return Some(false);
     };
     let Some((memory, desc)) = crate::resource::texture_memory(resource) else {
-        return false;
+        return Some(false);
     };
     let Some(layout) = crate::resource::texture_layout(&desc) else {
-        return false;
+        return Some(false);
     };
     let layout = &layout.planes[0].layout;
     if from > crate::resource::read_from(layout, first).max(copy.base) {
-        return false;
+        return Some(false);
     }
-    let size = layout.bytes_from(from) as usize;
-    with_read(size, |read| {
+    let size = layout.bytes_from(from);
+    if !admit(size) {
+        return None;
+    }
+    Some(with_read(size as usize, |read| {
         if crate::host::read_there(memory, read) == 0 {
             return false;
         }
         digest(read) == held
-    })
+    }))
 }
 
 /// Where the levels from `first` on of a title texture are: address and

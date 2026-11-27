@@ -5804,6 +5804,10 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Tests: the one asking of the write watch is this submission's
+        // until it ends, whatever other tests ask (`crate::watch::asking_turn`).
+        #[cfg(test)]
+        let _turn = crate::watch::asking_turn();
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -9629,7 +9633,10 @@ impl Meter {
                          as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                          {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                          {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                         {} made slots found unmapped and made null",
+                         {} made slots found unmapped and let go (the stand-in, or null), {} looks that found the memory of a slot's \
+                         new texture away while it showed another (kept showing it); slots of placed textures made at once from a host \
+                         copy that held what they show (VICTORY_MIRROR_CURRENT=0: none): {} the host renders to, {} as their last upload \
+                         took them, {} left to the pass past the frame's bytes to compare",
                         crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                         crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                         crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -9637,7 +9644,11 @@ impl Meter {
                         crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                         crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                         crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                        crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                        crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                        crate::descriptor::host::KEPT_AWAY.load(Ordering::Relaxed),
+                        crate::descriptor::host::CURRENT_COPIES[0].load(Ordering::Relaxed),
+                        crate::descriptor::host::CURRENT_COPIES[1].load(Ordering::Relaxed),
+                        crate::descriptor::host::CURRENT_COPIES[2].load(Ordering::Relaxed)
                     );
                 }
                 if crate::pagegen::on() {
@@ -10961,9 +10972,8 @@ mod refresh_tests {
     /// Prepares as a submission does: one asking for all the ranges, the
     /// refreshes in several flushes, the asking's end.
     fn submission(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize) {
-        // One at a time, as submissions are.
-        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        // One at a time, as submissions are, the other tests' among them.
+        let _turn = crate::watch::asking_turn();
         let asked: Vec<(usize, usize)> = ranges.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
         crate::watch::ask_once(&asked);
         let mut batch = Batch::default();
@@ -11340,16 +11350,11 @@ mod refresh_tests {
             // Ends in the middle of pages.
             let (at, len) = (region + 500, 5 * PAGE);
             let look = |expected: bool, what: &str| {
-                // The submission's one asking, which takes two ranges. (Again
-                // if a submission of another test ended it.)
-                let mut known = false;
-                for _ in 0..100 {
-                    crate::watch::ask_once(&[(at, at + len), (region + 7 * PAGE, region + 8 * PAGE)]);
-                    known = copy.nothing_new(at, len);
-                    if known || !expected {
-                        break;
-                    }
-                }
+                // The submission's one asking, which takes two ranges; this
+                // test's until it ends, whatever other tests submit.
+                let _turn = crate::watch::asking_turn();
+                crate::watch::ask_once(&[(at, at + len), (region + 7 * PAGE, region + 8 * PAGE)]);
+                let known = copy.nothing_new(at, len);
                 assert_eq!(known, expected, "view {view}: {what}");
                 let copied = copy.update(at, len);
                 crate::watch::ask_once_end();

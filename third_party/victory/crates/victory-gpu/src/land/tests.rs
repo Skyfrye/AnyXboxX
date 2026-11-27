@@ -256,6 +256,7 @@ fn a_piece_waits_for_a_change_of_mapping() {
 /// texture pass only there, and before its bytes were in.
 #[test]
 fn a_landing_tells_the_texture_slots_that_read_it() {
+    crate::pagegen::TEST_ON.set(Some(true));
     assert!(crate::safecopy::on());
     let title = Title::new(BLOCK);
     for (round, beside) in [false, true].into_iter().enumerate() {

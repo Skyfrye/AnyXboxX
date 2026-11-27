@@ -1677,6 +1677,16 @@ pub(crate) fn own_view_dimension(this: This) -> u32 {
     own_dimension(&resource(this).desc)
 }
 
+/// The format (`DXGI_FORMAT`) of resource `this`: what a view of it made
+/// without a description reads it as. 0: unknown, or nothing.
+#[cfg(windows)]
+pub(crate) fn own_format(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    resource(this).desc.format
+}
+
 /// [`own_view_dimension`] of a texture described by `desc`.
 fn own_dimension(desc: &ResourceDesc) -> u32 {
     // (`D3D12_RESOURCE_DIMENSION` in, `D3D12_SRV_DIMENSION` out.)

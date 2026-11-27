@@ -119,8 +119,12 @@ pub(crate) fn now() -> u64 {
 
 static TICK: AtomicU64 = AtomicU64::new(1);
 
-/// Buckets of the counting filter ([`FILTER`]), as bits.
-const FILTER_BITS: u32 = 16;
+/// Buckets of the counting filter ([`FILTER`]), as bits. A million: each
+/// slot watches two keys per 64 KiB block (its address and the physical
+/// page), and at 20,000 slots or more that is 100,000-200,000 pages. With
+/// 65,536 buckets the filter was 80-95 % full there, and most writes of
+/// memory no slot watches took the table's lock.
+const FILTER_BITS: u32 = 20;
 
 /// For each bucket, how many watches there are of pages in it: a change of
 /// pages whose buckets are all 0 concerns no slot and takes no lock. Raised
@@ -175,8 +179,9 @@ pub(crate) enum Teller {
 /// the title's own memory ([`Watchers::asks`]); looks by digest at slots of
 /// memory nothing tracks, and those that found it changed; slots made due
 /// by a physical page's change; slots whose guard was not all up when they
-/// were read ([`Kept::Open`]).
-pub(crate) static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+/// were read ([`Kept::Open`]); slots armed again, what views showed there
+/// having changed while [`watch`] armed them.
+pub(crate) static STATS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 const UNWATCHED: usize = 6;
 const DUE: usize = 7;
 const LOST: usize = 8;
@@ -187,6 +192,7 @@ const LOOKS_CHANGED: usize = 11;
 /// address, or memory of the title's own).
 const DUE_SHOWN: usize = 12;
 const OPEN: usize = 13;
+const REWATCHED: usize = 14;
 
 fn count(what: usize, n: u64) {
     if n != 0 {
@@ -199,6 +205,8 @@ fn changed(pages: &[Page], teller: Teller) {
     if pages.is_empty() || WATCHED.load(Ordering::SeqCst) == 0 {
         return;
     }
+    #[cfg(test)]
+    TOLD_HERE.set(TOLD_HERE.get() + 1);
     // Most writes are of memory no slot watches (buffers): no lock for them.
     if !pages.iter().any(|p| FILTER[p.bucket()].load(Ordering::SeqCst) != 0) {
         count(UNWATCHED, 1);
@@ -223,10 +231,42 @@ fn changed(pages: &[Page], teller: Teller) {
     count(teller as usize, told);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// On this thread: changes told past the first checks ([`changed`]),
+    /// and lookups of what views show ([`contents`]), for tests.
+    static TOLD_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LOOKED_UP_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `[at, at + len)` changed and its bytes are in: told by `teller`, at the
+/// pages it shows ([`contents`]). Memory no view shows (most that we and
+/// the title write: buffers) is its own pages, its addresses: asked of the
+/// filter with no lock taken, no lookup of views and no list made. (Every
+/// write took the views' lock, walked their map and made a list, on the
+/// submitting thread among others.)
+fn tell(at: usize, len: usize, teller: Teller) {
+    if !crate::inplace::any_view(at, len) {
+        let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+        if (first..last).all(|block| FILTER[Page::at(block * PAGE).bucket()].load(Ordering::SeqCst) == 0) {
+            count(UNWATCHED, 1);
+            return;
+        }
+        let pages: Vec<Page> = (first..last).map(|block| Page::at(block * PAGE)).collect();
+        changed(&pages, teller);
+        return;
+    }
+    let mut pages = Vec::new();
+    contents(at, len, &mut pages);
+    changed(&pages, teller);
+}
+
 /// The pages `[at, at + len)` shows, by what they are (each 64 KiB block's
 /// physical page if a view shows it there, else the block's own), into
 /// `out`.
 fn contents(at: usize, len: usize, out: &mut Vec<Page>) {
+    #[cfg(test)]
+    LOOKED_UP_HERE.set(LOOKED_UP_HERE.get() + 1);
     crate::inplace::physical(at, at.saturating_add(len), |block, shown| {
         out.push(match shown {
             Some((section, index)) => Page::shown(section, index),
@@ -237,7 +277,8 @@ fn contents(at: usize, len: usize, out: &mut Vec<Page>) {
 
 /// What a slot that reads title memory `[at, at + len)` watches: every
 /// block's address, and the physical page a view shows there; in order,
-/// each once.
+/// each once. (What views show there may change before the memory is read:
+/// see [`watch`] for the order that loses no change.)
 pub(crate) fn pages_of(at: usize, len: usize) -> Vec<Page> {
     let mut out = Vec::new();
     crate::inplace::physical(at, at.saturating_add(len), |block, shown| {
@@ -258,9 +299,7 @@ pub(crate) fn written(at: usize, len: usize) {
     if !on() || len == 0 || WATCHED.load(Ordering::SeqCst) == 0 {
         return;
     }
-    let mut pages = Vec::new();
-    contents(at, len, &mut pages);
-    changed(&pages, Teller::Ours);
+    tell(at, len, Teller::Ours);
 }
 
 /// Tells [`written`] of `[at, at + len)` when dropped: for a writer with
@@ -278,9 +317,7 @@ pub(crate) fn faulted(at: usize) {
     if !on() || WATCHED.load(Ordering::SeqCst) == 0 {
         return;
     }
-    let mut pages = Vec::new();
-    contents(at / PAGE * PAGE, PAGE, &mut pages);
-    changed(&pages, Teller::Fault);
+    tell(at / PAGE * PAGE, PAGE, Teller::Fault);
 }
 
 /// The kernel's write watch found pages of the title's own memory written:
@@ -368,6 +405,48 @@ fn let_go(pages: &[Page]) {
     }
 }
 
+/// Watches slot `slot` of a heap on title memory `[at, at + len)`, which it
+/// is about to read for an upload; returns how that memory tells of writes.
+/// `with` hands the heap's [`Watchers`] to what it is given, under the
+/// heap's lock for that call alone (not for [`arm`]'s guarding). In the
+/// order that loses no change: the pages are watched first
+/// ([`Watchers::begin`]), then the tick taken and the memory guarded or
+/// asked about ([`arm`]), then what views show there is looked up again: a
+/// mapping changed after the tick is a change of the address's own page,
+/// told after it.
+///
+/// A mapping changed between the first lookup and the tick is not: [`arm`]
+/// guarded what is shown now, whose physical pages nobody held yet, so the
+/// fault of a title store through another view of them was dropped (one at
+/// this address is told at the address too, as its guard comes off), and
+/// that view, opened by it, took the next stores with no fault. Then the
+/// pages shown now are
+/// held and armed again, with a tick of their own, up to [`REWATCHES`]
+/// times; still moving after that, the slot is read again at the next pass
+/// ([`Kept::Open`]).
+pub(crate) fn watch(slot: u32, at: usize, len: usize, mut with: impl FnMut(&mut dyn FnMut(&mut Watchers))) -> Kept {
+    let mut pages = pages_of(at, len);
+    let mut tries = 0;
+    loop {
+        with(&mut |w| w.begin(slot, &pages));
+        let (since, kept) = arm(at, len);
+        let again = pages_of(at, len);
+        if again == pages || tries == REWATCHES {
+            let kept = if again == pages { kept } else { Kept::Open };
+            let mut again = Some(again);
+            with(&mut |w| w.watch(slot, again.take().unwrap_or_default(), since, kept));
+            return kept;
+        }
+        count(REWATCHED, 1);
+        pages = again;
+        tries += 1;
+    }
+}
+
+/// How many times [`watch`] holds and arms a slot's pages again when what
+/// views show there changed while it did.
+const REWATCHES: usize = 2;
+
 /// The number the next change kept will have.
 fn head() -> u64 {
     let t = table();
@@ -422,6 +501,9 @@ static KINDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// after (a write after the asking is in the kernel's next answer). View
 /// memory the guards left open for now is read again at the next pass
 /// ([`Kept::Open`]); what they never guard is looked at by its digest.
+/// The slot's pages must be watched already ([`Watchers::begin`]): a change
+/// told of pages nobody watches is dropped, and the fault that told it
+/// opened the block, so the title's next stores make none.
 pub(crate) fn arm(at: usize, len: usize) -> (u64, Kept) {
     let end = at.saturating_add(len);
     let views = crate::inplace::shown_bytes(at, len).is_some_and(|n| n != 0);
@@ -492,12 +574,30 @@ pub(crate) struct Watchers {
 }
 
 impl Watchers {
+    /// Slot `slot` is about to read its memory, the pages `pages`: they are
+    /// watched from now on, before [`arm`] takes the slot's tick, and the
+    /// heap reads the changes kept from before that tick too. Until
+    /// [`Watchers::watch`] says what the read saw, any change of them makes
+    /// the slot due (an upload too many at worst).
+    ///
+    /// (Watched only after the tick, a change between the two was dropped:
+    /// no slot watched its pages yet. The fault that told it had opened the
+    /// block, so the title's later stores made none, and the slot kept the
+    /// bytes from before them until something guarded the block again; most
+    /// often at a slot's first upload, as a title fills a texture it just
+    /// described.)
+    pub(crate) fn begin(&mut self, slot: u32, pages: &[Page]) {
+        self.start();
+        if self.slots.get(&slot).is_some_and(|w| *w.pages == *pages) {
+            return;
+        }
+        let kept = self.slots.get(&slot).map_or(Kept::Told, |w| w.kept);
+        self.replace(slot, pages.to_vec(), 0, kept);
+    }
+
     /// Slot `slot` read its memory, the pages `pages`, after tick `since`.
     pub(crate) fn watch(&mut self, slot: u32, pages: Vec<Page>, since: u64, kept: Kept) {
-        if !self.started {
-            self.cursor = head();
-            self.started = true;
-        }
+        self.start();
         if kept == Kept::Open {
             self.open.push(slot);
             count(OPEN, 1);
@@ -515,14 +615,47 @@ impl Watchers {
             }
             return;
         }
-        self.forget(slot);
+        self.replace(slot, pages, since, kept);
+    }
+
+    /// At the first watch the heap reads the changes kept from here on (none
+    /// before concerns a slot of it).
+    fn start(&mut self) {
+        if !self.started {
+            self.cursor = head();
+            self.started = true;
+        }
+    }
+
+    /// Slot `slot` watches `pages` from tick `since` in place of what it
+    /// watched: the new pages are held before the old ones are let go, so
+    /// that a page in both is watched all along.
+    fn replace(&mut self, slot: u32, pages: Vec<Page>, since: u64, kept: Kept) {
         hold(&pages);
+        if let Some(old) = self.slots.remove(&slot) {
+            let_go(&old.pages);
+            self.unlist(slot, &old.pages);
+            self.unask(old.kept);
+            KINDS[old.kept.kind()].fetch_sub(1, Ordering::Relaxed);
+        }
         for &page in &pages {
             self.by_page.entry(page).or_default().push(slot);
         }
         self.ask(kept);
         KINDS[kept.kind()].fetch_add(1, Ordering::Relaxed);
         self.slots.insert(slot, Watch { pages: pages.into_boxed_slice(), since, kept });
+    }
+
+    /// `slot` out of the lists of `pages`' watchers.
+    fn unlist(&mut self, slot: u32, pages: &[Page]) {
+        for page in pages {
+            if let Some(slots) = self.by_page.get_mut(page) {
+                slots.retain(|&s| s != slot);
+                if slots.is_empty() {
+                    self.by_page.remove(page);
+                }
+            }
+        }
     }
 
     fn ask(&mut self, kept: Kept) {
@@ -549,14 +682,7 @@ impl Watchers {
             return;
         };
         let_go(&watch.pages);
-        for page in watch.pages.iter() {
-            if let Some(slots) = self.by_page.get_mut(page) {
-                slots.retain(|&s| s != slot);
-                if slots.is_empty() {
-                    self.by_page.remove(page);
-                }
-            }
-        }
+        self.unlist(slot, &watch.pages);
         self.unask(watch.kept);
         KINDS[watch.kept.kind()].fetch_sub(1, Ordering::Relaxed);
     }
@@ -719,14 +845,14 @@ impl Drop for Watchers {
 
 /// The page generations line for the log.
 pub(crate) fn line() -> String {
-    let n: [u64; 14] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
+    let n: [u64; 15] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
     let kinds: [u64; 3] = std::array::from_fn(|i| KINDS[i].load(Ordering::Relaxed));
     format!(
         "page generations (VICTORY_PAGE_GENERATIONS=0: notices by address and fingerprint looks, as before), since the start: \
          changes of watched pages told by guard faults {}, by the kernel's write watch {}, by our writes {}, by DirectStorage \
          into physical pages {}, by mappings {}, by guards taken off {}; {} changes of memory no slot watches; {} slots made \
          due ({} by a physical page, whatever view it was written through; {} read while their guard was not all up), {} \
-         times a heap fell behind the changes kept; {} askings of the kernel for slots of the title's own memory, {} looks by \
+         armed again as what views showed there changed meanwhile, {} times a heap fell behind the changes kept; {} askings of the kernel for slots of the title's own memory, {} looks by \
          digest at memory nothing tracks ({} found it changed); now {} pages watched by {} slots guarded, {} asked, {} looked at",
         n[Teller::Fault as usize],
         n[Teller::Kernel as usize],
@@ -738,6 +864,7 @@ pub(crate) fn line() -> String {
         n[DUE],
         n[DUE_SHOWN],
         n[OPEN],
+        n[REWATCHED],
         n[LOST],
         n[ASKED],
         n[LOOKS],
@@ -762,15 +889,14 @@ mod tests {
     }
 
     /// Watches slot `slot` of `watchers` on `[at, at + len)` as the texture
-    /// pass does before it reads the memory.
+    /// pass does before it reads the memory ([`super::watch`]).
     fn watch(watchers: &mut Watchers, slot: u32, at: usize, len: usize) -> Kept {
-        let (since, kept) = arm(at, len);
-        watchers.watch(slot, pages_of(at, len), since, kept);
-        kept
+        super::watch(slot, at, len, |f| f(watchers))
     }
 
     #[test]
     fn pages_pack_apart() {
+        TEST_ON.set(Some(true));
         assert_ne!(Page::shown(4, 1), Page::shown(8, 1));
         assert_ne!(Page::shown(4, 1), Page::shown(4, 2));
         assert_ne!(Page::shown(0, 1), Page::at(PAGE));
@@ -785,6 +911,7 @@ mod tests {
     /// pass of a CPU write at any view; five sampled looks went over it.)
     #[test]
     fn a_title_write_through_another_view_makes_the_slot_due() {
+        TEST_ON.set(Some(true));
         const SIZE: usize = 2 * PAGE;
         let (_, one, two) = kept_views(SIZE);
         let mut watchers = Watchers::default();
@@ -804,11 +931,246 @@ mod tests {
         assert_eq!(watchers.moved(), [1]);
     }
 
+    /// A write through another view between the slot's tick and the watch of
+    /// its pages is not lost, nor are the title's stores after it (the fault
+    /// had opened the block: they made none). Before, the pages were held
+    /// only after the tick, the change was dropped as one of pages nobody
+    /// watched, and the slot never saw the stores (round 1's review probe).
+    #[test]
+    fn a_write_between_the_tick_and_the_watch_is_not_lost() {
+        TEST_ON.set(Some(true));
+        const SIZE: usize = PAGE;
+        TEST_ON.set(Some(true));
+        let (_, one, two) = kept_views(SIZE);
+        let mut watchers = Watchers::default();
+        // What the texture pass does, with the title's write where the
+        // window was: after the tick, before the pages were held.
+        let pages = pages_of(one, SIZE);
+        watchers.begin(1, &pages);
+        let (since, kept) = arm(one, SIZE);
+        // SAFETY: the second view, read-write once the handler opened it.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        watchers.watch(1, pages_of(one, SIZE), since, kept);
+        // SAFETY: as above.
+        unsafe { ((two + 4096) as *mut u8).write(2) };
+        assert_eq!(watchers.moved(), [1], "the writes after the slot's tick reach it");
+    }
+
+    /// The runtime shows other pages at a slot's address between the first
+    /// lookup of its pages and its tick: the pages shown now are held and
+    /// armed again, and the title's stores through them after the read
+    /// reach the slot. (Armed once, the guard went up over pages nobody
+    /// held: the fault of a store there was dropped, and the block it
+    /// opened took the next stores with no fault; the mapping's own change
+    /// came before the tick. Round 2's review.)
+    #[test]
+    fn a_mapping_changed_before_the_tick_is_armed_again() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
+            MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        TEST_ON.set(Some(true));
+        const SIZE: usize = PAGE;
+        // The pages shown at the slot's address after the change, and
+        // another view of them, which the title writes through.
+        let (second, _, other) = kept_views(SIZE);
+        // SAFETY (all): a placeholder of our own showing a section of its
+        // own, then the other; kept for the life of the process, as
+        // `kept_views`.
+        let at = unsafe {
+            let first = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!first.is_null());
+            let hole = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(hole, 0);
+            let view = MapViewOfFile3(first, GetCurrentProcess(), hole as _, 0, SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(view.Value as usize, hole);
+            crate::inplace::title_memory_view(hole, SIZE, first as usize, 0);
+            hole
+        };
+        let remap = || {
+            let _changing = crate::watch::title_memory_remapping();
+            crate::watch::title_memory_unmapping(at, SIZE);
+            // SAFETY: the view mapped above, and the placeholder it leaves.
+            unsafe {
+                let view = windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as _ };
+                assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
+                let view = MapViewOfFile3(second as _, GetCurrentProcess(), at as _, 0, SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert_eq!(view.Value as usize, at);
+            }
+            crate::watch::title_memory_remapped(at, SIZE);
+            crate::inplace::title_memory_view(at, SIZE, second, 0);
+        };
+        let mut watchers = Watchers::default();
+        let mut calls = 0;
+        let kept = super::watch(1, at, SIZE, |f| {
+            calls += 1;
+            if calls == 2 {
+                // A store of the title's through the other view of the pages
+                // shown now, after their guard went up.
+                // SAFETY: the view, read-write once the handler opened it.
+                unsafe { ((other + 8) as *mut u8).write_volatile(1) };
+            }
+            f(&mut watchers);
+            if calls == 1 {
+                remap();
+            }
+        });
+        assert_eq!(kept, Kept::Told);
+        assert_eq!(watchers.slots[&1].pages[..], pages_of(at, SIZE)[..], "the pages shown now");
+        // The upload has read the memory; the title stores again there.
+        // SAFETY: as above.
+        unsafe { ((other + 4096) as *mut u8).write_volatile(2) };
+        assert_eq!(watchers.moved(), [1], "the store after the read reaches the slot");
+    }
+
+    /// A slot whose pages change (its texture moved) holds the new ones
+    /// before it lets the old ones go: a page in both is watched all along,
+    /// and keeps its last change. (Let go first, it was out of the table
+    /// for a moment, a change of it then was dropped, and it came back with
+    /// no change known.)
+    #[test]
+    fn a_slot_holds_its_new_pages_before_it_lets_the_old_go() {
+        TEST_ON.set(Some(true));
+        let at = own_memory(3 * PAGE);
+        let shared = Page::at(at + PAGE);
+        let entry = |page: Page| table().pages.get(&page).copied();
+        let mut watchers = Watchers::default();
+        watchers.watch(1, pages_of(at, 2 * PAGE), now(), Kept::Told);
+        changed(&[shared], Teller::Ours);
+        let told = entry(shared).map(|e| e.1);
+        assert!(told.is_some_and(|tick| tick > 0));
+        // Its texture moved a page on: the page in both stays watched.
+        watchers.watch(1, pages_of(at + PAGE, 2 * PAGE), now(), Kept::Told);
+        assert_eq!(entry(shared).map(|e| e.1), told, "its last change kept");
+        assert_eq!(entry(shared).map(|e| e.0), Some(1));
+        assert!(entry(Page::at(at)).is_none());
+        drop(watchers);
+        assert!(entry(shared).is_none());
+    }
+
+    /// A write told up to the end of the address space (a title's `fread`
+    /// with a huge count) is looked up to there, its last block's end being
+    /// past it. (The lookup overflowed whenever a slot watched pages: the
+    /// watch tests' `ranges_past_the_address_space_end_do_not_overflow`
+    /// failed when one of these ran beside it.)
+    #[test]
+    fn a_write_up_to_the_end_of_the_address_space_is_looked_up() {
+        TEST_ON.set(Some(true));
+        let at = own_memory(PAGE);
+        let mut watchers = Watchers::default();
+        watchers.watch(1, pages_of(at, PAGE), now(), Kept::Told);
+        written(usize::MAX - 16, PAGE);
+        assert_eq!(pages_of(usize::MAX - 16, 16), [Page::at(usize::MAX)]);
+        assert!(watchers.moved().is_empty());
+    }
+
+    /// A copy of ours into title memory at submission (`Step::Copy`, a placed
+    /// copy) is told once, by the copy when its bytes are in: `wrote` told it
+    /// again (and the arenas' own writes, which no slot reads).
+    #[test]
+    fn a_copy_at_submission_is_told_once() {
+        TEST_ON.set(Some(true));
+        let at = own_memory(PAGE);
+        let mut watchers = Watchers::default();
+        watchers.watch(1, pages_of(at, PAGE), now(), Kept::Told);
+        let bytes = [9u8; 64];
+        let before = TOLD_HERE.get();
+        crate::host::copy_mapped(at as *mut u8, bytes.as_ptr(), bytes.len(), true);
+        crate::watch::wrote(at, bytes.len());
+        assert_eq!(TOLD_HERE.get(), before + 1);
+        assert_eq!(watchers.moved(), [1]);
+    }
+
+    /// A write of memory no view shows is told with no lookup of views, and
+    /// of memory no slot watches with no lock: its pages are its addresses.
+    /// Memory a view shows is looked up, and told at its physical page.
+    #[test]
+    fn writes_of_memory_no_view_shows_look_up_no_views() {
+        const SIZE: usize = PAGE;
+        TEST_ON.set(Some(true));
+        let (_, one, two) = kept_views(SIZE);
+        let at = own_memory(2 * PAGE);
+        let mut watchers = Watchers::default();
+        watchers.watch(1, pages_of(at, PAGE), now(), Kept::Told);
+        watch(&mut watchers, 2, one, SIZE);
+        assert!(!crate::inplace::any_view(at, 2 * PAGE));
+        assert!(crate::inplace::any_view(two, SIZE));
+        let (looked, told) = (LOOKED_UP_HERE.get(), TOLD_HERE.get());
+        // (Unless another test watches a page of the unwatched one's bucket.)
+        let shared = FILTER[Page::at(at + PAGE).bucket()].load(Ordering::SeqCst) != 0;
+        // Watched, and not.
+        written(at + 8, 8);
+        written(at + PAGE, 8);
+        assert_eq!(LOOKED_UP_HERE.get(), looked, "no lookup of views");
+        assert_eq!(TOLD_HERE.get(), told + 1 + u64::from(shared), "the unwatched page took no lock");
+        assert_eq!(watchers.moved(), [1]);
+        // Through the other view: looked up, and told at the page.
+        crate::watch::writing(two + 16, 16);
+        assert!(LOOKED_UP_HERE.get() > looked);
+        assert_eq!(watchers.moved(), [2]);
+    }
+
+    /// The filter keeps 200,000 watched pages (some 20,000 slots) mostly in
+    /// buckets of their own: a write of memory no slot watches seldom
+    /// shares one, and takes no lock. (With 65,536 buckets at most a third
+    /// of them had one of their own.)
+    #[test]
+    fn the_filter_has_room_for_the_pages_of_a_scene() {
+        let pages = (0..200_000usize).map(|n| Page::at(0x7f00_0000_0000 + n * 3 * PAGE));
+        let buckets: std::collections::HashSet<usize> = pages.map(Page::bucket).collect();
+        assert!(buckets.len() > 160_000, "{} buckets for 200,000 pages", buckets.len());
+    }
+
+    /// `bytes` of memory of our own (no view, not write-watched) that no
+    /// other test is given: never freed, so its addresses, by which its
+    /// pages are watched, are this test's alone. (Heap memory of a `Vec` is
+    /// another test's next, and the counts of its pages with it.)
+    fn own_memory(bytes: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: a fresh allocation, kept for the life of the process.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        at
+    }
+
+    /// The title writes through another view of the slot's page, which then
+    /// rests open: a slot read meanwhile at the first view cannot count on a
+    /// fault for the alias's next write, and is read again at a pass to
+    /// come. (The first view stayed read-only, but not clean, and was taken
+    /// for whole: the alias's writes reached nobody; round 1's review probe.)
+    #[test]
+    fn a_slot_whose_alias_rests_open_is_read_again() {
+        TEST_ON.set(Some(true));
+        const SIZE: usize = PAGE;
+        TEST_ON.set(Some(true));
+        let (_, one, two) = kept_views(SIZE);
+        let mut watchers = Watchers::default();
+        assert_eq!(watch(&mut watchers, 1, one, SIZE), Kept::Told);
+        crate::watch::REST_IN_TEST.set(std::time::Duration::from_secs(60));
+        // SAFETY: the second view, read-write once the handler opened it.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert_eq!(watchers.moved(), [1]);
+        let kept = watch(&mut watchers, 1, one, SIZE);
+        crate::watch::REST_IN_TEST.set(std::time::Duration::ZERO);
+        assert_eq!(kept, Kept::Open, "the alias rests open: not whole");
+        assert_eq!(watchers.reopen(), [1]);
+    }
+
     /// A block the title has just written rests open (`crate::watch`'s
     /// guard rest): a slot read meanwhile could not count on a fault for the
     /// next write, and is read again at a pass to come, guarded then.
     #[test]
     fn a_slot_read_while_its_block_rests_open_is_read_again() {
+        TEST_ON.set(Some(true));
         const SIZE: usize = PAGE;
         let (_, one, _) = kept_views(SIZE);
         let mut watchers = Watchers::default();
@@ -832,6 +1194,7 @@ mod tests {
     /// reaches every view.
     #[test]
     fn our_writes_reach_every_view_of_the_pages() {
+        TEST_ON.set(Some(true));
         const SIZE: usize = 2 * PAGE;
         let (section, one, two) = kept_views(SIZE);
         let mut watchers = Watchers::default();
@@ -853,22 +1216,22 @@ mod tests {
     /// submission) tells the slots that read it once its bytes are in.
     #[test]
     fn a_copy_into_title_memory_tells_when_it_is_in() {
-        let mut memory = vec![0u8; 2 * PAGE];
-        let at = memory.as_mut_ptr() as usize;
+        TEST_ON.set(Some(true));
+        let at = own_memory(2 * PAGE);
         let mut watchers = Watchers::default();
         watchers.watch(4, pages_of(at, 2 * PAGE), now(), Kept::Told);
         let bytes = [7u8; 256];
         crate::host::copy_mapped((at + PAGE) as *mut u8, bytes.as_ptr(), bytes.len(), true);
-        assert_eq!(memory[PAGE..PAGE + 256], bytes);
+        // SAFETY: our own memory, which nothing else writes.
+        assert_eq!(unsafe { std::slice::from_raw_parts((at + PAGE) as *const u8, 256) }, bytes);
         assert_eq!(watchers.moved(), [4]);
-        drop(watchers);
-        drop(memory);
     }
 
     /// The runtime maps or unmaps memory at an address: the slots that read
     /// it there are due, not those that read the same pages elsewhere.
     #[test]
     fn a_mapping_makes_due_the_slots_at_its_address() {
+        TEST_ON.set(Some(true));
         const SIZE: usize = 2 * PAGE;
         let (_, one, two) = kept_views(SIZE);
         let mut watchers = Watchers::default();
@@ -885,6 +1248,7 @@ mod tests {
     /// frame for its slots there.
     #[test]
     fn the_write_watch_tells_of_writes_to_the_titles_own_memory() {
+        TEST_ON.set(Some(true));
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -912,8 +1276,8 @@ mod tests {
     /// its digest, and a change found makes the slot due.
     #[test]
     fn memory_nothing_tracks_is_looked_at_by_its_digest() {
-        let mut memory = vec![0u8; 3 * PAGE];
-        let at = memory.as_mut_ptr() as usize;
+        TEST_ON.set(Some(true));
+        let at = own_memory(3 * PAGE);
         let mut watchers = Watchers::default();
         let Kept::Looked(_, _, digest, next) = watch(&mut watchers, 3, at, 3 * PAGE) else {
             panic!("plain memory is looked at");
@@ -921,19 +1285,19 @@ mod tests {
         assert!(watchers.looks(next - 1, usize::MAX).is_empty(), "not before its time");
         assert_eq!(watchers.looks(next, usize::MAX), [(3, at, 3 * PAGE)]);
         assert!(!watchers.looked(3, at, 3 * PAGE, digest, next));
-        // SAFETY: our own vector, which nothing else reads now.
+        // SAFETY: our own memory, which nothing else reads now.
         unsafe { ((at + PAGE) as *mut u8).write_volatile(5) };
         let now = digest_of(at, 3 * PAGE);
         assert_ne!(now, digest);
         assert!(watchers.looks(next, usize::MAX).is_empty(), "looked at, next in half a second");
         assert!(watchers.looked(3, at, 3 * PAGE, now, next + LOOK_MS));
-        drop(memory);
     }
 
     /// A heap that falls behind the changes kept compares all it watches by
     /// their pages' last changes: none is lost.
     #[test]
     fn a_watcher_behind_the_changes_kept_loses_none() {
+        TEST_ON.set(Some(true));
         const SIZE: usize = PAGE;
         let (_, one, two) = kept_views(SIZE);
         let mut watchers = Watchers::default();
@@ -942,21 +1306,21 @@ mod tests {
         crate::watch::writing(two, 8);
         // Other changes, more than are kept.
         let mut other = Watchers::default();
-        let memory = vec![0u8; PAGE];
-        watch(&mut other, 9, memory.as_ptr() as usize, PAGE);
+        let memory = own_memory(PAGE);
+        watch(&mut other, 9, memory, PAGE);
         for _ in 0..=LOG_MOST {
-            changed(&[Page::at(memory.as_ptr() as usize)], Teller::Ours);
+            changed(&[Page::at(memory)], Teller::Ours);
         }
         assert_eq!(watchers.moved(), [1, 2]);
         assert!(watchers.moved().is_empty());
-        drop((watchers, other, memory));
+        drop((watchers, other));
     }
 
     /// The log line says who told of changes and what watches now.
     #[test]
     fn the_line_counts_who_told() {
-        let mut memory = vec![0u8; PAGE];
-        let at = memory.as_mut_ptr() as usize;
+        TEST_ON.set(Some(true));
+        let at = own_memory(PAGE);
         let mut watchers = Watchers::default();
         watchers.watch(5, pages_of(at, PAGE), now(), Kept::Told);
         let before = STATS[Teller::Ours as usize].load(Ordering::Relaxed);
@@ -966,16 +1330,17 @@ mod tests {
         assert!(line.starts_with("page generations (VICTORY_PAGE_GENERATIONS=0"), "{line}");
         assert!(line.contains(" by our writes ") && line.contains(" slots guarded, "), "{line}");
         assert_eq!(watchers.moved(), [5]);
-        drop(watchers);
-        drop(memory);
     }
 
     /// Watching a slot's pages again with the same pages keeps the count of
-    /// watches; another slot's forgetting leaves the first watched.
+    /// watches; another slot's forgetting leaves the first watched. (In
+    /// memory of its own: the counts are of the pages at its addresses, and a
+    /// `Vec`'s were another test's next, which watched them too: it failed 1
+    /// in 6 parallel runs.)
     #[test]
     fn watches_are_counted() {
-        let memory = vec![0u8; 2 * PAGE];
-        let at = memory.as_ptr() as usize;
+        TEST_ON.set(Some(true));
+        let at = own_memory(2 * PAGE);
         let pages = pages_of(at, 2 * PAGE);
         let counted = |page: Page| table().pages.get(&page).map_or(0, |e| e.0);
         let mut watchers = Watchers::default();
@@ -989,6 +1354,5 @@ mod tests {
         assert_eq!(watchers.moved(), [1]);
         drop(watchers);
         assert_eq!(counted(pages[0]), 0);
-        drop(memory);
     }
 }
