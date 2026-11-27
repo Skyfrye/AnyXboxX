@@ -171,11 +171,17 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-/// Since the last line of the log: streams handed over; calls translated and
-/// the microseconds that took (all threads), recordings translated, and
-/// recordings let go of in the middle.
+/// Since the last line of the log: streams handed over. And, growing (the
+/// line takes what they grew by; the book of frames reads them too): calls
+/// translated and the microseconds that took (all threads), recordings
+/// translated, and recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The microseconds all threads have translated so far (`crate::framebook`).
+pub(crate) fn translated_us() -> u64 {
+    STATS[1].load(Relaxed)
+}
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -190,6 +196,9 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// When the title submitted it (microseconds of [`crate::framebook`]'s
+    /// clock; 0: not yet), for the book of frames.
+    submitted_at: AtomicU64,
 }
 
 #[derive(Default)]
@@ -213,6 +222,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            submitted_at: AtomicU64::new(0),
         }
     }
 
@@ -261,6 +271,11 @@ impl Recording {
                 drop(inner);
                 give_back(kept);
                 STATS[2].fetch_add(1, Relaxed);
+                // How long after its submission it was translated to its end.
+                let at = self.submitted_at.load(Relaxed);
+                if at != 0 {
+                    crate::framebook::translated_after(crate::framebook::now_us().saturating_sub(at));
+                }
                 crate::queue::line_moved();
             }
         }
@@ -345,6 +360,11 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
         .filter_map(|&l| {
             // SAFETY: the title passes its lists, which nobody records into now.
             let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
+            if let Some(recording) = &front.recording
+                && crate::framebook::on()
+            {
+                recording.submitted_at.store(crate::framebook::now_us().max(1), Relaxed);
+            }
             front.close();
             front.submitted = true;
             front.recording.clone()
@@ -357,7 +377,8 @@ pub(crate) fn line(frames: f64) {
     if !wanted() || !on() {
         return;
     }
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    static LAST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    let s: Vec<f64> = crate::framebook::grown(&STATS, &LAST).iter().map(|&n| n as f64 / frames).collect();
     tracing::info!(
         "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
         s[0],

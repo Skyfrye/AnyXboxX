@@ -2183,6 +2183,18 @@ impl ValueWait {
         self.holds_for(u64::from_le_bytes(raw))
     }
 
+    /// What is waited for, in words (the book of frames' lines).
+    #[cfg(windows)]
+    pub(crate) fn said(&self) -> String {
+        format!(
+            "{} bits at {:#x} against {:#x} (comparison {})",
+            if self.wide { 64 } else { 32 },
+            self.address,
+            self.reference,
+            self.comparison
+        )
+    }
+
     /// Where the value waited for is: address and bytes.
     #[cfg(windows)]
     pub(crate) fn place(&self) -> (usize, usize) {
