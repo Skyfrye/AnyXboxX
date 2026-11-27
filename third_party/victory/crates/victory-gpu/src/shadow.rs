@@ -4399,14 +4399,18 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        // (Most copies have no range shaders may be writing: no lock then.)
+        let mut busy: Vec<(usize, usize)> = if self.pending_now.load(Ordering::Acquire) == 0 {
+            Vec::new()
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -4443,7 +4447,9 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.pending_now.load(Ordering::Acquire) != 0
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());

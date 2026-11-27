@@ -173,6 +173,11 @@ impl Notes {
     /// The notes of pages `[first, last)` in page order, `each` of them
     /// until it says no: whether it never did. A part at a time.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
+        // (A range in one piece, as most are: no list of pieces made.)
+        if first < last && first >> SHARD_SHIFT == (last - 1) >> SHARD_SHIFT {
+            let s = self.read(shard_of(first));
+            return s.written.range(first..last).all(|(&p, &w)| each(p, w));
+        }
         match pieces(first, last) {
             Some(pieces) => pieces.into_iter().all(|(from, to)| {
                 let s = self.read(shard_of(from));
