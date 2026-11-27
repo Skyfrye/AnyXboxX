@@ -69,6 +69,10 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// The group barriers the translation added where the host waves of a console wave meet
+    /// (exchanges between halves, LDS kept in order between them, the entry's numbering of
+    /// waves): not the program's own `s_barrier`s, nor fences that wait for no one.
+    pub meetings: u32,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -363,6 +367,8 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// The group barriers added where host waves meet so far ([`Lowered::meetings`]).
+    meetings: u32,
     /// LDS shared by the lanes of a console wave that the host runs whole: a shared-memory
     /// fence before each LDS write and before the first LDS read after one
     /// ([`Self::lds_fence`]).
@@ -2344,6 +2350,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            meetings: 0,
             lds_order,
             lds_written: true,
             lds_meet,
@@ -3150,6 +3157,7 @@ impl<'a> Lower<'a> {
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
+            meetings: self.meetings,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -5102,6 +5110,7 @@ impl<'a> Lower<'a> {
     fn group_sync(&mut self, block: usize) {
         #[cfg(test)]
         GROUP_SYNCS.set(GROUP_SYNCS.get() + 1);
+        self.meetings += 1;
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -6433,6 +6442,7 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
+            self.meetings += 1;
             let mode = self.s.m.i32(meeting_mode());
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -6538,6 +6548,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        self.meetings += 1;
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);

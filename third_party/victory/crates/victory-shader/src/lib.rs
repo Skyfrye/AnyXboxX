@@ -29,12 +29,13 @@ pub mod structure;
 pub const TRANSLATOR_VERSION: u32 = 2;
 
 /// The revision of the forms only hosts of 32-lane waves (NVIDIA) get: the paired form of
-/// console wave64 compute programs and its precedence over approximate forms, the loose-LDS
-/// form, f16 roundings from the bits, no meeting of two host waves in a loop the lanes leave
-/// one by one. Part of the key of those hosts' cached translations only (`victory-gpu`'s
-/// `shader_cache`): **bump it with any change that changes their translations and no other
-/// host's**, so that a 64-lane host keeps every entry.
-pub const WAVE32_REVISION: u32 = 5;
+/// console wave64 compute programs and its precedence over approximate forms and over exact
+/// forms whose host waves meet often, the loose-LDS form, f16 roundings from the bits, no
+/// meeting of two host waves in a loop the lanes leave one by one. Part of the key of those
+/// hosts' cached translations only (`victory-gpu`'s `shader_cache`): **bump it with any change
+/// that changes their translations and no other host's**, so that a 64-lane host keeps every
+/// entry.
+pub const WAVE32_REVISION: u32 = 6;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
