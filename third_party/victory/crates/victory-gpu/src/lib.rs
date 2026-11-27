@@ -70,6 +70,8 @@ mod port_journal;
 #[cfg(windows)]
 mod land;
 pub mod list;
+#[cfg(all(test, windows))]
+mod loadprobe;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
