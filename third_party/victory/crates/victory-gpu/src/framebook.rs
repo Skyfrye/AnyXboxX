@@ -66,6 +66,20 @@ static AT_PRESENT: AtomicU64 = AtomicU64::new(0);
 /// (microseconds), and how many were translated after their submission.
 static LATE_LISTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Since the last present: the microseconds the title's fence events
+/// waited, from the title's asking until the fence got there (the most of
+/// one, and all of them), and how many.
+static EVENTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// An event the title asked for on a fence was set `us` microseconds after.
+pub(crate) fn title_event_waited(us: u64) {
+    if on() {
+        EVENTS[0].fetch_max(us, Relaxed);
+        EVENTS[1].fetch_add(us, Relaxed);
+        EVENTS[2].fetch_add(1, Relaxed);
+    }
+}
+
 /// Microseconds since the book's clock began.
 pub(crate) fn now_us() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
@@ -82,7 +96,7 @@ pub(crate) fn translated_after(us: u64) {
 }
 
 /// The columns of a row, in milliseconds but for those [`COUNTED`].
-const COLUMNS: [&str; 38] = [
+const COLUMNS: [&str; 41] = [
     "frame",
     "title_gap",
     "lag",
@@ -121,8 +135,11 @@ const COLUMNS: [&str; 38] = [
     "lists_late",
     "chunks_made",
     "uploads_made",
+    "events_most",
+    "events_all",
+    "events",
 ];
-const COUNTED: [usize; 5] = [13, 33, 35, 36, 37];
+const COUNTED: [usize; 6] = [13, 33, 35, 36, 37, 40];
 
 type Row = [f32; COLUMNS.len()];
 
@@ -231,6 +248,7 @@ pub(crate) fn presented(called: Instant) {
     let counters = counters();
     let waited = AT_PRESENT.load(Relaxed);
     let [late_most, late] = [LATE_LISTS[0].swap(0, Relaxed), LATE_LISTS[1].swap(0, Relaxed)];
+    let events = EVENTS.each_ref().map(|n| n.swap(0, Relaxed));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let made = [
         crate::host::CHUNKS_MADE[0].load(Relaxed),
@@ -269,6 +287,9 @@ pub(crate) fn presented(called: Instant) {
     row[35] = late as f32;
     row[36] = made[0].wrapping_sub(was.made[0]) as f32;
     row[37] = made[1].wrapping_sub(was.made[1]) as f32;
+    row[38] = events[0] as f32 / 1e3;
+    row[39] = events[1] as f32 / 1e3;
+    row[40] = events[2] as f32;
     writer().send(row);
 }
 
