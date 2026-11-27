@@ -2432,7 +2432,7 @@ pub(crate) fn let_go_idle() {
             // block used again since the look would leave the others' pieces
             // free inside a block the system still counts.
             if !unit.textures.iter().all(|&at| may_go(at)) {
-                crate::vram::LET_GO[2].fetch_add(1, Relaxed);
+                crate::vram::LET_GO[crate::vram::LEFT].fetch_add(1, Relaxed);
                 continue;
             }
             // And no piece is cut from its block while they go.
@@ -2455,12 +2455,18 @@ pub(crate) fn let_go_idle() {
                 if let Some(block) = unit.block {
                     crate::pool::undrain(block);
                 }
-                crate::vram::LET_GO[2].fetch_add(1, Relaxed);
+                crate::vram::LET_GO[crate::vram::LEFT].fetch_add(1, Relaxed);
                 continue;
             }
             gave += unit.gives;
-            crate::vram::LET_GO[0].fetch_add(1, Relaxed);
-            crate::vram::LET_GO[1].fetch_add(unit.gives, Relaxed);
+            // (A block's memory is back once it has emptied: `crate::pool::drained`.)
+            match unit.block {
+                Some(_) => crate::vram::LET_GO[crate::vram::BLOCKS].fetch_add(1, Relaxed),
+                None => {
+                    crate::vram::LET_GO[crate::vram::OWN_COPIES].fetch_add(1, Relaxed);
+                    crate::vram::LET_GO[crate::vram::OWN_BYTES].fetch_add(unit.gives, Relaxed)
+                }
+            };
         }
         // At 95 % and past, what whole units did not give: idle copies by
         // age, the longest unused first, from any block. That gives the
