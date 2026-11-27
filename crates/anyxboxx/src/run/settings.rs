@@ -10,7 +10,8 @@ use super::{Profile, RunArgs};
 /// `VICTORY_D3D12_DRED=light` (DRED stays opt-in: `--dred`). Measured by avatarmanz on Windows 11 with
 /// an RX 7900 XTX (VIctory's README); not measured on NVIDIA with this base. `VICTORY_RELAY=2` also
 /// makes stage 3 of the late waits VIctory's default (`VICTORY_LATE_WAIT` unset). Applied unless
-/// `--no-tuned-settings`.
+/// `--no-tuned-settings`. `VICTORY_CARD_AWAKE=1` keeps any card but NVIDIA's awake: on NVIDIA's the loop
+/// halved the drawing queue (`always` keeps them awake all the same).
 pub const TUNED: &[(&str, &str)] = &[
     ("VICTORY_TEXTURE_NO_WAIT", "1"),
     ("VICTORY_RELAY", "2"),

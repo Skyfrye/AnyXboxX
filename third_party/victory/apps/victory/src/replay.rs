@@ -85,7 +85,8 @@ pub(crate) struct Replay {
     /// idle between them, as it does while the title prepares the next.
     #[arg(long, default_value_t = 0.0)]
     pace: f64,
-    /// Keep the card's clocks up meanwhile (VICTORY_CARD_AWAKE=1).
+    /// Keep the card's clocks up meanwhile, on any card, NVIDIA's too (as
+    /// VICTORY_CARD_AWAKE=always; `=1` leaves NVIDIA's off).
     #[arg(long)]
     awake: bool,
     /// The system's breadcrumbs after every command (VICTORY_D3D12_DRED=light).
