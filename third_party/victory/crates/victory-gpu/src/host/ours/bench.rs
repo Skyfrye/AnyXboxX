@@ -6,6 +6,25 @@
 //! and the card kept awake (`VICTORY_CARD_AWAKE`) beside a load of draws
 //! and dispatches. Ignored by default; run them with
 //! `cargo test -p victory-gpu --release --lib host::ours::bench -- --ignored --nocapture --test-threads=1`.
+//!
+//! What the passes' numbers are not: the card time of ours in a frame. They
+//! are a floor, from part of it. The twins copy the same freshly cleared,
+//! compressed 2560x1440 depth texture into the same twin 21 times, 29.5 MB
+//! that stay in the RTX 5080's 64 MB L2 (1.37 TB/s, above what its memory
+//! gives): 0.45 ms is the least they cost. Clamps, depth planes, preludes'
+//! uploads and texture read-backs are not benched (read-backs are not timed
+//! at all). The "about 1.5 ms of ours" these give is a lower bound; only the
+//! frame line of a run with `VICTORY_OUR_CARD_TIMES=1` says how much is ours.
+//! The sends from the upload heap ran at the card's speed here (39.4 MB in
+//! 0.20 ms, more than PCIe carries), but `send.rs` notes 5.4 ms for 342 such
+//! copies in a captured frame: look at the sends-up kind in a run before
+//! taking `VICTORY_SEND_BAR` or `VICTORY_UP_QUEUE` for useless.
+//!
+//! Of ours the biggest measured are the compares (0.80 ms, some 750 MB read a
+//! frame) and the twins (0.45 ms); neither is made smaller yet (only the
+//! steps' reads, 0.14 ms to 0.005). Next would be fewer compared pieces
+//! (only what shaders declared and wrote) and twin copies only where the
+//! other side is read.
 
 use super::*;
 use crate::host::{CARD_COMPARE, transition};

@@ -19,9 +19,14 @@
 //! 83.6 ms alone and 175.4 ms with the loop (frames of 84.9 and 182.8 ms);
 //! with 260 us of the CPU's between submissions, as the submitting thread
 //! leaves them in the world, 83.6 and 175.2 ms; a light frame 8.5 and 18.1 ms
-//! (`host::ours::bench::bench_card_awake_beside_draws_and_dispatches`). The
-//! card runs the drawing queue and this compute queue by turns, not side by
-//! side, and each of the loop's dispatches holds it for its whole length.
+//! (`host::ours::bench::bench_card_awake_beside_draws_and_dispatches`; again
+//! in review: 88.6 and 174.9 ms, with the gaps 88.6 and 177.4). The card
+//! runs the drawing queue and this compute queue by turns, not side by side,
+//! and each of the loop's dispatches holds it for its whole length. The
+//! bench's gaps are 0 and 260 us; the loop was made for gaps of 1.2-2.4 ms,
+//! which it does not try: that the clocks hold up across those without the
+//! loop is not shown, only that the loop costs NVIDIA's cards half the
+//! drawing queue whatever the gaps.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
