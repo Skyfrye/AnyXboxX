@@ -918,6 +918,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    // Render target, unordered access, depth write, copy destination.
+    const WRITES: u32 = 0x4 | 0x8 | 0x10 | COPY_DEST;
+    if state & WRITES != 0 {
+        crate::texture::ahead::before_write(resource);
+    }
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));

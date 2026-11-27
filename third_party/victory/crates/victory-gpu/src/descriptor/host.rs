@@ -238,6 +238,10 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// Per title slot, the newest submission begun (`crate::host::submissions`)
+    /// when a draw last read it through a table: the list that draw is in
+    /// goes to the card later, as a newer submission ([`HostHeap::note_recycled`]).
+    read_at: Vec<std::sync::atomic::AtomicU32>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -2261,6 +2265,9 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            read_at: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -3479,6 +3486,9 @@ impl HostHeap {
             }
             return;
         }
+        if let Some(at) = self.read_at.get(index as usize) {
+            at.store(crate::host::submissions().0 as u32, Relaxed);
+        }
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
@@ -3507,6 +3517,12 @@ impl HostHeap {
         let now = (crate::frame::current() as u32).wrapping_add(1) & !TABLED_READ;
         if stamp & TABLED_READ != 0 && now.wrapping_sub(stamp & !TABLED_READ) & !TABLED_READ <= 1 {
             RECYCLED[usize::from(!for_draw)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The card has not finished even the submissions begun when the
+            // draw read it: the list with that draw, sent later, has not run.
+            let read = self.read_at.get(index as usize).map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed));
+            if (crate::host::submissions().1 as u32) <= read {
+                RECYCLED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -5828,7 +5844,10 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
 /// while a draw had read them through a table in this frame or the one
 /// before, whose lists may not have run yet and then read the new record:
 /// by a draw's table, and by anything else ([`HostHeap::note_recycled`]).
-pub(crate) static RECYCLED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// The third: of the first two, those whose draw's list had surely not run
+/// on the card yet (it had not finished the submissions begun when the draw
+/// read the slot).
+pub(crate) static RECYCLED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Frames for which a slot kept on another texture's host copy
 /// ([`HostHeap::kept_elsewhere`]) holds back uploads into that copy.
@@ -6016,11 +6035,18 @@ fn same_bytes(old: u64, new: u64) {
 /// written with another texture, such that kept the old one, slots given the
 /// neutral texture, slots made null as their memory was another's.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn pop_causes() -> [u64; 4] {
+pub(crate) fn pop_causes() -> [u64; 6] {
     use std::sync::atomic::Ordering::Relaxed;
     let all: u64 = REWRITTEN[..5].iter().map(|n| n.load(Relaxed)).sum();
     let kept = REWRITTEN[5].load(Relaxed);
-    [all.saturating_sub(kept), kept, LATE[3].load(Relaxed), STALE[0].load(Relaxed)]
+    [
+        all.saturating_sub(kept),
+        kept,
+        LATE[3].load(Relaxed),
+        STALE[0].load(Relaxed),
+        RECYCLED[2].load(Relaxed),
+        KEPT_OVERWRITES[0].load(Relaxed),
+    ]
 }
 
 /// Whether a slot already made from its record is told so without the lock
