@@ -205,12 +205,14 @@ pub fn run(
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
+    // VICTORY_UPSCALER; each off without it), and the title's FidelityFX at
+    // DLSS's scale when DLSS can be tried (VICTORY_DLSS=1).
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
+        let dlss = victory_hle::modules::fidelityfx::render_scale();
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size, dlss) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");

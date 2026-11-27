@@ -37,6 +37,16 @@
 //!   the title divided by it (+0x28f03e8) 49 s in.
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **NVIDIA DLSS** (`VICTORY_DLSS=1`, when it can be tried): the picker
+//!   returns 7 and FidelityFX's scale is DLSS's mode's (`VICTORY_DLSS_MODE`,
+//!   Quality's 0.667 by default; `VICTORY_FFX_SCALE` still wins), through
+//!   the two sites above: the title's FidelityFX calls then reach
+//!   `victory_hle::modules::fidelityfx`, which hands the upscale to DLSS.
+//!   The phase count the title divides by comes from the FidelityFX query
+//!   that module now answers: FidelityFX's own count, 8 x (output width /
+//!   render width)^2, 17 at 0.667 (1707 of 2560), 32 at 0.5, never 0 (a count
+//!   below 1 from the title's FidelityFX is replaced by it there too), so
+//!   the division above is safe at every scale DLSS asks for.
 
 use crate::frame_rate::Patched;
 
@@ -289,31 +299,70 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
     Patched::Done
 }
 
-/// Applies what the switches ask for; a line each in the log and on
-/// standard output.
+/// What the switches ask for.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Asked {
+    pub output: Option<(u32, u32)>,
+    pub render_scale: Option<f32>,
+    pub ffx_scale: Option<f32>,
+    pub upscaler: Option<u32>,
+    /// DLSS's render scale, when DLSS can be tried (the module's notes).
+    pub dlss_scale: Option<f32>,
+}
+
+impl Asked {
+    /// From the switches; `dlss_scale` from whoever knows whether DLSS can
+    /// be tried.
+    pub fn from_env(dlss_scale: Option<f32>) -> Asked {
+        Asked {
+            output: asked_output(),
+            render_scale: asked_render_scale(),
+            ffx_scale: asked_ffx_scale(),
+            upscaler: asked_upscaler(),
+            dlss_scale,
+        }
+    }
+
+    /// The sites to change, with their code and the value said.
+    pub fn sites(&self) -> Vec<(&'static Site, Vec<u8>, String)> {
+        let mut sites: Vec<(&Site, Vec<u8>, String)> = Vec::new();
+        if let Some((w, h)) = self.output {
+            sites.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+            if (w, h) != (3840, 2160) {
+                sites.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+            }
+        }
+        if let Some(s) = self.render_scale {
+            sites.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+        }
+        let (ffx, kind) = match self.dlss_scale {
+            Some(dlss) => {
+                if self.upscaler.is_some_and(|k| k != 7) {
+                    println!("resolution: VICTORY_UPSCALER left out: DLSS takes the title's FidelityFX (7)");
+                }
+                (Some(self.ffx_scale.unwrap_or(dlss)), Some(7))
+            }
+            None => (self.ffx_scale, self.upscaler),
+        };
+        if let Some(s) = ffx {
+            sites.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
+        }
+        if let Some(kind) = kind {
+            sites.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+        }
+        sites
+    }
+}
+
+/// Applies what the switches ask for (`dlss_scale`: DLSS's render scale if
+/// DLSS can be tried); a line each in the log and on standard output.
 ///
 /// # Safety
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
-    let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
-    if let Some((w, h)) = asked_output() {
-        asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
-        if (w, h) != (3840, 2160) {
-            asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
-        }
-    }
-    if let Some(s) = asked_render_scale() {
-        asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
-    }
-    if let Some(s) = asked_ffx_scale() {
-        asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
-    }
-    if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
-    }
-    for (site, code, value) in asked {
+pub unsafe fn apply_asked(base: usize, size: usize, dlss_scale: Option<f32>) {
+    for (site, code, value) in Asked::from_env(dlss_scale).sites() {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
         let offset = format!("{:#x}", site.at);
@@ -403,6 +452,23 @@ mod tests {
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+    }
+
+    #[test]
+    fn dlss_takes_fidelityfx_at_its_scale() {
+        let names = |a: Asked| a.sites().into_iter().map(|(site, code, _)| (site.at, code)).collect::<Vec<_>>();
+        let dlss = Asked { output: Some((2560, 1440)), render_scale: Some(1.0), dlss_scale: Some(0.667), ..Asked::default() };
+        let sites = names(dlss);
+        assert!(sites.contains(&(PICKER.at, picker_code(7))), "FidelityFX picked");
+        assert!(sites.contains(&(FFX_SCALE.at, ffx_scale_code(0.667))), "at DLSS's scale");
+        assert!(sites.contains(&(OWN_SCALE.at, own_scale_code(1.0))), "the title's own scale as asked");
+        // An explicit FidelityFX scale wins; another upscaler does not.
+        let explicit = Asked { ffx_scale: Some(0.75), upscaler: Some(6), dlss_scale: Some(0.5), ..Asked::default() };
+        assert_eq!(names(explicit), [(FFX_SCALE.at, ffx_scale_code(0.75)), (PICKER.at, picker_code(7))]);
+        // Without DLSS, as before.
+        let before = Asked { upscaler: Some(6), ..Asked::default() };
+        assert_eq!(names(before), [(PICKER.at, picker_code(6))]);
+        assert!(names(Asked::default()).is_empty());
     }
 
     #[cfg(windows)]
