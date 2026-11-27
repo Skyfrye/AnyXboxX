@@ -56,8 +56,9 @@
 //! two host copies written over the same title memory; more than [`MOST`]
 //! bytes to bring back; a copy in the card's memory without the relay's copy
 //! queue (`VICTORY_RELAY_COPY=1`), where the landing's fetches go to the
-//! drawing queue and a fetch beside it would be new; a copy in the PC's
-//! memory without its snapshot.
+//! drawing queue and a fetch beside it would be new, or with the check of
+//! torn fetches (`VICTORY_FETCH_CHECK=1`, Linux and AMD), which this fetch
+//! does not make; a copy in the PC's memory without its snapshot.
 
 use std::sync::Arc;
 
@@ -220,6 +221,11 @@ impl Plan {
         // what the relay does only with its switch: without it, as before.
         if carded && !relay_copy() {
             return Err("copies in the card's memory are fetched on the drawing queue (VICTORY_RELAY_COPY=0)");
+        }
+        // The relay hashes what its fetches bring there (`torn`); this
+        // fetch does not, and was not tried where that was needed.
+        if carded && torn::on() {
+            return Err("copies in the card's memory, with torn fetches checked (VICTORY_FETCH_CHECK=1)");
         }
         if self.back.iter().any(|(shadow, ..)| !shadow.carded() && !shadow.snapshot_held()) {
             return Err("a copy in the PC's memory holds no snapshot");
