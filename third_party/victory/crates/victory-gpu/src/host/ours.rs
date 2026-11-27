@@ -21,7 +21,9 @@
 //! end of what it holds: work of ours that overlaps the end of the title's
 //! is counted short, never long. Of the passes recorded into the title's
 //! lists (twins, planes, clamps) a list that runs more than once is counted
-//! once.
+//! once; one sent again once the ring of pairs has come round and another
+//! list has taken its block writes over that one's times, and is caught when
+//! it is sent: those pairs are not read, and the line says how many.
 //!
 //! What it costs the card (`bench_what_a_thousand_pairs_cost`, RTX 5080, two
 //! runs: a list of 1,000 short passes 30.7 and 31.2 ms without pairs, 31.1
@@ -160,6 +162,11 @@ struct Slots {
     kinds: Box<[AtomicU32]>,
     /// The mapping the card resolves into: two tick counts per pair.
     back: usize,
+    /// Per block of [`BLOCK`] pairs that lists take (the first ones): the
+    /// times it was taken; and the time whose pairs a list run again since
+    /// wrote over (0: none), which are not read.
+    blocks: Box<[AtomicU32]>,
+    spoiled: Box<[AtomicU32]>,
 }
 
 /// What [`Slots::gather`] read.
@@ -170,16 +177,48 @@ struct Gathered {
     /// Pairs whose times made no sense (the second before the first, or a
     /// second apart).
     odd: u64,
+    /// Pairs not read: a list that held their block before ran again.
+    spoiled: u64,
 }
 
 impl Slots {
-    /// Slots for `pairs` pairs, whose tick counts are at `back` (16 bytes a
-    /// pair, zeroed, live as long as these).
-    fn new(pairs: u32, back: usize) -> Slots {
+    /// Slots for `pairs` pairs, the first in `blocks` blocks lists take,
+    /// whose tick counts are at `back` (16 bytes a pair, zeroed, live as
+    /// long as these).
+    fn new(pairs: u32, blocks: u32, back: usize) -> Slots {
         Slots {
             kinds: (0..pairs).map(|_| AtomicU32::new(0)).collect(),
             back,
+            blocks: (0..blocks).map(|_| AtomicU32::new(0)).collect(),
+            spoiled: (0..blocks).map(|_| AtomicU32::new(0)).collect(),
         }
+    }
+
+    /// Block `block` is taken by a list: the time it is taken.
+    fn take_block(&self, block: u32) -> u32 {
+        self.blocks[block as usize].fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    }
+
+    /// A list that took block `block` at time `time` is sent to the card:
+    /// whether the block was taken again since, by another list whose pairs
+    /// this run writes over. Those are then not read.
+    fn sent(&self, block: u32, time: u32) -> bool {
+        let now = self.blocks[block as usize].load(Ordering::Acquire);
+        if now == time {
+            return false;
+        }
+        self.spoiled[block as usize].store(now, Ordering::Release);
+        true
+    }
+
+    /// Whether the pairs of block `block` as it is taken now are written
+    /// over.
+    fn spoiled(&self, block: u32) -> bool {
+        let Some(spoiled) = self.spoiled.get(block as usize) else {
+            return false;
+        };
+        let spoiled = spoiled.load(Ordering::Acquire);
+        spoiled != 0 && spoiled == self.blocks[block as usize].load(Ordering::Acquire)
     }
 
     /// The two tick counts of pair `at`.
@@ -216,6 +255,10 @@ impl Slots {
             // Taken again meanwhile (another time above the kind): those
             // ticks may be the new pair's, read next time.
             if self.kinds[at as usize].compare_exchange(was, was & !0xff, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                continue;
+            }
+            if self.spoiled(at / BLOCK) {
+                into.spoiled += 1;
                 continue;
             }
             match to.checked_sub(from).filter(|&ticks| ticks < most) {
@@ -270,6 +313,9 @@ static ODD: AtomicU64 = AtomicU64::new(0);
 /// Since the last line: pairs taken again before they were read (their
 /// lists had not run, or the ring came round first).
 static OVERWRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Since the last line: pairs not read because a list that held their block
+/// ran again after another list had taken it ([`Pairs::sent`]).
+static SPOILED: AtomicU64 = AtomicU64::new(0);
 /// Since the last line: resolves recorded (one per block of a list, one
 /// per submission).
 static RESOLVES: AtomicU64 = AtomicU64::new(0);
@@ -335,7 +381,7 @@ fn make(host: &Host) -> windows::core::Result<Clock> {
             heap,
             buffer,
             per_ms: frequency.max(1) as f64 / 1e3,
-            slots: Slots::new(pairs, back as usize),
+            slots: Slots::new(pairs, PAIRS / BLOCK, back as usize),
             ends,
             _allocator: allocator,
         })
@@ -361,6 +407,7 @@ impl Clock {
             }
         }
         ODD.fetch_add(read.odd, Ordering::Relaxed);
+        SPOILED.fetch_add(read.spoiled, Ordering::Relaxed);
     }
 }
 
@@ -369,10 +416,11 @@ impl Clock {
 #[must_use]
 pub(crate) struct Mark(u32);
 
-/// The pairs one list (open) has taken, by blocks: first pair, pairs used.
-/// [`Pairs::resolve`] before the list is closed.
+/// The pairs one list has taken, by blocks: first pair, pairs used, the time
+/// the block was taken. [`Pairs::resolve`] before the list is closed,
+/// [`Pairs::sent`] each time it is sent, [`Pairs::clear`] when it is reset.
 #[derive(Default)]
-pub(crate) struct Pairs(Vec<(u32, u32)>);
+pub(crate) struct Pairs(Vec<(u32, u32, u32)>);
 
 impl Pairs {
     /// The first timestamp of a pair for `kind`, recorded into `list`
@@ -380,7 +428,7 @@ impl Pairs {
     pub(crate) fn begin(&mut self, list: &ID3D12GraphicsCommandList, kind: Kind) -> Option<Mark> {
         let clock = clock()?;
         let at = match self.0.last_mut() {
-            Some((first, used)) if *used < BLOCK => {
+            Some((first, used, _)) if *used < BLOCK => {
                 *used += 1;
                 *first + *used - 1
             }
@@ -390,7 +438,8 @@ impl Pairs {
                 if let Some(quarter) = ahead(first, PAIRS) {
                     clock.gather(quarter);
                 }
-                self.0.push((first, 1));
+                let time = clock.slots.take_block(first / BLOCK);
+                self.0.push((first, 1, time));
                 first
             }
         };
@@ -418,7 +467,8 @@ impl Pairs {
             return;
         };
         RESOLVES.fetch_add(self.0.len() as u64, Ordering::Relaxed);
-        for (first, used) in self.0.drain(..) {
+        // (Kept: the list may be sent again, see `sent`.)
+        for &(first, used, _) in &self.0 {
             // SAFETY: an open list, our query heap and buffer (its custom
             // heap's buffers take copies in the common state); every query
             // of the block's used pairs was ended in this list.
@@ -432,6 +482,19 @@ impl Pairs {
                     16 * u64::from(first),
                 );
             }
+        }
+    }
+
+    /// The list is sent to the card. A list of the title's may be sent
+    /// again, recorded once: if another list has taken one of its blocks of
+    /// pairs since (the ring came round), this run writes its times over
+    /// that one's, and those are not read.
+    pub(crate) fn sent(&self) {
+        let Some(Some(clock)) = CLOCK.get() else {
+            return;
+        };
+        for &(first, _, time) in &self.0 {
+            clock.slots.sent(first / BLOCK, time);
         }
     }
 
@@ -509,14 +572,15 @@ pub(crate) fn line(frames: f64) {
         "the card's times per frame, by its timestamps (VICTORY_OUR_CARD_TIMES=1; the timing costs the card some 0.5-0.8 us \
          a pair and 2.8-2.9 us a resolve, {:.0} resolves a frame): {submissions:.1} submissions ran {whole:.1} ms, the title's \
          lists {:.1} of it and ours {ours:.1} ({}); ours sent apart from them {:.1} ms ({}) (ms, pairs a frame); {} pairs \
-         read out of order, {} taken again before they were read",
+         read out of order, {} taken again before they were read, {} not read for a list run again after another took          them",
         RESOLVES.swap(0, Ordering::Relaxed) as f64 / frames,
         (whole - ours).max(0.0),
         parts(&inside),
         ms(&apart),
         parts(&apart),
         ODD.swap(0, Ordering::Relaxed),
-        OVERWRITTEN.swap(0, Ordering::Relaxed)
+        OVERWRITTEN.swap(0, Ordering::Relaxed),
+        SPOILED.swap(0, Ordering::Relaxed)
     );
 }
 
@@ -597,7 +661,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// stands for what the card resolves into.
     fn slots(pairs: u32) -> (Slots, Vec<u64>) {
         let mut back = vec![0u64; 2 * pairs as usize];
-        let slots = Slots::new(pairs, back.as_mut_ptr() as usize);
+        let slots = Slots::new(pairs, pairs / BLOCK, back.as_mut_ptr() as usize);
         (slots, back)
     }
 
@@ -624,6 +688,35 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut again = Gathered::default();
         slots.gather(0..16, 1 << 20, &mut again);
         assert_eq!(again, Gathered::default());
+    }
+
+    /// A list of the title's sent again, recorded once, after the ring came
+    /// round and another list took its block of pairs, writes its times over
+    /// that one's: caught when it is sent, those are not read (and said not
+    /// to be); the block taken once more is read again.
+    #[test]
+    fn a_list_sent_again_after_another_took_its_pairs_spoils_them() {
+        let (slots, _back) = slots(32);
+        // A list takes block 1, and is sent.
+        let first = slots.take_block(1);
+        assert!(!slots.sent(1, first));
+        // The ring comes round: another list takes the block and a pair.
+        let second = slots.take_block(1);
+        let _ = slots.out(8, Kind::Planes);
+        // The first list is sent again: its run writes over that pair.
+        assert!(slots.sent(1, first));
+        ran(&slots, 8, 7);
+        let mut read = Gathered::default();
+        slots.gather(0..32, 1 << 20, &mut read);
+        assert_eq!((read.sums[Kind::Planes.index()][1], read.spoiled), (0, 1));
+        // The second list is sent: nothing to say. Taken once more, read.
+        assert!(!slots.sent(1, second));
+        let _ = slots.take_block(1);
+        let _ = slots.out(9, Kind::Planes);
+        ran(&slots, 9, 3);
+        let mut read = Gathered::default();
+        slots.gather(0..32, 1 << 20, &mut read);
+        assert_eq!((read.sums[Kind::Planes.index()], read.spoiled), ([3, 1], 0));
     }
 
     /// A pair taken again for the same kind is another pair to a gathering

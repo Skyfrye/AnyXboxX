@@ -6045,6 +6045,10 @@ impl Host {
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
         }
+        // A list sent again after its pairs went to another (`ours`).
+        for list in runs {
+            list.timed_sent();
+        }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
@@ -6633,6 +6637,13 @@ impl HostList {
     pub(crate) fn timed_end(&self, mark: Option<ours::Mark>) {
         if mark.is_some() {
             self.timed.lock().unwrap_or_else(|e| e.into_inner()).end(&self.list, mark);
+        }
+    }
+
+    /// The list goes to the card ([`ours::Pairs::sent`]).
+    fn timed_sent(&self) {
+        if ours::on() {
+            self.timed.lock().unwrap_or_else(|e| e.into_inner()).sent();
         }
     }
 
