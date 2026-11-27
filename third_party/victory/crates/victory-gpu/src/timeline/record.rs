@@ -363,9 +363,31 @@ fn sample() {
     #[repr(C, align(16))]
     struct Aligned(CONTEXT);
     let mut open: Vec<(u32, *mut std::ffi::c_void)> = Vec::new();
+    // `VICTORY_TIMELINE_SAMPLE_ALL=<n>`: the n threads of the process that ran the most in the
+    // last 200 ms (by their CPU times), chosen again every 200 ms: the title's own, whose work is
+    // outside our spans (what its main thread runs, ours that it calls without a span, the
+    // system's), as well as ours. Else the title's submitting threads alone.
+    let busiest = std::env::var("VICTORY_TIMELINE_SAMPLE_ALL").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+    let all = busiest > 0;
+    let mut listed: Option<std::time::Instant> = None;
+    let mut every: Vec<u32> = Vec::new();
+    let mut ran: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     while on() {
-        for place in &TITLES {
-            let id = place.load(Ordering::Relaxed);
+        if all && listed.is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(200)) {
+            let now: Vec<(u32, u64)> = threads_but_this().into_iter().map(|id| (id, cpu_time(id))).collect();
+            let mut by: Vec<(u64, u32)> =
+                now.iter().map(|&(id, t)| (t.saturating_sub(ran.get(&id).copied().unwrap_or(t)), id)).collect();
+            by.sort_unstable_by(|a, b| b.cmp(a));
+            every = by.into_iter().take(busiest).map(|(_, id)| id).collect();
+            ran = now.into_iter().collect();
+            listed = Some(std::time::Instant::now());
+        }
+        let wanted: Vec<u32> = if all {
+            every.clone()
+        } else {
+            TITLES.iter().map(|place| place.load(Ordering::Relaxed)).collect()
+        };
+        for id in wanted {
             if id == 0 {
                 continue;
             }
@@ -422,6 +444,54 @@ fn sample() {
         // SAFETY: opened above.
         unsafe { CloseHandle(handle) };
     }
+}
+
+/// The CPU time thread `id` has run, in 100 ns (0 if it cannot be asked).
+fn cpu_time(id: u32) -> u64 {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{GetThreadTimes, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+    // SAFETY: plain Win32 calls on a thread of this process; the handle is closed.
+    unsafe {
+        let handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, id);
+        if handle.is_null() {
+            return 0;
+        }
+        let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut ended, mut kernel, mut user) = (zero, zero, zero, zero);
+        let ok = GetThreadTimes(handle, &mut created, &mut ended, &mut kernel, &mut user) != 0;
+        CloseHandle(handle);
+        let t = |f: FILETIME| u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime);
+        if ok { t(kernel) + t(user) } else { 0 }
+    }
+}
+
+/// The ids of this process's threads but the calling one.
+fn threads_but_this() -> Vec<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+    let mut ids = Vec::new();
+    // SAFETY: plain Win32 calls; the entry is sized as the call asks and the snapshot is closed.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return ids;
+        }
+        let (pid, me) = (GetCurrentProcessId(), GetCurrentThreadId());
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = size_of::<THREADENTRY32>() as u32;
+        let mut more = Thread32First(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid && entry.th32ThreadID != me {
+                ids.push(entry.th32ThreadID);
+            }
+            more = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    ids
 }
 
 /// `frames` among the stacks: its place, plus one.
