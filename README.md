@@ -1,114 +1,149 @@
-# AnyXboxX — Xbox Series X emulator (prototype)
-
-[![Discord](https://img.shields.io/badge/Discord-AnyXboxX-5865F2?logo=discord&logoColor=white)](https://discord.gg/TcX42vRyPU)
+# AnyXboxX diffbase
 
 **English** · [Français](docs/i18n/README.fr.md)
 
+AnyXboxX diffbase is our own line of [AnyXboxX](https://github.com/LooperSalty/AnyXboxX) and of its graphics engine, [VIctory](https://github.com/Marvisak/VIctory). It runs your own copy of the Xbox Series build 1.0.2.1 of Grand Theft Auto VI on a Windows PC, and it is tuned and measured on an NVIDIA RTX card. It keeps the engine base that upstream AnyXboxX had on 26 November 2026, the "combined base", and adds our performance and picture work on top. Upstream has since moved to another engine base (Vice-Tay, [LooperSalty/AnyXboxX#454](https://github.com/LooperSalty/AnyXboxX/pull/454)). This line diverges from it on purpose and is not sent upstream.
+
+This repository contains no game files, no game code, no keys and no console or SDK files, and it does not explain how to get them. You need your own legally obtained copy of the game.
+
+![The launcher's Home page](docs/images/launcher-home.png)
+
 > [!NOTE]
-> **Where we are (2026-11-26)**
->
-> - ✅ **The game runs.** GTA VI 1.0.2.1 (Xbox Series build) starts, plays its cutscenes and reaches the open world through VIctory, the copy in `third_party/victory`, with ray tracing working (indoor lighting and shadows).
-> - 📈 **15 to 20 fps, peaks at 28 fps in cutscenes** (Series X mode, combined base, Linux with Proton, RX 9070 XT and patched RADV, measured on 2026-11-26); not measured on Windows with this base yet. The bottleneck is the processor: the copies and read-backs that emulate the console's unified memory. That work is in progress. Earlier measurements: [docs/progress.md](docs/progress.md).
-> - ⛔ **Known limits**: some graphics are missing; the game uses 28–30 GB of RAM, so 32 GB is recommended.
+> **Where we are (2026-11-27).** The first cutscene runs at about 23 fps at native 2560x1440 on an RTX 5080, up from about 10 fps on the combined base. With ray tracing on, it runs at about 14 fps, up from about 6. The open world is not measured yet.
 
-AnyXboxX runs Xbox GDK executables (PE32+ x86-64) on Windows. It is specialised on one build, **Grand Theft Auto VI for Xbox Series, version 1.0.2.1**, and only translates what that game needs: the console's system functions, the RDNA 2 shaders and the Direct3D 12.x calls. The graphics come from [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 or later), copied into `third_party/victory` with the pull requests of its contributors, credited in [THIRD_PARTY.md](THIRD_PARTY.md).
+## Measured gains
 
-This repository contains no game files, keys or executables, and does not explain how to get them. Live status page, with the disk space to plan for: **[loopersalty.github.io/AnyXboxX](https://loopersalty.github.io/AnyXboxX/)**.
+Setup: first cutscene, 2560x1440 native (`VICTORY_OUTPUT=2560x1440`, `VICTORY_RENDER_SCALE=1.0`), Series X profile. RTX 5080, Ryzen 7 9800X3D, 31 GB of RAM, Windows 11. The fps figures come from the game's own frame counter.
+
+| Build | fps over the scene | Median second | Low (10th percentile) |
+|---|---|---|---|
+| Combined base (VIctory's `play.ps1` set) | 9.9 | 10.4 | 7.6 |
+| + card budgets and RAM relief | 20.8 | 22.7 | 16.1 |
+| + submission-thread fixes (this line's set) | 22.8 | 26.7 | 18.6 |
+
+- **GPU work per frame** fell from 82.8 ms to 28.5 ms with the card budgets: the title's buffers stay in the card's memory, with a reservation, instead of being read by the GPU from the PC's memory.
+- **Ray tracing on** (`VICTORY_BVH_BUILDER=1`, correct indoor lighting): about 14 fps, up from about 6.
+- **Caveats**: each build was measured once, on about 2 minutes of the same cutscene, on one machine. The open world has not been measured with this line yet. The game caps itself at 30 fps.
 
 ## Requirements
 
 - Windows 10 or 11, 64-bit, with an AVX2 processor.
-- A Direct3D 12 graphics card with shader model 6.6 and mesh shaders: NVIDIA RTX 20 series or newer, or AMD RDNA 2 or newer. A 12 GB card runs short of texture memory; the launcher has a preset for 8 and 12 GB cards.
-- 32 GB of RAM recommended, and more than 30 GB free on the system drive (the shader cache grows as you play).
-- Your own copy of the Xbox Series 1.0.2.1 build: a folder that contains `game_scarlett_master.exe`. It is not provided.
-- [Rust](https://rustup.rs/) and Visual Studio 2022 or 2026 Build Tools with the "Desktop development with C++" workload. VIctory is built from source the first time you play.
+- A Direct3D 12 graphics card with shader model 6.6 and mesh shaders. **An NVIDIA RTX card is recommended**: this line is tuned and measured on an RTX 5080 (16 GB). On AMD the launcher uses VIctory's own measured set, without this line's additions. The presets for 8 and 12 GB cards are not measured.
+- 32 GB of RAM: the game uses about 30 GB. Keep more than 30 GB free on the system drive, because the shader cache grows as you play.
+- Your own legally obtained copy of the Xbox Series 1.0.2.1 build: a folder that contains `game_scarlett_master.exe`. It is not provided.
+- [Git](https://git-scm.com/), [Rust through rustup](https://rustup.rs/), and Visual Studio 2022 or 2026 Build Tools with the "Desktop development with C++" workload. VIctory is built from source the first time you play.
+- Optional, for DLSS: an `nvngx_dlss.dll` that you already have from another game. It is never shipped here.
 
-## Run the game
+## Build and run
 
-### With the graphical launcher (recommended)
+### With the launcher (recommended)
 
-1. Clone the repository: `git clone https://github.com/LooperSalty/AnyXboxX.git`. VIctory is already in `third_party/victory`.
-2. Get `anyxboxx-launcher.exe` from the [launcher-v0.1.0 release](https://github.com/LooperSalty/AnyXboxX/releases/tag/launcher-v0.1.0) and put it in the cloned folder, or build it with `cargo build --release -p anyxboxx-launcher`.
-3. Double-click the launcher. On the **Game folder** page, choose the folder that holds `game_scarlett_master.exe`, then press **PLAY**. The first start builds VIctory and warms the shader cache; judge the speed from the second start.
+```powershell
+git clone --recurse-submodules https://github.com/Skyfrye/anyXboxx-diffbase.git
+cd anyXboxx-diffbase
+cargo build --release -p anyxboxx-launcher
+.\target\release\anyxboxx-launcher.exe
+```
 
-The full guide, with the options, the files written and troubleshooting, is in [docs/launcher.md](docs/launcher.md) (French: [docs/fr/lanceur.md](docs/fr/lanceur.md)).
+1. **Setup** page: every line must be green or explained (Rust, the Direct3D 12 runtime, the VC++ redistributable, the GPU driver).
+2. **Game folder** page: pick the folder that holds `game_scarlett_master.exe`. You can also drop the folder on the window. The launcher only reads it: it never copies or changes the game's files.
+3. **Play** page: the output size defaults to your screen's (the largest of the title's own sizes that fits it), rendered at native size. Switch the optional features you want on (see below).
+4. **Home**: press **PLAY**. The first time, the launcher builds VIctory (several minutes, once), then starts the game.
+
+The first run is slow while the game's shaders are translated, often well under 1 fps for a while. Judge the speed from the second run. You can also translate them before playing: turn on "Translate the shaders before playing" on the Play page, or use the **Shaders** page.
+
+If a `victory.exe` sits next to `anyxboxx-launcher.exe`, the launcher uses it as it is and builds nothing. `--victory-exe <path>` does the same for a `victory.exe` elsewhere.
 
 ### From the command line
 
 ```powershell
 cargo build --release -p anyxboxx
-.\target\release\anyxboxx.exe run --game-dir <game folder>
+.\target\release\anyxboxx.exe run --game-dir <game folder> --profile diffbase --override VICTORY_OUTPUT=2560x1440 --override VICTORY_RENDER_SCALE=1.0 --override VICTORY_PANEL=1
 ```
 
-`anyxboxx run` starts the game with the same measured settings as the launcher. Full guide: [docs/running-gta6.md](docs/running-gta6.md) (French: [docs/fr/lancer-gta6.md](docs/fr/lancer-gta6.md)).
+`--profile diffbase` gives VIctory this line's measured set, the same one the launcher uses on NVIDIA. Without `--profile`, `anyxboxx run` uses VIctory's own `play.ps1` set. `VICTORY_OUTPUT` takes only the title's own sizes: 1280x720, 1664x936, 1920x1080, 2560x1440 and 3840x2160. More options are in [docs/running-gta6.md](docs/running-gta6.md).
 
-## Translation progress
+## The launcher
 
-![Progress map: one cell per function, green if translated](docs/images/carte-avancee.svg)
+The launcher checks your machine, verifies your game folder, builds or finds `victory.exe`, and starts the game with this line's settings. It does not contain or download any game file. Its pictures were made for this project (see [crates/anyxboxx-launcher/assets](crates/anyxboxx-launcher/assets/README.md)). It uses no art, logo or trademark from the game.
 
-Regenerate: `scarlett.py --carte <package folder> docs/images/carte-avancee.svg`.
+| Feature | Switch | Default | What it does |
+|---|---|---|---|
+| Stats overlay | `VICTORY_PANEL=1` | on | Frame rate, frame time, memory and textures on the picture. F3 shows or hides it in game. |
+| Output size | `VICTORY_OUTPUT` | your screen | The size the game draws at, from the title's own list. |
+| Native render | `VICTORY_RENDER_SCALE=1.0` | on | Renders at the output size instead of at two thirds of it. |
+| Ray-traced light | `VICTORY_BVH_BUILDER=1` | off | The title's own ray-traced indirect light: interiors are lit correctly, at about 14 fps. |
+| Natural eyes | `VICTORY_AMBIENT_SPECULAR=1.5` | off | Bounds the reflections, so eyes look natural without ray tracing. |
+| Skin confetti fix | `VICTORY_FIRST_UPLOAD_FRONT=1` | off | Experimental fix for the coloured specks that sometimes appear on skin. |
+| NVIDIA DLSS | `VICTORY_DLSS=1`, `VICTORY_DLSS_DLL`, `VICTORY_DLSS_MODE` | off | DLSS upscales in place of the title's FidelityFX. Needs your own `nvngx_dlss.dll`. Experimental: not measured in game yet. |
 
-![Xbox Series X translation progress](docs/images/traduction.svg)
+![The launcher's Play page](docs/images/launcher-play.png)
 
-- **CPU instructions: 100%.** The Series X uses an AMD Zen 2 in x86-64, the same instruction set as a PC: the game's code runs as is.
-- **GPU instructions: 89%.** 1,330 of the 1,490 RDNA 2 encodings run in the reference interpreter, and the RDNA 2 → DXIL recompiler already draws a first vertex and pixel shader with D3D12.
-- **System functions: 66%** of the 1,337 functions imported by the DLLs of the test package are resolved.
-- **GDK runtime: 210 of the 396 functions** are written in AnyXboxX, in Rust and C++: the task queue, the offline user, the Xbox Series X identity, saves, the package, the offline Store and invitations. The other interfaces are served by the Windows GDK runtime when it is installed.
+The Play page also has presets for 12 GB and 8 GB cards (not measured), the window mode, the keyboard layout, NVIDIA Smooth Motion, and an Advanced panel where any `VICTORY_*` value can be overridden.
 
-The chart is regenerated by `scarlett.py --traduction <package folder> docs/images/traduction.svg`.
+**Logs**: each game run writes `logs\game-<time>.log` next to the launcher. The log starts with the command and every VIctory setting used. If that folder cannot be written, the log goes to `%LOCALAPPDATA%\AnyXboxX-diffbase\logs` instead. The launcher's settings are kept in `%LOCALAPPDATA%\AnyXboxX-diffbase\launcher\settings.toml`. The full guide is in [docs/launcher.md](docs/launcher.md).
 
-## Project progress
+### Controls
 
-| Step | Status |
+- **Move**: W A S D (Z Q S D on AZERTY, by key position). **Look**: the mouse, or I J K L.
+- **Mouse**: click the picture to take the mouse. It then turns the camera, the left button is the right trigger and the right button is the left trigger. F9 takes the mouse or lets it go, and switching to another window lets it go.
+- **F3**: shows or hides the stats overlay.
+- Confirm: Enter. Back: Backspace. Menu: Esc. A gamepad works too.
+
+## What differs from upstream AnyXboxX
+
+| | Upstream AnyXboxX | This line |
+|---|---|---|
+| Engine base | Vice-Tay ([LooperSalty/AnyXboxX#454](https://github.com/LooperSalty/AnyXboxX/pull/454)) | The combined base of 26 November, plus our work |
+| Tuned on | AMD (RX 7900 XTX on Windows, RX 9070 XT on Linux) | NVIDIA (RTX 5080) |
+| NVIDIA settings | VIctory's `play.ps1` set, not measured on NVIDIA | Measured set: card budgets, RAM relief, submission-thread switches, no `VICTORY_CARD_AWAKE` |
+| Output size | The console's 3840x2160, rendered at two thirds | The screen's size, rendered at native size |
+| DLSS | No | Yes, experimental (`VICTORY_DLSS=1`) |
+| Stats overlay | Diagnostics builds only | Release builds too (F3) |
+| Launcher | Profiles and presets | Our profile, an output size, the optional features above, logs next to it, original art |
+
+### Lineage of the engine
+
+The engine is `third_party/victory`:
+
+- **Combined base**: [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) `c9c932c` merged with [codec-d/cool_fox](https://github.com/codec-d/cool_fox) `f4b48ad`, plus upstream AnyXboxX's fixes.
+- **Round 1**: list translation brought from 27–38 µs to 4 µs a call on NVIDIA.
+- **Round 2**: settles, GPU overhead, mouse input, stability, and review fixes.
+- **Vice-Tay ports**: card budgets with a reservation, RAM relief under memory pressure, and BC7 decode fixes.
+- **Fixes**: the bake stamp, and the submission thread (helpers above normal, a core of its own, the D3D runtime's background threads on the first cores).
+- **Ray tracing**: pages that will never arrive no longer slow the structure walks.
+- **Picture**: the reflection bound (`VICTORY_AMBIENT_SPECULAR`), and the skin confetti fix behind a switch.
+- **Additions**: NVIDIA DLSS (`VICTORY_DLSS=1`), and the stats overlay in release builds.
+
+Every source and its author is credited in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+## Known issues
+
+- Skin sometimes shows coloured "confetti". A fix exists behind `VICTORY_FIRST_UPLOAD_FRONT=1` (the launcher's "Skin confetti fix").
+- Some interiors show blocky bands.
+- The game caps itself at 30 fps.
+- The game uses about 30 GB of RAM.
+- The first run is slow while the shaders are translated.
+- DLSS has not been measured in game yet.
+
+## Repository checks
+
+| Check | Status |
 |---|---|
-| Rust launcher `anyxboxx-launcher` and `anyxboxx run`: check the machine, build VIctory, warm the shader cache, start the game | ✅ done |
-| The Xbox Series 1.0.2.1 build runs through VIctory (combined base: avatarmanz/VIctory-7900XTX + codec-d/cool_fox + our fixes): boot, cutscenes, open world (15 to 20 fps, peaks at 28 fps in cutscenes, on Linux, Proton, RX 9070 XT, patched RADV; ray tracing working; faces and video frame order fixed; not measured on Windows with this base) | 🟡 in progress |
-| Unified memory emulation: copies and read-backs between the console's memory and the PC's (main cost of the CPU) | 🟡 in progress |
-| Ray-traced lighting (the BVH structure builder is off) | ⏳ to do |
-| NVIDIA Smooth Motion switch in the launcher, presets for 8 and 12 GB cards | ✅ done |
-| Runtime DLLs in Rust: `xmem`, `kernelx`, `d3d12_xs`, `anyxboxx_tls`, `XCRDAPI`; `xgameruntime` ported and checked against the C++ DLL, which is still the one shipped | 🟡 in progress |
-| GDK runtime: 210 of 396 functions written in AnyXboxX; the others delegated to the Windows GDK runtime, named by the trace | 🟡 in progress |
-| `XTaskQueue`, `XAsync`, `XThread`, `XUser`, `XSystem`, `XGameSave`, `XPackage`, `XStore` written by AnyXboxX | ✅ done |
-| D3D12.X: `D3D12XboxCreateDevice`, console `ID3D12*` interfaces, served by TomBox's Rust `d3d12_xs.dll` (MIT) | 🟡 in progress |
-| RDNA 2 disassembler: 1,490 mnemonics, checked against 38,999 public LLVM encodings | 🟡 in progress |
-| RDNA 2 disassembler operands identical to LLVM's text (scalar, VOP1/VOPC, DS, EXP) | ✅ done |
-| RDNA 2 → DXIL shader recompiler: vertex and pixel shaders drawn with D3D12, textures with `image_sample`, identical to the reference interpreter on the GPU and on WARP | 🟡 in progress |
-| Wave64 compute programs on GPUs with 32-lane waves | 🟡 in progress |
-| Shader cache: translated shaders compiled to DXIL once, then reused from disk | 🟡 in progress |
-| Console DXIL → PC DXIL retarget (Xbox2Windows, MIT) | ✅ done |
-| Console textures in Rust: BC7 and GFX10 `SW_4K_S` tiling, ported from Xbox2Windows (MIT) | 🟡 in progress |
-| Console XMA2 audio decoded to WAV by TomBox's Rust port of FFmpeg's decoder (LGPL) | 🟡 in progress |
-| x64 SEH exceptions (`.pdata`), dynamic loading of a DLL at run time (`LoadLibrary` + `DllMain`) | ⏳ to do |
-| D3D12.X graphics to Direct3D 12 / Vulkan | ⏳ to do |
-| 1900+ automated tests | ✅ done |
-| Pull request checks: lint and the English and French READMEs kept in sync (rows, images, test count) | ✅ done |
-
-## Research and history
-
-- [docs/progress.md](docs/progress.md): measurements of the game, and the earlier results on the console DLLs of the test package.
-- [docs/test-game.md](docs/test-game.md): the free test games (SimpleTriangle, SDL3's testgdk) of the first prototype, and the Python tools that still generate the progress charts.
-- [docs/day-one.md](docs/day-one.md): the first-launch report for a console executable (`jour_j.py`, in French: [docs/fr/jour-j.md](docs/fr/jour-j.md)).
-- [Xbox Series X hardware architecture](docs/research/xbox-series-x-architecture.md), [existing emulators and compatibility layers](docs/research/state-of-the-art.md), [TomBox](docs/research/tombox.md), [Xbox2Windows](docs/research/xbox2windows.md).
-- [Rust port status](docs/rust-full-status.md).
-
-## Tests
+| 1900+ automated tests | ✅ |
+| English and French READMEs kept in sync (rows, images, test count) | ✅ |
 
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest
+cargo test --release -p anyxboxx -p anyxboxx-launcher
 ```
 
-The tests that need the C++ runtime are skipped when it is not built. GPU tests need `dxc` and the GPU runner; without a GPU they use WARP.
-
-## Contributing
-
-The `main` branch is protected: every contribution goes through a reviewed pull request, and the tests must pass. Bugs and functions to emulate are reported in the issues. The full rules are in [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Discussion, help and test reports: [Discord](https://discord.gg/TcX42vRyPU)
+The tests that need the C++ runtime are skipped when it is not built. GPU tests need `dxc` and the GPU runner; without a GPU they use WARP. The layout of the repository and its rules are in [AGENTS.md](AGENTS.md).
 
 ## License
 
-AnyXboxX is distributed under the [GNU GPL 3.0 or later](LICENSE). Third-party parts keep their own license: the `Task` module of libHttpClient (MIT, `runtime/third_party/libhttpclient-task`) and the RDNA 2 tables generated from LLVM's public encoding tests (Apache 2.0 with LLVM exception, `PrototypeScarlett/emu/rdna2_ops.py` and `rdna2_shapes.py`).
+This line is distributed under the [GNU GPL 3.0 or later](LICENSE), like upstream AnyXboxX and VIctory. Third-party parts keep their own licence, and every source is credited in [THIRD_PARTY.md](THIRD_PARTY.md).
 
-Third-party components and credits: [THIRD_PARTY.md](THIRD_PARTY.md).
+DLSS support is code we wrote from the public declarations of NVIDIA's DLSS SDK. No NVIDIA file is copied, linked or shipped, and the DLSS model (`nvngx_dlss.dll`) comes from you. Whether this use fits the GPL has not been checked by a lawyer.

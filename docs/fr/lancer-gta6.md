@@ -340,8 +340,8 @@ Le lanceur graphique fait la compilation, le préchauffage des shaders et le lan
 Récupérer le code (VIctory est inclus) :
 
 ```powershell
-git clone https://github.com/LooperSalty/AnyXboxX.git
-cd AnyXboxX
+git clone --recurse-submodules https://github.com/Skyfrye/anyXboxx-diffbase.git
+cd anyXboxx-diffbase
 ```
 
 ## Compilation

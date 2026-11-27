@@ -340,8 +340,8 @@ The graphical launcher does the build, the shader warm-up and the launch for you
 Get the code (VIctory is included):
 
 ```powershell
-git clone https://github.com/LooperSalty/AnyXboxX.git
-cd AnyXboxX
+git clone --recurse-submodules https://github.com/Skyfrye/anyXboxx-diffbase.git
+cd anyXboxx-diffbase
 ```
 
 ## Build
