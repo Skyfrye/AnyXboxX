@@ -4234,12 +4234,16 @@ impl Shadow {
             let t = under_ns(3, t);
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
+            let done: Vec<Done> = done.into_iter().map(|runs| runs.into_inner().unwrap_or_else(|e| e.into_inner())).collect();
             // The runs of all the pages, noted at once (`card.dirty` is
-            // sorted and joined when it is taken).
-            let mut changed: Vec<(usize, usize)> = Vec::new();
+            // sorted and joined when it is taken). Room for all of them at
+            // once: some 100,000 a frame, and growing to them was 1.7% of
+            // the submitting thread's time (run s2-prof1).
+            let mut changed: Vec<(usize, usize)> =
+                Vec::with_capacity(if self.card.is_some() { done.iter().flatten().map(Vec::len).sum() } else { 0 });
             let (mut runs_in, mut bytes_in) = (0u64, 0u64);
             for (i, runs) in done.into_iter().enumerate() {
-                let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+                let Some(runs) = runs else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));

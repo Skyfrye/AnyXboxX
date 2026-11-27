@@ -3302,16 +3302,27 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
     let mut places: ByCopy<Option<usize>> = ByCopy::default();
     let scanning = std::time::Instant::now();
+    // The copy of the step before and its place: most refreshes come several
+    // times on end for the same copy, and the table was 1.8% of the
+    // submitting thread's time (run s2-prof1).
+    let mut last: (usize, Option<usize>) = (0, None);
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
-                    shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
-                        spans.len() - 1
-                    })
-                });
-                if let Some(i) = *place {
+                let key = Arc::as_ptr(shadow) as usize;
+                let place = if key == last.0 {
+                    last.1
+                } else {
+                    let place = *places.entry(key).or_insert_with(|| {
+                        shadow.writes_pending().then(|| {
+                            spans.push((shadow.clone(), *address, *address + *len));
+                            spans.len() - 1
+                        })
+                    });
+                    last = (key, place);
+                    place
+                };
+                if let Some(i) = place {
                     let s = &mut spans[i];
                     (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
                 }
@@ -5971,18 +5982,31 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            // The copy of the refreshes on end, its span so far (or `None`
+            // if it is not asked about): most come several times on end.
+            let mut run: Option<(usize, Option<(usize, usize)>)> = None;
+            let mut put = |run: Option<(usize, Option<(usize, usize)>)>| {
+                if let Some((key, Some((from, to)))) = run {
+                    let span = spans.entry(key).or_insert((from, to));
+                    *span = (span.0.min(from), span.1.max(to));
+                }
+            };
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    if let Step::Refresh(shadow, address, len) = step {
+                        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, *address + *len);
+                        match &mut run {
+                            Some((k, span)) if *k == key => {
+                                if let Some(span) = span {
+                                    *span = (span.0.min(*address), span.1.max(end));
+                                }
+                            }
+                            _ => put(run.replace((key, shadow.asked_ahead().then_some((*address, end))))),
+                        }
                     }
                 }
             }
+            put(run);
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -8769,7 +8793,8 @@ impl Batch {
             return;
         }
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-        let mut touches = Vec::new();
+        // (Room for all at once: 20,000 a frame.)
+        let mut touches = Vec::with_capacity(steps + parts.len());
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);
