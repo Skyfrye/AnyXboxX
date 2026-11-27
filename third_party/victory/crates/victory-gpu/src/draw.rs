@@ -5322,31 +5322,30 @@ mod bake_tests {
     /// is told to have left the slots that are due: it counted as served,
     /// and the warning of bakes that read stand-ins missed it. (No list is
     /// recorded, so nothing is sent.)
+    ///
+    /// On a heap of its own, which no other test's submission syncs (one did
+    /// the slot's upload between its write and the test's look), and with
+    /// no budget of its own rather than the frame's spent by hand (that
+    /// spent every other bake test's too, for good if this one failed).
     #[test]
     fn a_bake_past_its_budget_is_told_to_leave_its_due_slots() {
         if crate::host::host().is_none() {
             return;
         }
-        let h = crate::descriptor::test_view_heap(16);
-        let heap = crate::descriptor::heap(h);
-        let Some(host) = heap.host() else { return };
+        let Some(host) = crate::descriptor::host::HostHeap::new(false, 16) else { return };
         let texture = crate::resource::test_texture(3, 4, 4, 1);
-        let handle = heap.handle(7).unwrap();
-        crate::descriptor::create_srv(std::ptr::null(), texture, std::ptr::null(), handle);
+        let (_record, _) = host.test_write_texture(7, texture);
         let frame = crate::frame::current();
         assert!(host.texture_slots_any_due(frame, crate::host::now_ms()));
         // (Queued and showing the stand-in: counted as such for the warning.)
         assert_eq!(host.queued_without_texture(), 1);
-        let mut state = State::default();
-        state.heaps = [h as usize, 0];
-        // (The frame's other bakes took the whole budget.)
-        BAKED_MS.store(1500, Ordering::Relaxed);
+        // (The heap the bake's pass would read: with no budget there is none.)
+        let heap = crate::descriptor::heap(crate::descriptor::test_view_heap(16));
         let before = BAKES_LEFT[1].load(Ordering::Relaxed);
-        let [served, whole] = state.bake_textures(heap, host, frame, false, 1500);
+        let [served, whole] = State::default().bake_textures(heap, &host, frame, false, 0);
         assert!(!served, "a slot was due and had no pass");
         assert!(!whole);
         assert!(BAKES_LEFT[1].load(Ordering::Relaxed) > before);
-        BAKED_MS.store(0, Ordering::Relaxed);
     }
 
     /// How a draw is taken for a bake: by a program, or by its targets
@@ -5373,19 +5372,20 @@ mod bake_tests {
     /// card before a bake: no settle brings it nearer, and the bake takes
     /// its upload through its own list. (It settled the whole card for it,
     /// up to four times a bake.)
+    ///
+    /// The heap's own part of the question: the other, levels made again
+    /// once submissions have run, is every heap's, and another test's could
+    /// be waiting then.
     #[test]
     fn a_flip_waiting_in_a_list_asks_no_settle_before_a_bake() {
         let Some(gpu) = crate::host::host() else { return };
-        let h = crate::descriptor::test_view_heap(16);
-        let heap = crate::descriptor::heap(h);
-        let Some(host) = heap.host() else { return };
+        let Some(host) = crate::descriptor::host::HostHeap::new(false, 16) else { return };
         let texture = crate::resource::test_texture(3, 4, 4, 1);
-        let handle = heap.handle(6).unwrap();
-        crate::descriptor::create_srv(std::ptr::null(), texture, std::ptr::null(), handle);
+        let (_record, handle) = host.test_write_texture(6, texture);
         let other = gpu.new_list().unwrap();
         host.texture_slot_show_after(&other, 6, handle);
         assert_eq!(host.stand_ins_left()[1], 1, "behind the list's flip");
-        assert!(!host.needs_gpu_settle_for_bake());
+        assert!(!host.flips_wait_for_the_card());
         drop(other);
     }
 

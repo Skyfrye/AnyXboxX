@@ -3129,16 +3129,37 @@ impl HostHeap {
     /// its own list ([`HostHeap::take_pending_list_flips`]). (It settled the
     /// whole card for it, up to four times a bake.)
     pub(crate) fn needs_gpu_settle_for_bake(&self) -> bool {
-        let own = std::ptr::from_ref(self) as usize;
-        let finished = crate::host::submissions().1;
-        {
-            let flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
-            if flips.iter().any(|f| f.heap == own && f.after > finished) {
-                return true;
-            }
+        if self.flips_wait_for_the_card() {
+            return true;
         }
+        // (Of every heap: levels on demand note them for all.)
+        let finished = crate::host::submissions().1;
         let after = RESHOWN_AFTER.lock().unwrap_or_else(|e| e.into_inner());
         after.iter().any(|&(at, _)| at > finished)
+    }
+
+    /// Whether a deferred slot flip of this heap waits for submissions that
+    /// still run ([`HostHeap::needs_gpu_settle_for_bake`]'s part of its own).
+    pub(crate) fn flips_wait_for_the_card(&self) -> bool {
+        let own = std::ptr::from_ref(self) as usize;
+        let finished = crate::host::submissions().1;
+        let flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+        flips.iter().any(|f| f.heap == own && f.after > finished)
+    }
+
+    /// Tests elsewhere: slot `index` written with a shader view of texture
+    /// object `texture` (its own description), as the title writes one,
+    /// and mirrored here; the record (kept by the caller while the slot is
+    /// used) and its handle. On a heap of its own (no other test's
+    /// submission syncs it, as it does the heaps the title made).
+    #[cfg(test)]
+    pub(crate) fn test_write_texture(&self, index: u32, texture: crate::object::This) -> (Box<[u32; 4]>, u64) {
+        let mut record = Box::new([0u32; 4]);
+        let [i, generation] = super::words_for(View::Shader(texture as usize, None));
+        record[..3].copy_from_slice(&[VIEW_TAG, i, generation]);
+        let handle = record.as_ptr() as u64;
+        let _ = self.mirror(index, handle, false);
+        (record, handle)
     }
 
     /// Drains deferred flips still sitting in unsubmitted command lists for
