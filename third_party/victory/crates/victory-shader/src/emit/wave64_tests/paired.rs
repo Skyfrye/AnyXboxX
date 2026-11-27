@@ -569,3 +569,53 @@ fn paired_lanes_with_all_of_lds_meet_again_before_the_program_writes_it() {
     same_as_console("paired lanes with all of LDS", &got, &want);
     eprintln!("ran on the hardware device: two console waves numbered with the counter in their own LDS");
 }
+
+/// One console wave of 64 threads in a loop that each lane leaves when its own value comes up,
+/// as a waterfall loop does: each round takes the wave's first lane's value
+/// (`v_readfirstlane_b32`), and the lanes that hold it keep it with the round's number and
+/// leave (`v_cmpx_eq_u32`, `s_andn2_wrexec_b64`, `s_cbranch_execnz` back). Lane t holds
+/// t >> 4: lanes 0-15 leave in the first round, 16-31 in the second, 32-47 in the third and
+/// 48-63 in the fourth. The lane numbers (`v_mbcnt`) and the count of the wave's lanes
+/// (`s_bcnt1_i32_b64` of EXEC, kept as data) take lanes of both halves.
+fn rounds_until_the_own_value() -> NativeProgram {
+    let mut w = vec![vop2(0x16, 1, k(4), 0)]; // v_lshrrev_b32 v1, 4, v0
+    w.extend(vop3(0x365, 4, 193, k(0))); // v_mbcnt_lo_u32_b32 v4, -1, 0
+    w.extend(vop3(0x366, 4, 193, v(4))); // v_mbcnt_hi_u32_b32 v4, -1, v4
+    w.extend([
+        sop1(0x10, 18, EXEC),     // s_bcnt1_i32_b64 s18, exec
+        vop1(0x01, 5, 18),        // v_mov_b32 v5, s18
+        sop1(0x03, 15, k(0)),     // s_mov_b32 s15, 0: the round
+        sop1(0x04, 16, EXEC),     // s_mov_b64 s[16:17], exec
+        sop1(0x04, 12, EXEC),     // s_mov_b64 s[12:13], exec: the lanes still waiting
+        vop1(0x02, 14, v(1)),     // v_readfirstlane_b32 s14, v1
+        vopc(0xD2, 14, 1),        // v_cmpx_eq_u32 exec, s14, v1
+        sop2(0x00, 15, 15, k(1)), // s_add_u32 s15, s15, 1
+        vop1(0x01, 2, 14),        // v_mov_b32 v2, s14
+        vop1(0x01, 3, 15),        // v_mov_b32 v3, s15
+        sop1(0x3A, 12, 12),       // s_andn2_wrexec_b64 s[12:13], s[12:13]
+        sopp(0x09, -7),           // s_cbranch_execnz to the v_readfirstlane_b32
+        sop1(0x04, EXEC, 16),     // s_mov_b64 exec, s[16:17]
+    ]);
+    w.extend(stores([2, 3, 4, 5]));
+    native_of(&w, true, 64)
+}
+
+/// A loop of one block that the lanes leave one by one is not code every lane runs in every
+/// round: two host waves of 32 that exchanged the wave's first lane through LDS there would
+/// meet at the group barriers of different rounds (the lower half's threads leave after one or
+/// two rounds, the upper half's after three or four) and read each other's stale dwords. The
+/// program takes the paired form, which gives what the console's 64 lanes compute. (Before,
+/// the loop's block counted as one every lane runs, and the program took the halves.)
+#[test]
+fn a_loop_the_lanes_leave_one_by_one_is_not_where_two_host_waves_meet() {
+    let native = rounds_until_the_own_value();
+    let (shader, form) = emitted_32(&native, true);
+    assert_eq!(form, Some(WaveForm::PAIRED), "the form for a host of 32-lane waves");
+    let shader = shader.expect("emit");
+    validated(&shader);
+    let want: Vec<u32> = (0..64u32).flat_map(|t| [t >> 4, (t >> 4) + 1, t, 64]).collect();
+    let _one = super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run(&shader, [0; 4], 256) else { return };
+    same_as_console("rounds until the own value", &got, &want);
+    eprintln!("ran on the hardware device: a loop the lanes leave one by one, as on the console");
+}
