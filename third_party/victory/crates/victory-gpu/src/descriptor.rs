@@ -1099,9 +1099,13 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
+    /// The shapes of views of placed memory, and where each is by its
+    /// hash ([`shape_key`]): keyed by the shape itself the index held a
+    /// second copy of each (116 bytes), 2.4 million of them, some 900 MB
+    /// with the list, 18 minutes into the world (avatarmanz/VIctory-7900XTX
+    /// #206).
     shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    shape_index: std::collections::BTreeMap<u64, u32>,
     /// Entries no resource owns (constant buffer views and views of placed
     /// memory), oldest first, with the generation each was made at: past
     /// [`ownerless_cap`] the oldest is freed, as nothing else frees them.
@@ -1233,6 +1237,13 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     )
 }
 
+/// The key of `shape` in [`Views::shape_index`]: its hash, by a hasher
+/// with fixed keys, so one shape has one key all through the run.
+fn shape_key(shape: &Shape) -> u64 {
+    use std::hash::BuildHasher;
+    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(shape)
+}
+
 /// The record words that name the view of placed memory at `address` with
 /// shape number `shape`.
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
@@ -1242,17 +1253,27 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
 impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
+    ///
+    /// Of two shapes with one hash, the second is a table entry too, as
+    /// when the shapes are full: one in billions with a few million shapes.
     fn shape(&mut self, shape: Shape) -> Option<u32> {
-        if let Some(&at) = self.shape_index.get(&shape) {
-            return Some(at);
+        let key = shape_key(&shape);
+        if let Some(&at) = self.shape_index.get(&key) {
+            return (self.shapes[at as usize] == shape).then_some(at);
         }
         if self.shapes.len() >= SHAPES {
             return None;
         }
         let at = self.shapes.len() as u32;
         self.shapes.push(shape);
-        self.shape_index.insert(shape, at);
+        self.shape_index.insert(key, at);
         Some(at)
+    }
+
+    /// The number of `shape` if it is there already.
+    fn known_shape(&self, shape: &Shape) -> Option<u32> {
+        let &at = self.shape_index.get(&shape_key(shape))?;
+        (self.shapes[at as usize] == *shape).then_some(at)
     }
 
     /// The view of placed memory [`placed_words`] named.
@@ -1361,7 +1382,7 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
+                    let known = views_read().known_shape(&shape);
                     let shape = known.or_else(|| views_write().shape(shape));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
@@ -1434,7 +1455,7 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
             + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + views.shape_index.len() as u64 * size_of::<(u64, u32)>() as u64 * 3 / 2,
         constants,
         placed,
         views.shapes.len() as u64,
@@ -2419,6 +2440,31 @@ mod tests {
         desc[8] = 1;
         create_placed_srv(null, &resource, &desc, at);
         assert_ne!(record_at(at), Some(first));
+    }
+
+    /// A shape seen before has its number, through the index by hash; of
+    /// two shapes with one hash the second has none (it is then a table
+    /// entry, as when the shapes are full), and the first keeps its own.
+    #[test]
+    fn placed_shapes_are_found_by_their_hash() {
+        let mut views = Views::default();
+        let shape = |n: u32| -> Shape { (n % 2 == 1, [n; 14], [n.wrapping_mul(3); 14]) };
+        assert_eq!(views.known_shape(&shape(1)), None);
+        assert_eq!(views.shape(shape(1)), Some(0));
+        assert_eq!(views.shape(shape(2)), Some(1));
+        assert_eq!(views.shape(shape(1)), Some(0));
+        assert_eq!(views.known_shape(&shape(2)), Some(1));
+        assert_eq!(views.shapes.len(), 2);
+        // A shape whose hash were that of shape 1.
+        let other = shape(5);
+        views.shape_index.insert(shape_key(&other), 0);
+        assert_eq!(views.known_shape(&other), None);
+        assert_eq!(views.shape(other), None);
+        assert_eq!(views.known_shape(&shape(1)), Some(0));
+        assert_eq!(views.shapes.len(), 2);
+        // The key is the same each time: records of one run name one shape.
+        assert_eq!(shape_key(&shape(7)), shape_key(&shape(7)));
+        assert_ne!(shape_key(&shape(7)), shape_key(&shape(8)));
     }
 
     /// Entries no resource owns stay under their cap: the oldest go stale,
