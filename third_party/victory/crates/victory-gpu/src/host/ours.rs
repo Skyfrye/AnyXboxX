@@ -279,7 +279,7 @@ impl Slots {
 /// their lists have run; read now they are not taken again unread.
 fn ahead(first: u32, len: u32) -> Option<std::ops::Range<u32>> {
     let quarter = len / 4;
-    (first % quarter == 0).then(|| {
+    first.is_multiple_of(quarter).then(|| {
         let next = (first / quarter + 1) % 4;
         next * quarter..(next + 1) * quarter
     })
