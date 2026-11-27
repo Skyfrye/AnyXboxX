@@ -554,7 +554,10 @@ fn view_format(view: &View) -> u32 {
 /// far out of range, on NVIDIA and RADV alike), where a null view's zeros
 /// are defined for every type.
 fn integer_view(view: &View) -> bool {
-    crate::pipeline::host::integer_format(DXGI_FORMAT(view_format(view) as i32))
+    let format = DXGI_FORMAT(view_format(view) as i32);
+    // (The stencil planes' views read integers too; no target has them.)
+    crate::pipeline::host::integer_format(format)
+        || matches!(format, DXGI_FORMAT_X24_TYPELESS_G8_UINT | DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)
 }
 
 /// The stand-in kind and view description for a texture view of SRV
@@ -6332,8 +6335,9 @@ mod tests {
         for format in [28, 41, 98] {
             assert!(neutral_for(&view(format), at).is_some(), "format {format}");
         }
-        // R32_UINT, R8G8B8A8_SINT, R16_UINT: null.
-        for format in [42, 32, 57] {
+        // R32_UINT, R8G8B8A8_SINT, R16_UINT, and the stencil planes'
+        // X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT: null.
+        for format in [42, 32, 57, 47, 22] {
             assert!(neutral_for(&view(format), at).is_none(), "format {format}");
         }
         let floats = placed_2d(0x7fee_3400_0000, 98);
