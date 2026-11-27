@@ -1927,7 +1927,12 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
-                        match self.heap_buffers(list) {
+                        let began = crate::list::thin::times_on().then(std::time::Instant::now);
+                        let buffers = self.heap_buffers(list);
+                        if let Some(began) = began {
+                            crate::list::thin::timed_part(0, began.elapsed().as_nanos() as u64);
+                        }
+                        match buffers {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
@@ -4269,10 +4274,18 @@ impl State {
                 let index = first + k;
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
-                if list_views
+                let timing = crate::list::thin::times_on().then(std::time::Instant::now);
+                let listed = if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
+                    host.make_listed(recording, words, index).map(|listed| (words, listed))
+                } else {
+                    None
+                };
+                if let Some(began) = timing {
+                    crate::list::thin::timed_part(1, began.elapsed().as_nanos() as u64);
+                }
+                if let Some((words, mut listed)) = listed {
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
@@ -5205,6 +5218,14 @@ fn readable_count(buffer: bool) {
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    let timing = crate::list::thin::times_on().then(std::time::Instant::now);
+    readable_untimed(list, kind, view);
+    if let Some(began) = timing {
+        crate::list::thin::timed_part(2, began.elapsed().as_nanos() as u64);
+    }
+}
+
+fn readable_untimed(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);

@@ -403,6 +403,36 @@ pub(crate) fn line(frames: f64) {
         *last = now;
         g
     };
+    if times_on() {
+        static LAST_TIMES: Mutex<[u64; TIMED]> = Mutex::new([0; TIMED]);
+        let now: [u64; TIMED] = std::array::from_fn(|i| TIMES[i].load(Relaxed));
+        let d: Vec<f64> = {
+            let mut last = held(&LAST_TIMES);
+            let d = now.iter().zip(last.iter()).map(|(n, l)| n.saturating_sub(*l) as f64 / frames).collect();
+            *last = now;
+            d
+        };
+        let by_kind: Vec<String> = KINDS
+            .iter()
+            .enumerate()
+            .map(|(k, name)| {
+                format!("{name} {:.0} in {:.1} ms ({:.2} us each)", d[2 * k + 1], d[2 * k] / 1e6, d[2 * k] / 1e3 / d[2 * k + 1].max(1.0))
+            })
+            .collect();
+        let by_part: Vec<String> = PARTS
+            .iter()
+            .enumerate()
+            .map(|(p, name)| {
+                let at = 2 * KINDS.len() + 2 * p;
+                format!("{name} {:.0} in {:.1} ms", d[at + 1], d[at] / 1e6)
+            })
+            .collect();
+        tracing::info!(
+            "translating per frame by kind of call (VICTORY_THIN_TIMES): {}; in binds: {}",
+            by_kind.join(", "),
+            by_part.join(", ")
+        );
+    }
     tracing::info!(
         "views of lists per frame: {:.0} asked, {:.0} made; made ready to be read {:.0}, {:.0} of them of buffers; waits for dynamic slots (VICTORY_SLOT_WAIT) {:.2}, {:.1} ms",
         g[0],
@@ -762,13 +792,121 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Whether the translating threads time their calls by kind, and the parts
+/// of `crate::draw::State::bind` they spend most in, for the line
+/// (`VICTORY_THIN_TIMES=1`, off). A sampling profile suspends the threads it
+/// samples, and one suspended inside a lock that all the others take makes
+/// that lock look far busier than it is (the process heap's lock was 54 % of
+/// the translating in profile tp1, and a heap of our own changed nothing of
+/// the translating's time without the profile, runs cb and c1).
+pub(crate) fn times_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_THIN_TIMES"))
+}
+
+/// The kinds of calls [`times_on`] counts apart.
+const KINDS: [&str; 9] = [
+    "draws",
+    "dispatches",
+    "mesh dispatches",
+    "indirect executions",
+    "bindings",
+    "barriers",
+    "copies and clears",
+    "begin, end, uploads",
+    "other",
+];
+/// Parts of a bind ([`timed_part`]): the heap pass, views of tables, views
+/// made ready.
+const PARTS: [&str; 3] = ["the heap pass", "views of tables (make_listed)", "views made ready (readable)"];
+const TIMED: usize = 2 * KINDS.len() + 2 * PARTS.len();
+/// Of all threads: nanoseconds and calls by kind, then by part.
+static TIMES: [AtomicU64; TIMED] = [const { AtomicU64::new(0) }; TIMED];
+
+/// The kind of call `op` is ([`KINDS`]).
+fn kind_of(op: u64) -> usize {
+    let is = |p: Plain| op == p as u64;
+    if is(Plain::DRAW) || is(Plain::DRAW_INDEXED) {
+        0
+    } else if is(Plain::DISPATCH) || is(Plain::DISPATCH_X) {
+        1
+    } else if is(Plain::DISPATCH_MESH) || is(Plain::DISPATCH_MESH_X) {
+        2
+    } else if is(Plain::EXECUTE_INDIRECT) {
+        3
+    } else if op == BARRIER || op == BARRIER_GROUPS {
+        5
+    } else if op == COPY_TEXTURE
+        || op == CLEAR_RTV
+        || op == CLEAR_DSV
+        || is(Plain::COPY_BUFFER)
+        || is(Plain::COPY_RESOURCE)
+        || is(Plain::COPY_RESOURCE_X)
+        || is(Plain::COPY_MEMORY)
+        || is(Plain::RESOLVE)
+        || is(Plain::RESOLVE_QUERIES)
+    {
+        6
+    } else if op == RESET || op == CLOSE || op == UPLOAD || op == EXTERNAL {
+        7
+    } else if op < Plain::END as u64 || (VIEWPORTS..=TARGETS).contains(&op) {
+        4
+    } else {
+        8
+    }
+}
+
+/// Adds `ns` to part `part` of a bind ([`PARTS`]), with [`times_on`].
+pub(crate) fn timed_part(part: usize, ns: u64) {
+    let at = 2 * KINDS.len() + 2 * part;
+    TIMES[at].fetch_add(ns, Relaxed);
+    TIMES[at + 1].fetch_add(1, Relaxed);
+}
+
+/// The calls of a stream timed by kind ([`times_on`]), added to [`TIMES`]
+/// when the stream is done.
+struct Timed {
+    ns: [u64; KINDS.len()],
+    n: [u64; KINDS.len()],
+    /// When the call being made began, and its kind.
+    last: Option<(std::time::Instant, usize)>,
+}
+
+impl Timed {
+    /// The call being made ends now; `next` (a kind) begins.
+    fn next(&mut self, next: Option<usize>) {
+        let now = std::time::Instant::now();
+        if let Some((began, kind)) = self.last {
+            self.ns[kind] += now.duration_since(began).as_nanos() as u64;
+            self.n[kind] += 1;
+        }
+        self.last = next.map(|kind| (now, kind));
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        self.next(None);
+        for k in 0..KINDS.len() {
+            if self.n[k] > 0 {
+                TIMES[2 * k].fetch_add(self.ns[k], Relaxed);
+                TIMES[2 * k + 1].fetch_add(self.n[k], Relaxed);
+            }
+        }
+    }
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let mut timed = times_on().then(|| Timed { ns: [0; KINDS.len()], n: [0; KINDS.len()], last: None });
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+        if let Some(t) = &mut timed {
+            t.next(Some(kind_of(op)));
+        }
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;
