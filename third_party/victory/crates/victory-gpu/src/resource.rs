@@ -1158,6 +1158,7 @@ impl Memory {
         if info.size >= 32 << 20 {
             tracing::info!(mb = info.size >> 20, at = ?ptr, "memory for the title from our allocator (a heap or a descriptor heap)");
         }
+        crate::ram::title_from_ours(layout.size() as i64);
         Ok(Memory {
             ptr,
             layout,
@@ -1170,8 +1171,11 @@ impl Drop for Memory {
     fn drop(&mut self) {
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
-            // SAFETY: allocated in `new` with this layout.
-            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+            _ => {
+                crate::ram::title_from_ours(-(self.layout.size() as i64));
+                // SAFETY: allocated in `new` with this layout.
+                unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
+            }
         }
     }
 }
@@ -3391,6 +3395,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[13] = 0;
     }
     let desc = &key;
+    // What this thread found already, without the lock every thread that
+    // looks for a placed texture takes.
+    #[cfg(not(feature = "diagnostics"))]
+    if let Some(r) = placed_seen(address, desc, None) {
+        return Some(r as This);
+    }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`). Only a diagnostics build reads it,
@@ -3417,6 +3427,8 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         }
     }
     if let Some(&r) = map.get(&(address, *desc)) {
+        #[cfg(not(feature = "diagnostics"))]
+        placed_seen(address, desc, Some(r));
         return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -3444,6 +3456,30 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         .placed
         .store(true, std::sync::atomic::Ordering::Relaxed);
     Some(out)
+}
+
+/// The placed textures this thread found in [`PLACED_TEXTURES`]: an entry
+/// there is never taken out or changed (the resource is kept for the run),
+/// so what it said once it says from then on. With `found`, notes it; the
+/// resource of (`address`, `desc`) if this thread found it before. (Of
+/// 16,384 at most: past that it starts over.)
+#[cfg(all(windows, not(feature = "diagnostics")))]
+fn placed_seen(address: u64, desc: &[u32; 14], found: Option<usize>) -> Option<usize> {
+    type Seen = std::collections::HashMap<(u64, [u32; 14]), usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
+    thread_local! {
+        static SEEN: std::cell::RefCell<Seen> = std::cell::RefCell::new(Seen::default());
+    }
+    SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        let Some(found) = found else {
+            return seen.get(&(address, *desc)).copied();
+        };
+        if seen.len() >= 1 << 14 {
+            seen.clear();
+        }
+        seen.insert((address, *desc), found);
+        Some(found)
+    })
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -5307,5 +5343,32 @@ float4 lit() : SV_Target { return 1.0; }
             assert!(footprint.crop_upload_rows(&mut region, footprint.bytes().unwrap()).is_none());
             assert_eq!(region, outside);
         }
+    }
+}
+
+#[cfg(all(test, windows, not(feature = "diagnostics")))]
+mod placed_seen_tests {
+    use super::placed_seen;
+
+    /// What a thread noted of the placed textures it says again, and only
+    /// for the same address and description; past its bound it starts over.
+    #[test]
+    fn a_placed_texture_found_once_is_known_to_the_thread() {
+        std::thread::spawn(|| {
+            let desc = [3u32, 0, 0, 0, 256, 0, 256, 1, 9, 0, 1, 0, 0, 0];
+            assert_eq!(placed_seen(0x1000, &desc, None), None);
+            assert_eq!(placed_seen(0x1000, &desc, Some(77)), Some(77));
+            assert_eq!(placed_seen(0x1000, &desc, None), Some(77));
+            let mut other = desc;
+            other[4] = 512;
+            assert_eq!(placed_seen(0x1000, &other, None), None);
+            assert_eq!(placed_seen(0x2000, &desc, None), None);
+            for i in 0..(1u64 << 14) {
+                placed_seen(0x10_0000 + i * 0x1000, &desc, Some(i as usize));
+            }
+            assert_eq!(placed_seen(0x1000, &desc, None), None, "started over");
+        })
+        .join()
+        .unwrap();
     }
 }

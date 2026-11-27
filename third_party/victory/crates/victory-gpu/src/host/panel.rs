@@ -167,7 +167,7 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
     out
 }
 
-/// The counters read for it. They grow, and go back to 0 with the frame-rate
+/// The counters read for it. They grow; some go back to 0 with the frame-rate
 /// line (right behind a look of ours).
 #[derive(Clone, Copy, Default)]
 struct Counters([u64; COUNTERS]);

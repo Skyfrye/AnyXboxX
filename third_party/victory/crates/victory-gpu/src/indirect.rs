@@ -51,7 +51,8 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. From bit 8: the program's tag
+    // (`wide_tag`; 0: none).
     uint has_count;
     uint count_offset;
 };
@@ -89,11 +90,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // and store nothing.
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = id.x * (kind == ROWS ? ROWS_BYTES : stride);
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+    bool wide = false;
+    bool noted = false;
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
@@ -115,10 +118,18 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint instances = min(want.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
         draw_counts = uint2(count, instances);
-    } else if (active && kind == 2) {
+    } else if (active && (kind == 2 || kind == ROWS)) {
         uint3 g = src_args.Load3(src_at);
-        // Up to WIDEST groups in x run as asked (`widest`).
-        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        // A record of ROWS of more than 65,535 groups in x, and one in y,
+        // runs them all in rows (`ROWS`); else up to WIDEST groups in x run
+        // as asked (`widest`), and one of a tagged program that would run
+        // in rows is noted (`wide_tag`).
+        bool rows_would = g.x > 65535u && g.x <= GROUPS && g.y == 1u;
+        wide = kind == ROWS && rows_would;
+        noted = kind == 2 && rows_would && g.x > WIDEST && (has_count >> 8) != 0;
+        if (!wide) {
+            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        }
         // x * y fits 32 bits where it is looked at; the whole count may not.
         if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
@@ -142,7 +153,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && kind == 10) {
         // Diagnostics, in the budget buffer's next words (below): the
         // largest group count a mesh record asked for, and the groups
         // asked in all.
@@ -202,7 +213,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2 && n > 0) {
+    if (gi == 0 && kind == 10 && n > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
@@ -210,8 +221,24 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (!active) {
         return;
     }
+    if (noted) {
+        note_wide(budget, has_count >> 8);
+    }
     bool over = fits[gi] == 0;
-    if (kind <= 1) {
+    if (kind == ROWS) {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        uint4 r = rows_of(groups, wide);
+        if (r.w > 0) {
+            // Diagnostics: the records laid out in rows, the most groups.
+            uint was;
+            budget.InterlockedAdd(20, 1u, was);
+            budget.InterlockedMax(24, r.w, was);
+        }
+        dst_args.Store2(dst_at, r.zw);
+        dst_args.Store3(dst_at + 8, uint3(r.xy, groups.z));
+    } else if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
@@ -275,10 +302,176 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// its last 1,905 tiles, the lowest of the picture. The console runs what it
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. Other cards stay at 65,535.
+/// indirect counts. Other cards stay at 65,535, and run such records in rows
+/// ([`ROWS`]).
 fn widest(amd: bool) -> u32 {
     let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
     if amd && on { 1 << 20 } else { 65_535 }
+}
+
+/// The clamp's kind of a dispatch record whose groups along X may run in
+/// rows: read as a dispatch's three words, written as [`ROWS_BYTES`]: the
+/// two words `victory_shader::emit::USER_GROUP_ROWS` of the program (the
+/// groups of a row and the groups asked for along X; both 0 for a record
+/// that runs as asked), then the dispatch (`crate::draw`'s signature of it
+/// reads them).
+///
+/// A D3D12 host runs at most 65,535 groups along a dimension; NVIDIA's cuts
+/// an indirect dispatch of more there. The title's tile lists are
+/// dispatches of one group per tile along X ([`widest`]). Cut to 65,535,
+/// the first of the indirect diffuse light's lost its last tiles, which
+/// kept what they held frames before: the band of blocks along the bottom
+/// of the prison cell, and stripes and blocks wherever a class's last tiles
+/// fell (forearms and wrists in the diner). A record of more than 65,535
+/// groups along X (at most 2^20, as any dispatch) and one along Y runs in
+/// [`rows`] of at most 65,535 groups, and the program numbers its groups as
+/// the console does (those of the last row past the count leave at once).
+/// Others are clamped as dispatches are. Only the records of programs that
+/// asked for that many once are of this kind ([`Wide`]).
+pub(crate) const ROWS: u32 = 12;
+/// The bytes of a record of [`ROWS`] as the clamp writes it.
+pub(crate) const ROWS_BYTES: u32 = 20;
+
+/// [`ROWS`]' layout in the clamps' HLSL: of the clamped groups `g`,
+/// `wide` when the record asked for more than 65,535 along X and one along
+/// Y: x the groups of a row, y the rows, z the row's groups again and w the
+/// groups asked for (z and w 0: `g` as it is). As [`rows`].
+const ROWS_OF: &str = r#"
+// The tag of a program one of whose records asked for more groups along X
+// than run, into the budget buffer's notes (`wide_tag`): their count at
+// byte 28, the first WIDE_NOTES from byte 32.
+void note_wide(RWByteAddressBuffer budget, uint tag) {
+    uint slot;
+    budget.InterlockedAdd(28, 1u, slot);
+    if (slot < WIDE_NOTES) {
+        budget.Store(32 + slot * 4, tag);
+    }
+}
+uint4 rows_of(uint3 g, bool wide) {
+    if (!wide || g.x <= 65535u) {
+        return uint4(g.xy, 0u, 0u);
+    }
+    uint rows = (g.x + 65534u) / 65535u;
+    uint row = (g.x + rows - 1u) / rows;
+    return uint4(row, rows, row, g.x);
+}
+"#;
+
+/// The rows a dispatch of `x` by `y` groups runs in ([`ROWS`]): the groups
+/// of a row and the rows, as few rows as hold them and as even as they can
+/// be, if `x` is more than 65,535 (at most 2^20) and `y` 1; else `None`.
+pub(crate) fn rows(x: u32, y: u32) -> Option<(u32, u32)> {
+    (x > 65_535 && x <= 1 << 20 && y == 1).then(|| {
+        let rows = x.div_ceil(65_535);
+        (x.div_ceil(rows), rows)
+    })
+}
+
+/// The command signature of a dispatch that may run in rows ([`ROWS`]) for
+/// programs of the root signature `root` whose two words
+/// (`victory_shader::emit::USER_GROUP_ROWS`, the row's groups and the
+/// groups asked for) are dwords `words` of root parameter `param`: those
+/// two words, then the dispatch, from records as the clamps write them.
+pub(crate) fn rows_command_signature(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    (param, words): (u32, [u32; 2]),
+) -> windows::core::Result<ID3D12CommandSignature> {
+    let word = |at: u32| D3D12_INDIRECT_ARGUMENT_DESC {
+        Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+        Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+            Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                RootParameterIndex: param,
+                DestOffsetIn32BitValues: at,
+                Num32BitValuesToSet: 1,
+            },
+        },
+    };
+    let arguments = [
+        word(words[0]),
+        word(words[1]),
+        D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: ROWS_BYTES,
+        NumArgumentDescs: arguments.len() as u32,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a valid description whose arguments live through the call; it
+    // changes root arguments, so it names the programs' root signature.
+    unsafe { device.CreateCommandSignature(&desc, root, &mut signature)? };
+    signature.ok_or_else(windows::core::Error::empty)
+}
+
+/// Whether dispatches of more than 65,535 groups along X run in rows
+/// ([`ROWS`]) on the host's card: on every card that does not run them as
+/// asked ([`widest`]).
+pub(crate) fn in_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| host().is_some_and(|h| widest(amd(&h.device)) == 65_535))
+}
+
+/// The tags of programs noted in a list's budget buffer at most
+/// ([`wide_tag`]): words 8 on, after their count in word 7.
+pub(crate) const WIDE_NOTES: u32 = 8;
+
+/// The programs whose indirect dispatches run as [`ROWS`]: those that asked
+/// for more than 65,535 groups along X once. A record read through the
+/// signature of rows costs the card a wait of its own between two
+/// dispatches (`rows_signature_costs`: 15.7 against 0.85 microseconds a
+/// dispatch on an RTX 5080, with a barrier between every two), and a frame
+/// has some 800 indirect dispatches of which a few are that wide (the tile
+/// lists): so the others go on as dispatches. A program's records are
+/// clamped as dispatches until one of them asks for more; the clamp notes
+/// its tag (from bit 8 of the clamp's flags, the batch's job word 3) in the
+/// list's budget buffer, the list's next submission reads it
+/// ([`noted_wide`]), and from then on its records are of [`ROWS`]. Until
+/// then such a record runs 65,535 groups along X, as before: the first
+/// frames of a tile list that wide.
+#[derive(Default)]
+struct Wide {
+    /// The tag of a program (by the address of its host pipeline, 1 on).
+    tags: std::collections::HashMap<usize, u32>,
+    /// The programs by tag, less one.
+    programs: Vec<usize>,
+    /// The programs noted.
+    noted: std::collections::HashSet<usize>,
+}
+
+fn wide() -> std::sync::MutexGuard<'static, Wide> {
+    static WIDE: std::sync::LazyLock<std::sync::Mutex<Wide>> = std::sync::LazyLock::new(Default::default);
+    WIDE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the program of the host pipeline at `pipeline` runs its indirect
+/// dispatches in rows ([`Wide`]), else its tag for the clamp to note it by.
+pub(crate) fn wide_tag(pipeline: usize) -> Result<(), u32> {
+    let mut w = wide();
+    if w.noted.contains(&pipeline) {
+        return Ok(());
+    }
+    if let Some(&tag) = w.tags.get(&pipeline) {
+        return Err(tag);
+    }
+    // (Past 2^24 programs, none is told apart: no tag.)
+    let tag = u32::try_from(w.programs.len() + 1).ok().filter(|&t| t < 1 << 24).unwrap_or(0);
+    if tag != 0 {
+        w.programs.push(pipeline);
+        w.tags.insert(pipeline, tag);
+    }
+    Err(tag)
+}
+
+/// A program a clamp noted by its `tag` ([`wide_tag`]): its indirect
+/// dispatches run in rows from now on. The count of programs noted so far.
+pub(crate) fn noted_wide(tag: u32) -> usize {
+    let mut w = wide();
+    if let Some(&program) = (tag as usize).checked_sub(1).and_then(|i| w.programs.get(i)) {
+        w.noted.insert(program);
+    }
+    w.noted.len()
 }
 
 /// Whether `device` is an AMD card's.
@@ -306,7 +499,11 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!(
+        "#define WIDEST {}u\n#define REST {}\n#define ROWS {ROWS}u\n#define ROWS_BYTES {ROWS_BYTES}u\n#define WIDE_NOTES {WIDE_NOTES}u\n{ROWS_OF}{source}",
+        widest(amd(device)),
+        rest()
+    );
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -358,12 +555,13 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     }
 }
 
-/// Minimum record byte stride for a supported PC indirect argument `kind`.
+/// Minimum record byte stride for a supported PC indirect argument `kind`
+/// (or [`ROWS`]: a dispatch's, as the title gives it).
 fn min_stride(kind: u32) -> Option<u32> {
     match kind {
         0 => Some(16),
         1 => Some(20),
-        2 | 10 => Some(12),
+        2 | 10 | ROWS => Some(12),
         _ => None,
     }
 }
@@ -392,19 +590,41 @@ fn validate_layout(
 /// until the next clamp into it: executions read it with no barrier of
 /// their own. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp or alignment is not
-/// available.
+/// available. (The dispatches of programs: [`bound_tagged`].)
+#[cfg(test)]
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    bound_tagged(list, src, count, spec, 0)
 }
 
-/// [`bound`] for a window of records clamped ahead of the draws that will
+/// Records the non-destructive clamp of up to `records` records of `kind`
+/// (PC argument numbering) `stride` bytes apart from `src` (and bounded by
+/// the 32-bit count in `count` when given) into a device-local scratch
+/// buffer, at offset `0`, for the dispatches of a program with the tag
+/// `tag` ([`wide_tag`]; 0: none): a record of more groups along X than run
+/// is noted. The scratch buffer is left in `INDIRECT_ARGUMENT` until the
+/// next clamp into it. Replaces the list's compute root signature and
+/// pipeline (callers bind theirs after). `None` if the clamp or alignment
+/// is not available.
+pub(crate) fn bound_tagged(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    tag: u32,
+) -> Option<ID3D12Resource> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    // (Records of [`ROWS`] come out longer.)
+    let bytes = if spec.0 == ROWS { u64::from(ROWS_BYTES) * u64::from(spec.2) } else { bytes };
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, count, spec, (false, tag)).then_some(dst)
+}
+
+/// [`bound_tagged`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each
 /// record clamped charges the list's budget when it is clamped: a slot of
@@ -421,11 +641,11 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, (true, 0)).then_some(dst)
 }
 
-/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
-/// the list left it in; afterwards the list knows it is readable as
+/// [`record_clamp_tagged`] into `list`'s scratch buffer `dst`, from the
+/// state the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
 #[allow(clippy::too_many_arguments)]
 fn clamp_into(
@@ -436,11 +656,11 @@ fn clamp_into(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-    ahead: bool,
+    ahead_tag: (bool, u32),
 ) -> bool {
     let before = list.indirect_state(dst);
     let timed = list.timed_begin(crate::host::ours::Kind::Clamps);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let recorded = record_clamp_tagged(c, &list.list, (dst, before), budget, src, count, spec, ahead_tag);
     list.timed_end(timed);
     if recorded {
         list.indirect_readable(dst);
@@ -453,8 +673,26 @@ fn clamp_into(
 /// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
 /// their draws ([`bound_ahead`]). False, with nothing recorded, if the
 /// layout or the addresses do not fit the clamp.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    to: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_tagged(c, l, to, budget, src, count, spec, (ahead, 0))
+}
+
+/// Records the clamp as `record_clamp_as` does, for the records of a
+/// program with the tag `tag` ([`wide_tag`]; 0: none): a record of more
+/// groups along X than run is noted.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_tagged(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
@@ -462,7 +700,7 @@ fn record_clamp_as(
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-    ahead: bool,
+    (ahead, tag): (bool, u32),
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -507,7 +745,8 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let flags = has_count | (u32::from(ahead) << 1) | (tag.min((1 << 24) - 1) << 8);
+    let constants = [kind, stride, records, args_offset, flags, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -3031,6 +3270,178 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         }
     }
 
+    /// The rows a wide dispatch runs in: as few as hold it, as even as can
+    /// be, none of them past 65,535 groups.
+    #[test]
+    fn rows_of_wide_dispatches() {
+        assert_eq!(rows(67_440, 1), Some((33_720, 2)));
+        assert_eq!(rows(115_200, 1), Some((57_600, 2)));
+        assert_eq!(rows(65_536, 1), Some((32_768, 2)));
+        assert_eq!(rows(131_071, 1), Some((43_691, 3)));
+        assert_eq!(rows(1 << 20, 1), Some((61_681, 17)));
+        for x in [65_536u32, 65_537, 70_001, 131_070, 131_071, 196_605, 196_606, 999_999, 1 << 20] {
+            let (row, rows) = rows(x, 1).unwrap();
+            assert!(row <= 65_535 && rows <= 65_535, "{x}");
+            assert!(row * rows >= x && row * (rows - 1) < x, "{x}: {row} x {rows}");
+            assert!(row * rows - x < rows, "{x}: {row} x {rows}: one short group a row at most");
+        }
+        // As asked: what a dimension holds, two along Y, past what is run at all.
+        for (x, y) in [(65_535, 1), (100, 1), (70_000, 2), (70_000, 0), ((1 << 20) + 1, 1)] {
+            assert_eq!(rows(x, y), None, "{x} by {y}");
+        }
+    }
+
+    /// Any card runs every group of an indirect dispatch of more than
+    /// 65,535 along X once, under the console's number, in rows ([`ROWS`]):
+    /// clamped one by one and in a batch, the record's two words read into
+    /// the program's root constants by [`rows_command_signature`]. The
+    /// program numbers its groups as a translated one does
+    /// (`victory_shader`'s `Lower::group_rows`). Records that are not wide,
+    /// or two along Y, run as dispatches are clamped.
+    #[test]
+    fn cards_run_wide_indirect_dispatches_in_rows() {
+        const CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), UAV(u0)"
+cbuffer Rows : register(b0) {
+    uint other;
+    uint row;
+    uint asked;
+};
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint x = group.y * row + group.x;
+    uint y = row == 0 ? group.y : 0;
+    if (row != 0 && x >= asked) {
+        return;
+    }
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, x, was);
+    seen.InterlockedMax(8, y, was);
+    seen.InterlockedAdd(16 + x * 4, 1 + y, was);
+}
+"#;
+        for software in [false, true] {
+            let Some(mut gpu) = WarpHarness::on(software) else {
+                continue;
+            };
+            let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
+            let pass = make_from(&gpu.device, batch::SOURCE).expect("the batched clamp must compile");
+            // The words at dwords 1 and 2 of root parameter 0 (another before them).
+            let sig = rows_command_signature(&gpu.device, &worker.root, (0, [1, 2])).expect("the signature of rows");
+            // (asked x, y): in rows; as dispatches are clamped (up to WIDEST
+            // along X as asked, past it 65,535).
+            let mut cases = vec![(67_440u32, 1u32), (115_200, 1), (100, 1), (70_000, 2)];
+            if !software {
+                cases.extend([(1 << 20, 1), ((1 << 20) + 1, 1)]);
+            }
+            let widest = widest(amd(&gpu.device));
+            for (asked, ys) in cases {
+                let y = ys;
+                let runs = if rows(asked, y).is_some() || asked <= widest { asked } else { 65_535 };
+                for batched in [false, true] {
+                    let (src, src_ptr, src_gpu) = gpu.shared_buffer(1024);
+                    let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+                    let (_table, table_ptr, table_gpu) = gpu.shared_buffer(batch::TABLE);
+                    let size = 16 + (4 << 20) + 16;
+                    let seen = gpu.default_uav(size);
+                    let (back, back_ptr, _) = gpu.shared_buffer(size);
+                    let dst = gpu.default_uav(64 << 10);
+                    // SAFETY: mapped buffers, which nothing reads yet; an open
+                    // list and live buffers.
+                    unsafe {
+                        std::ptr::write_bytes(budget_ptr, 0, 256);
+                        for (w, word) in [asked, y, 1].into_iter().enumerate() {
+                            src_ptr.cast::<u32>().add(w).write_volatile(word);
+                        }
+                        if batched {
+                            batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                            assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, ROWS), Some(0));
+                        } else {
+                            let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
+                            assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, budget_gpu, (&src, 0), None, (ROWS, 12, 1), false));
+                        }
+                        gpu.list.SetComputeRootSignature(&worker.root);
+                        gpu.list.SetPipelineState(&worker.pso);
+                        gpu.list.SetComputeRoot32BitConstants(0, 3, [7u32, 0, 0].as_ptr().cast(), 0);
+                        gpu.list.SetComputeRootUnorderedAccessView(1, seen.GetGPUVirtualAddress());
+                        gpu.list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+                        gpu.list.ResourceBarrier(&[uav_barrier()]);
+                        gpu.list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        gpu.list.CopyBufferRegion(&back, 0, &seen, 0, size);
+                    }
+                    gpu.submit_and_wait();
+                    // SAFETY: the list has run; mapped words.
+                    let word = |i: usize| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() };
+                    let what = format!("asked for {asked} by {y}, batched {batched}, software {software}");
+                    assert_eq!([word(0), word(1), word(2)], [runs * ys, runs - 1, ys - 1], "{what}");
+                    let each = (1..=ys).sum::<u32>();
+                    let wrong = (0..runs as usize).find(|&g| word(4 + g) != each);
+                    assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, {what}");
+                    // SAFETY: mapped words the list's clamp wrote.
+                    let noted = unsafe { [5, 6].map(|k| budget_ptr.cast::<u32>().add(k).read_volatile()) };
+                    let wide = rows(asked, y).is_some();
+                    assert_eq!(noted, if wide { [1, asked] } else { [0, 0] }, "noted in rows, {what}");
+                }
+            }
+        }
+    }
+
+    /// A program's dispatch record of more groups along X than run, clamped
+    /// as a dispatch, is noted by the program's tag (one by one and in a
+    /// batch), and the program runs in rows from then on ([`wide_tag`],
+    /// [`noted_wide`]); one that fits, or two along Y, or without a tag, is
+    /// not noted.
+    #[test]
+    fn wide_records_of_tagged_programs_are_noted() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        for (asked, y, tag, noted) in [(67_440u32, 1u32, 5u32, true), (65_535, 1, 5, false), (70_000, 2, 5, false), (67_440, 1, 0, false)] {
+            for batched in [false, true] {
+                let (src, src_ptr, src_gpu) = warp.shared_buffer(1024);
+                let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+                let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+                let dst = warp.default_uav(64 << 10);
+                // SAFETY: mapped buffers, which nothing reads yet; an open list.
+                unsafe {
+                    std::ptr::write_bytes(budget_ptr, 0, 256);
+                    for (w, word) in [asked, y, 1].into_iter().enumerate() {
+                        src_ptr.cast::<u32>().add(w).write_volatile(word);
+                    }
+                    if batched {
+                        batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                        let mut table = batch::Table::new(table_ptr, 0, [1, 0, 0, 0]);
+                        assert_eq!(table.place_tagged(1, 0, 2, tag), Some(0));
+                    } else {
+                        let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
+                        assert!(record_clamp_tagged(&warp.clamp, &warp.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), (false, tag)));
+                    }
+                }
+                warp.submit_and_wait();
+                // SAFETY: the list has run; mapped words.
+                let words: Vec<u32> = (0..16).map(|k| unsafe { budget_ptr.cast::<u32>().add(k).read_volatile() }).collect();
+                let want = if noted { [1, tag] } else { [0, 0] };
+                assert_eq!([words[7], words[8]], want, "{asked} by {y}, tag {tag}, batched {batched}: {words:?}");
+            }
+        }
+        // The program noted runs in rows; another, tagged, does not.
+        let (first, second) = (0x5000_0010usize, 0x5000_0020usize);
+        let Err(tag) = wide_tag(first) else { panic!("a new program runs as a dispatch") };
+        let Err(other) = wide_tag(second) else { panic!("a new program runs as a dispatch") };
+        assert!(tag != 0 && other != 0 && tag != other);
+        assert_eq!(wide_tag(first), Err(tag), "the same tag again");
+        assert!(noted_wide(tag) >= 1);
+        assert_eq!(wide_tag(first), Ok(()));
+        assert_eq!(wide_tag(second), Err(other));
+        noted_wide(0);
+        noted_wide(u32::MAX);
+        assert_eq!(wide_tag(second), Err(other), "no tag notes no program");
+    }
+
     /// What a batch's table says of records added to it: one job per
     /// record, charged for every execution that reads it, and none for what
     /// the pass cannot read.
@@ -3320,6 +3731,89 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             }
             let what = if run == 0 { "each clamped on its own".to_owned() } else { format!("a batch every {run}") };
             println!("{EXECUTIONS} indirect dispatches, {what}: {best:.2} ms");
+        }
+    }
+
+    /// What reading a dispatch's two words of rows from its record costs
+    /// on the card (ignored: a measurement): a frame's worth of one-record
+    /// indirect dispatches of a few groups, with the dispatch signature and
+    /// with [`rows_command_signature`]'s, run back to back and with a wait
+    /// between every two.
+    #[test]
+    #[ignore]
+    fn rows_signature_costs() {
+        const CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), UAV(u0)"
+cbuffer Rows : register(b0) {
+    uint other;
+    uint row;
+    uint asked;
+};
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint i : SV_GroupIndex) {
+    uint x = group.y * row + group.x;
+    if (row != 0 && x >= asked) {
+        return;
+    }
+    if (i == 0) {
+        uint was;
+        seen.InterlockedAdd((x & 63) * 4, 1, was);
+    }
+}
+"#;
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        const EXECUTIONS: u32 = 2400;
+        let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
+        let plain = gpu.signature(2, 12);
+        let rows = rows_command_signature(&gpu.device, &worker.root, (0, [1, 2])).expect("the signature of rows");
+        let (args, args_ptr, _) = gpu.shared_buffer(64);
+        // SAFETY: the mapping holds 64 bytes; nothing reads them yet.
+        unsafe {
+            for (w, word) in [4u32, 1, 1, 0, 0, 4, 1, 1].into_iter().enumerate() {
+                args_ptr.cast::<u32>().add(w).write_volatile(word);
+            }
+        }
+        // Read as arguments from the card's memory, as the clamps' records are.
+        let records = gpu.default_uav(64 << 10);
+        // SAFETY: an open list; live buffers.
+        unsafe {
+            gpu.list.CopyBufferRegion(&records, 0, &args, 0, 64);
+            gpu.list.ResourceBarrier(&[transition(&records, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]);
+        }
+        gpu.submit_and_wait();
+        let seen = gpu.default_uav(256);
+        // SAFETY: a live buffer.
+        let seen_gpu = unsafe { seen.GetGPUVirtualAddress() };
+        for waits in [false, true] {
+            for (name, sig, at) in [("dispatch", &plain, 0u64), ("rows", &rows, 12)] {
+                let mut best = f64::MAX;
+                for _ in 0..6 {
+                    // SAFETY: an open list; live buffers and signatures.
+                    unsafe {
+                        // (A buffer is common again after each list.)
+                        gpu.list.ResourceBarrier(&[transition(&records, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]);
+                        gpu.list.SetComputeRootSignature(&worker.root);
+                        gpu.list.SetPipelineState(&worker.pso);
+                        gpu.list.SetComputeRootUnorderedAccessView(1, seen_gpu);
+                        for _ in 0..EXECUTIONS {
+                            gpu.list.SetComputeRoot32BitConstants(0, 3, [7u32, 0, 0].as_ptr().cast(), 0);
+                            gpu.list.ExecuteIndirect(sig, 1, &records, at, None, 0);
+                            if waits {
+                                gpu.list.ResourceBarrier(&[uav_barrier()]);
+                            }
+                        }
+                    }
+                    let t = std::time::Instant::now();
+                    gpu.submit_and_wait();
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                }
+                let between = if waits { "a wait between every two" } else { "back to back" };
+                println!("{EXECUTIONS} indirect dispatches of 4 groups, {name} signature, {between}: {best:.2} ms");
+            }
         }
     }
 }

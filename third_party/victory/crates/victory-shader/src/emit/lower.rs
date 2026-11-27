@@ -69,6 +69,10 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// The group barriers the translation added where the host waves of a console wave meet
+    /// (exchanges between halves, LDS kept in order between them, the entry's numbering of
+    /// waves): not the program's own `s_barrier`s, nor fences that wait for no one.
+    pub meetings: u32,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -363,6 +367,8 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// The group barriers added where host waves meet so far ([`Lowered::meetings`]).
+    meetings: u32,
     /// LDS shared by the lanes of a console wave that the host runs whole: a shared-memory
     /// fence before each LDS write and before the first LDS read after one
     /// ([`Self::lds_fence`]).
@@ -407,6 +413,9 @@ struct Lower<'a> {
     one_cu: Option<u32>,
     /// With `one_cu`: the zero read from it (made in the entry block).
     one_cu_zero: Option<V>,
+    /// A compute program's group number along X and Y as the console numbers it, whatever
+    /// rows the host laid its groups out in ([`Self::group_rows`]), made in the entry block.
+    rows: Option<(V, V)>,
     /// A partial final group (`USER_DISPATCH_THREADS_X`) whose console waves are two host
     /// waves: the threads past the count stay for the exchange's group barriers, so they
     /// cannot leave at entry; this says which threads the console launched, and memory,
@@ -492,11 +501,13 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// bit) as a number.
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+/// the branch that do not post-dominate it). With `meets` (where the host waves of a console
+/// wave meet at group barriers), also in every round of a loop: not the block of a lane branch
+/// that closes a loop ([`lane_regions`]). None with an indirect exit (not followed).
+fn all_lane_blocks(st: &Structured, meets: bool) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
+    for (_, region) in lane_regions(st, meets)? {
         for b in (0..n).filter(|&b| region[b]) {
             all[b] = false;
         }
@@ -505,9 +516,16 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 }
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
+/// not post-dominate it, which only some lanes run. With `meets`, also the branch's own block
+/// when a way from it leads back there (the branch closes a loop): the lanes leave such a loop
+/// one by one, each when its own condition says, so not every lane runs that block in every
+/// round. A block post-dominates itself, so without it a loop of one block (a waterfall loop)
+/// counts as a block every lane runs, and two host waves of a console wave that exchange there
+/// meet at the group barriers of different rounds: each thread leaves the host loop on its own
+/// lane's condition, and the thread whose lane is done goes on to the barriers after the loop
+/// while the other half's are still at the loop's. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+fn lane_regions(st: &Structured, meets: bool) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -551,11 +569,12 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
-        // blocks reachable from the lane branch that do not post-dominate it
+        // blocks reachable from the lane branch that do not post-dominate it, and its own
+        // block when it is reached again
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+            if seen[b] || !(meets && b == d) && pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
             seen[b] = true;
@@ -572,7 +591,7 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 /// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
 pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
     let mut out = Vec::new();
-    for (d, region) in lane_regions(st)? {
+    for (d, region) in lane_regions(st, true)? {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
@@ -622,7 +641,7 @@ fn lane_uniform(
 ) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let order = crate::ir::reverse_postorder(&p.blocks);
-    let regions = lane_regions(st);
+    let regions = lane_regions(st, true);
     let mut same: HashSet<Value> = HashSet::new();
     loop {
         // An atom of a lane condition that every lane of a console wave holds alike.
@@ -1604,6 +1623,17 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// The DXIL operation of a compute group's number (`groupId`).
+const GROUP_ID: u32 = 94;
+
+/// `VICTORY_GROUP_ROWS=0`: no compute program asks for the words of a dispatch laid out in
+/// rows (`shader.rs` `USER_GROUP_ROWS`), so the host runs at most 65,535 groups along X, as
+/// before.
+fn group_rows_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_ROWS").is_none_or(|v| v != "0"))
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -2043,7 +2073,7 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    if let Some(all) = all_lane_blocks(x.st, true) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -2108,7 +2138,7 @@ impl<'a> Lower<'a> {
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
-                        match all_lane_blocks(x.st) {
+                        match all_lane_blocks(x.st, true) {
                             None => why.push("an indirect exit"),
                             Some(all) if lds_meetings(p, x.st, &all).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
@@ -2187,7 +2217,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .enumerate()
                 .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
-            let all = all_lane_blocks(x.st);
+            let all = all_lane_blocks(x.st, false);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
                 .filter(|&b| {
@@ -2334,6 +2364,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            meetings: 0,
             lds_order,
             lds_written: true,
             lds_meet,
@@ -2359,6 +2390,7 @@ impl<'a> Lower<'a> {
             wave_base: None,
             one_cu,
             one_cu_zero: None,
+            rows: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -2922,7 +2954,7 @@ impl<'a> Lower<'a> {
         let every = if halves {
             self.all_lanes(self.cur_ir)
         } else {
-            all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
+            all_lane_blocks(self.x.st, false).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
         if !every && halves {
             need(self.cur_ir);
@@ -2988,13 +3020,17 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        // First of all: the count of threads below takes the group number as the console's.
+        if self.reads_group(counted) {
+            self.group_rows();
+        }
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
             let original = self.s.entry;
             let width = self.console_group().expect("compute thread count")[0];
             let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
-            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            let Val::I32(group) = self.compute_id("groupId.i32", GROUP_ID, 0) else {
                 unreachable!()
             };
             // (the paired form: each lane of the thread its own)
@@ -3140,6 +3176,7 @@ impl<'a> Lower<'a> {
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
+            meetings: self.meetings,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -3275,10 +3312,10 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.compute_id("groupId.i32", GROUP_ID, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
-                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                let Val::I32(g) = self.compute_id("groupId.i32", GROUP_ID, 0) else {
                     unreachable!()
                 };
                 let n = self.s.m.i32(self.x.mesh_stride);
@@ -3340,16 +3377,62 @@ impl<'a> Lower<'a> {
         self.load_input(id, col)
     }
 
-    /// A component of a compute thread or group id, read in the entry block.
+    /// A component of a compute thread or group id, read in the entry block (`opcode`
+    /// [`GROUP_ID`]: the group's).
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, k) = (self.s.entry, self.s.m.i32(u32::from(c)));
-        let id = self
-            .s
-            .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[k]);
+        let id = match self.rows {
+            // The group's number as the console's, whatever rows the host laid them out in.
+            Some((x, y)) if opcode == GROUP_ID && c < 2 => [x, y][usize::from(c)],
+            _ => self.s.op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[k]),
+        };
         if c == 0 && let Some(zero) = self.one_cu_zero() {
             return Val::I32(self.s.m.bin(entry, Bin::Add, id, zero));
         }
         Val::I32(id)
+    }
+
+    /// Whether this is a compute program that reads its group's number (`counted`: the count
+    /// of threads reads it), whose groups the host may lay out in rows ([`Self::group_rows`]).
+    fn reads_group(&self, counted: bool) -> bool {
+        matches!(self.x.native.io, StageIo::Cs(_))
+            && self.s.mesh.is_none()
+            && group_rows_on()
+            && (counted || self.x.io.inputs.iter().any(|&(_, i)| matches!(i, Input::GroupId(_))))
+    }
+
+    /// The group number of a dispatch whose groups along X the host laid out in rows
+    /// (`shader.rs` `USER_GROUP_ROWS`): a D3D12 host runs at most 65,535 groups along a
+    /// dimension (more is cut there, or refused), where the console runs what it is asked;
+    /// the title's tile lists are dispatches of one group per tile, more than 65,535 of them
+    /// at 2560x1440. With words `row` (the groups of a row) and `asked` (the groups along X
+    /// asked for) the group in row `y` at `x` is the console's `y * row + x` along X and 0
+    /// along Y, and those past `asked` (the last row's end) leave at once: the whole group,
+    /// before anything, so no barrier waits for them. Without (`row` 0) the numbers are the
+    /// host's. Made in the entry block, which ends with that test; [`Self::compute_id`]
+    /// gives the numbers.
+    fn group_rows(&mut self) {
+        let original = self.s.entry;
+        let row = self.host_word(RootType::Other(super::shader::USER_GROUP_ROWS), 0, 0);
+        let asked = self.host_word(RootType::Other(super::shader::USER_GROUP_ROWS + 1), 0, 0);
+        let [x, y] = [0, 1].map(|c| {
+            let k = self.s.m.i32(c);
+            self.s.op(original, "groupId.i32", Attr::ReadNone, self.s.t.i32, GROUP_ID, &[k])
+        });
+        let m = &mut self.s.m;
+        let zero = m.i32(0);
+        // (`row` 0: `x` itself)
+        let before = m.bin(original, Bin::Mul, y, row);
+        let x = m.bin(original, Bin::Add, before, x);
+        let plain = m.cmp(original, pred::EQ, row, zero);
+        let y = m.select(original, plain, y, zero);
+        let inside = m.cmp(original, pred::IULT, x, asked);
+        let runs = m.bin(original, Bin::Or, plain, inside);
+        let (body, done) = (m.new_block(), m.new_block());
+        m.terminate(original, Term::CondBr(runs, body, done));
+        m.terminate(done, Term::Ret);
+        self.s.entry = body;
+        self.rows = Some((x, y));
     }
 
     /// The console runs a thread group on one CU, whose waves share its vector L0 cache: a
@@ -5092,6 +5175,7 @@ impl<'a> Lower<'a> {
     fn group_sync(&mut self, block: usize) {
         #[cfg(test)]
         GROUP_SYNCS.set(GROUP_SYNCS.get() + 1);
+        self.meetings += 1;
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -6423,6 +6507,7 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
+            self.meetings += 1;
             let mode = self.s.m.i32(meeting_mode());
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -6528,6 +6613,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        self.meetings += 1;
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -9967,7 +10053,7 @@ impl<'a> Lower<'a> {
                 self.cross_lane(false)?;
                 let fetch_inactive = v.opsel & 1 != 0;
                 if fetch_inactive
-                    && !all_lane_blocks(self.x.st).is_some_and(|all| all[self.cur_ir])
+                    && !all_lane_blocks(self.x.st, false).is_some_and(|all| all[self.cur_ir])
                 {
                     // DXIL cannot read the last VGPR value of a host invocation
                     // that has left through a lane branch. A guard keeps it here.

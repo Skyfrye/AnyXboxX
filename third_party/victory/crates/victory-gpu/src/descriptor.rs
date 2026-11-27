@@ -170,6 +170,42 @@ fn sync_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0"))
 }
 
+/// Whether a placed texture's record the title copied into a slot that no
+/// draw's table held within the last frames (`host::TABLED_FRAMES`) is made
+/// at once (`VICTORY_COPIED_AT_ONCE=1`; off: it waits `host::COPIED_GRACE`
+/// frames for a draw, as the records of tables do). Such a slot is one
+/// shaders pick by index: its host slot went on showing what it showed
+/// before, the slot's earlier texture or the stand-in, for those frames,
+/// and the texture pass took it only then.
+#[cfg(windows)]
+pub(crate) fn copied_at_once() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_COPIED_AT_ONCE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPIED_AT_ONCE").is_some_and(|v| v != "0"))
+}
+
+/// Whether a record left to a draw's table that no draw made or read in the
+/// frames after it was written is made then (`VICTORY_TABLED_ORPHANS=1`;
+/// off: counted only). Nothing else looks at such a record again.
+#[cfg(windows)]
+pub(crate) fn tabled_orphans() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TABLED_ORPHANS") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_ORPHANS").is_some_and(|v| v != "0"))
+}
+
+/// Since the last frame line, of [`sync_heaps`]: placed textures made at
+/// once ([`copied_at_once`]); records left to tables that no draw made, and
+/// of them made ([`tabled_orphans`]); records left to tables.
+#[cfg(windows)]
+static COPIED_EXTRA: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Whether a submission's [`sync_heaps`] is done by a thread of its own
 /// beside the rest of the preparing (`VICTORY_HEAP_SYNC_ASIDE=0`: in front of
 /// it, as before).
@@ -384,6 +420,7 @@ pub(crate) fn sync_heaps() {
     let mut job_ns = [0u64; 3];
     let mut short = 0u64;
     let mut wait: Vec<u32> = Vec::new();
+    let mut left: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
@@ -400,16 +437,17 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
+        let at_once = copied_at_once();
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
         let (pages_a_job, records_a_job) = sync_jobs();
         let phase = crate::timeline::span("the heaps' records: those that waited");
         crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
-            for &index in before.chunks(records_a_job).nth(n).unwrap_or_default() {
+            for &(index, found) in before.chunks(records_a_job).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
-                    host.mirror(index, start + u64::from(index) * step, false);
+                    host.mirror_found(index, start + u64::from(index) * step, found, at_once);
                 }
             }
         });
@@ -418,6 +456,21 @@ pub(crate) fn sync_heaps() {
         tabled += of_tables;
         mirrored += before.len() as u64 - of_tables;
         kinds[4] += before.len() as u64 - of_tables;
+        // The records left to a draw's table some frames ago that no draw
+        // made since (`VICTORY_TABLED_ORPHANS=1` makes them).
+        let orphans = host.copied_orphans(frame);
+        COPIED_EXTRA[1].fetch_add(orphans.len() as u64, Relaxed);
+        if tabled_orphans() && !orphans.is_empty() {
+            let phase = crate::timeline::span("the heaps' records: those left to tables no draw made");
+            crate::land::each_view(true, orphans.len().div_ceil(records_a_job), &|n| {
+                for &(index, found) in orphans.chunks(records_a_job).nth(n).unwrap_or_default() {
+                    host.mirror_found(index, start + u64::from(index) * step, found, true);
+                }
+            });
+            phase.end();
+            COPIED_EXTRA[2].fetch_add(orphans.len() as u64, Relaxed);
+            mirrored += orphans.len() as u64;
+        }
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         // Ranges of the heap to look at, and whether a range is one the
@@ -551,15 +604,24 @@ pub(crate) fn sync_heaps() {
                         // reads of it (`draw.rs` `tables`).
                         if host.copied_tabled(index, frame) {
                             out.tabled += 1;
+                            out.left.push(index);
                             continue;
                         }
                         // Buffer views and placed textures get no host
                         // slot from this anyway, they wait for a draw
                         // or a pass: noted some frames on, unless a
-                        // draw's table turns out to hold them.
-                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
-                            out.wait.push(index);
-                            continue;
+                        // draw's table turns out to hold them. A placed
+                        // texture in a slot no table held lately is one a
+                        // shader picks by index: made now
+                        // (`VICTORY_COPIED_AT_ONCE=1`).
+                        let kind = word(2) >> KIND_SHIFT;
+                        if matches!(kind, CONSTANT | PLACED) && host.copied_waits() {
+                            if kind == PLACED && at_once && !host.tabled_within(index, frame) {
+                                out.at_once += 1;
+                            } else {
+                                out.wait.push(index);
+                                continue;
+                            }
                         }
                     }
                     // No view, in a slot that shows none: nothing to make or
@@ -600,7 +662,10 @@ pub(crate) fn sync_heaps() {
             kinds[0] += part.nothing;
             later += part.wait.len() as u64;
             mirrored += part.make.len() as u64;
+            COPIED_EXTRA[0].fetch_add(part.at_once, Relaxed);
+            COPIED_EXTRA[3].fetch_add(part.left.len() as u64, Relaxed);
             wait.append(&mut part.wait);
+            left.append(&mut part.left);
             make.append(&mut part.make);
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
@@ -622,6 +687,7 @@ pub(crate) fn sync_heaps() {
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
         }
+        host.copied_left(frame, std::mem::take(&mut left));
     }
     drop(heaps);
     let micros = started.elapsed().as_micros() as u64;
@@ -717,6 +783,10 @@ struct SyncPart {
     nothing: u64,
     make: Vec<u32>,
     wait: Vec<u32>,
+    /// Left to a draw's table ([`HostHeap::copied_left`]).
+    left: Vec<u32>,
+    /// Placed textures made at once ([`copied_at_once`]).
+    at_once: u64,
     kinds: [u64; 5],
     /// Nanoseconds reading, comparing, sorting out ([`SYNC_JOBS_NS`]).
     ns: [u64; 3],
@@ -806,6 +876,14 @@ pub(crate) fn sync_line(frames: f64) {
         split[2] / 1e6 / frames,
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames
+    );
+    let [at_once, orphans, made, left] =
+        [0, 1, 2, 3].map(|i| COPIED_EXTRA[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "of those records per frame: {left:.0} left to draws' tables, {orphans:.1} of them no draw made in the {} frames          after (made: {made:.1}, VICTORY_TABLED_ORPHANS={}); {at_once:.1} placed textures in slots no table held lately          made at once (VICTORY_COPIED_AT_ONCE={})",
+        host::COPIED_FRAMES,
+        u8::from(tabled_orphans()),
+        u8::from(copied_at_once())
     );
 }
 

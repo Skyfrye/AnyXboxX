@@ -224,6 +224,11 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
+    // The sampling profiler (`VICTORY_PROFILE`, off unless given) in every
+    // build: the submitting thread's time is spent differently in a
+    // diagnostics build.
+    #[cfg(not(feature = "diagnostics"))]
+    victory_loader::profile_on_schedule(|| 0);
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),

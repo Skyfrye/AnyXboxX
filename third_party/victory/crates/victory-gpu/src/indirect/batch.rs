@@ -37,7 +37,8 @@ ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
 // The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
 // (4-7), words (8-11) and the executions that read it (16-31); the
-// record's offset in the source; its place in the scratch buffer; nothing.
+// record's offset in the source; its place in the scratch buffer; the tag
+// of the program that reads it (`super::wide_tag`; 0: none).
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
@@ -64,6 +65,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint kind = 0;
     uint words = 0;
+    bool wide = false;
+    bool noted = false;
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
@@ -83,9 +86,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
             cost = record[0] * record[1];
-        } else if (kind == 2) {
+        } else if (kind == 2 || kind == ROWS) {
             uint3 g = uint3(record[0], record[1], record[2]);
-            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+            // In rows, or up to WIDEST in x as asked (`super::ROWS`), and
+            // noted if it would run in rows (`super::wide_tag`).
+            bool rows_would = g.x > 65535u && g.x <= GROUPS && g.y == 1u;
+            wide = kind == ROWS && rows_would;
+            noted = kind == 2 && rows_would && g.x > WIDEST && job.w != 0;
+            if (!wide) {
+                g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+            }
             if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
                 g = uint3(0, 0, 0);
             }
@@ -108,7 +118,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && kind == 10) {
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
@@ -166,12 +176,28 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (!active) {
         return;
     }
+    if (noted) {
+        note_wide(budget, job.w);
+    }
     if (fits[gi] == 0) {
         record[0] = 0;
         record[1] = 0;
         if (kind > 1) {
             record[2] = 0;
         }
+    }
+    if (kind == ROWS) {
+        // The program's two words, then the dispatch (`super::ROWS`).
+        uint4 r = rows_of(uint3(record[0], record[1], record[2]), wide);
+        if (r.w > 0) {
+            // Diagnostics: the records laid out in rows, the most groups.
+            uint was;
+            budget.InterlockedAdd(20, 1u, was);
+            budget.InterlockedMax(24, r.w, was);
+        }
+        dst_args.Store2(job.z, r.zw);
+        dst_args.Store3(job.z + 8, uint3(r.xy, record[2]));
+        return;
     }
     for (uint s = 0; s < words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
@@ -223,7 +249,16 @@ impl Table {
     /// of the host copy `id`, once the pass has run: a job of it is added if
     /// there is none. `None` if the pass cannot read that copy or has no
     /// room for another job.
+    #[cfg(test)]
     pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+        self.place_tagged(id, offset, kind, 0)
+    }
+
+    /// The place in the scratch buffer of the record of `kind` at `offset`
+    /// of the host copy `id`, as `place` says, for a program with the tag
+    /// `tag` (`super::wide_tag`; 0: none), which a new job takes: the pass
+    /// notes it if the record asks for more groups along X than run.
+    pub(crate) fn place_tagged(&mut self, id: u64, offset: u64, kind: u32, tag: u32) -> Option<u64> {
         let source = self.sources.iter().position(|&s| s == id)? as u32;
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
@@ -250,7 +285,7 @@ impl Table {
             to.write_volatile(job(source, kind, 1));
             to.add(1).write_volatile(offset);
             to.add(2).write_volatile(self.base + i * SLOT);
-            to.add(3).write_volatile(0);
+            to.add(3).write_volatile(tag);
             table.write_volatile(i + 1);
         }
         Some(place(i))

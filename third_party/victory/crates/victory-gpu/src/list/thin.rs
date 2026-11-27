@@ -171,11 +171,17 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-/// Since the last line of the log: streams handed over; calls translated and
-/// the microseconds that took (all threads), recordings translated, and
-/// recordings let go of in the middle.
+/// Since the last line of the log: streams handed over. And, growing (the
+/// line takes what they grew by; the book of frames reads them too): calls
+/// translated and the microseconds that took (all threads), recordings
+/// translated, and recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The microseconds all threads have translated so far (`crate::framebook`).
+pub(crate) fn translated_us() -> u64 {
+    STATS[1].load(Relaxed)
+}
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -190,6 +196,9 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// When the title submitted it (microseconds of [`crate::framebook`]'s
+    /// clock; 0: not yet), for the book of frames.
+    submitted_at: AtomicU64,
 }
 
 #[derive(Default)]
@@ -213,6 +222,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            submitted_at: AtomicU64::new(0),
         }
     }
 
@@ -261,6 +271,11 @@ impl Recording {
                 drop(inner);
                 give_back(kept);
                 STATS[2].fetch_add(1, Relaxed);
+                // How long after its submission it was translated to its end.
+                let at = self.submitted_at.load(Relaxed);
+                if at != 0 {
+                    crate::framebook::translated_after(crate::framebook::now_us().saturating_sub(at));
+                }
                 crate::queue::line_moved();
             }
         }
@@ -345,6 +360,11 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
         .filter_map(|&l| {
             // SAFETY: the title passes its lists, which nobody records into now.
             let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
+            if let Some(recording) = &front.recording
+                && crate::framebook::on()
+            {
+                recording.submitted_at.store(crate::framebook::now_us().max(1), Relaxed);
+            }
             front.close();
             front.submitted = true;
             front.recording.clone()
@@ -357,7 +377,8 @@ pub(crate) fn line(frames: f64) {
     if !wanted() || !on() {
         return;
     }
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    static LAST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    let s: Vec<f64> = crate::framebook::grown(&STATS, &LAST).iter().map(|&n| n as f64 / frames).collect();
     tracing::info!(
         "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
         s[0],
@@ -365,6 +386,61 @@ pub(crate) fn line(frames: f64) {
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
+    );
+    // What the translating took to bind views: the views of lists asked for
+    // and made (`crate::descriptor::host::HostHeap::make_listed`; the rest
+    // were copied from the thread's own), the views made ready to be read
+    // (`crate::draw`'s `readable`), and the waits for dynamic descriptor
+    // slots (`crate::host::slots_or_wait`).
+    static LAST_VIEWS: Mutex<[u64; 6]> = Mutex::new([0; 6]);
+    let [asked, made] = crate::descriptor::host::listed_counts();
+    let [read, buffers] = crate::draw::readable_counts();
+    let [waits, waited] = crate::host::slot_waits();
+    let g: Vec<f64> = {
+        let now = [asked, made, read, buffers, waits, waited];
+        let mut last = held(&LAST_VIEWS);
+        let g = now.iter().zip(last.iter()).map(|(n, l)| n.saturating_sub(*l) as f64 / frames).collect();
+        *last = now;
+        g
+    };
+    if times_on() {
+        static LAST_TIMES: Mutex<[u64; TIMED]> = Mutex::new([0; TIMED]);
+        let now: [u64; TIMED] = std::array::from_fn(|i| TIMES[i].load(Relaxed));
+        let d: Vec<f64> = {
+            let mut last = held(&LAST_TIMES);
+            let d = now.iter().zip(last.iter()).map(|(n, l)| n.saturating_sub(*l) as f64 / frames).collect();
+            *last = now;
+            d
+        };
+        let by_kind: Vec<String> = KINDS
+            .iter()
+            .enumerate()
+            .map(|(k, name)| {
+                format!("{name} {:.0} in {:.1} ms ({:.2} us each)", d[2 * k + 1], d[2 * k] / 1e6, d[2 * k] / 1e3 / d[2 * k + 1].max(1.0))
+            })
+            .collect();
+        let by_part: Vec<String> = PARTS
+            .iter()
+            .enumerate()
+            .map(|(p, name)| {
+                let at = 2 * KINDS.len() + 2 * p;
+                format!("{name} {:.0} in {:.1} ms", d[at + 1], d[at] / 1e6)
+            })
+            .collect();
+        tracing::info!(
+            "translating per frame by kind of call (VICTORY_THIN_TIMES): {}; in binds: {}",
+            by_kind.join(", "),
+            by_part.join(", ")
+        );
+    }
+    tracing::info!(
+        "views of lists per frame: {:.0} asked, {:.0} made; made ready to be read {:.0}, {:.0} of them of buffers; waits for dynamic slots (VICTORY_SLOT_WAIT) {:.2}, {:.1} ms",
+        g[0],
+        g[1],
+        g[2],
+        g[3],
+        g[4],
+        g[5] / 1000.0
     );
 }
 
@@ -716,13 +792,121 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Whether the translating threads time their calls by kind, and the parts
+/// of `crate::draw::State::bind` they spend most in, for the line
+/// (`VICTORY_THIN_TIMES=1`, off). A sampling profile suspends the threads it
+/// samples, and one suspended inside a lock that all the others take makes
+/// that lock look far busier than it is (the process heap's lock was 54 % of
+/// the translating in profile tp1, and a heap of our own changed nothing of
+/// the translating's time without the profile, runs cb and c1).
+pub(crate) fn times_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_THIN_TIMES"))
+}
+
+/// The kinds of calls [`times_on`] counts apart.
+const KINDS: [&str; 9] = [
+    "draws",
+    "dispatches",
+    "mesh dispatches",
+    "indirect executions",
+    "bindings",
+    "barriers",
+    "copies and clears",
+    "begin, end, uploads",
+    "other",
+];
+/// Parts of a bind ([`timed_part`]): the heap pass, views of tables, views
+/// made ready.
+const PARTS: [&str; 3] = ["the heap pass", "views of tables (make_listed)", "views made ready (readable)"];
+const TIMED: usize = 2 * KINDS.len() + 2 * PARTS.len();
+/// Of all threads: nanoseconds and calls by kind, then by part.
+static TIMES: [AtomicU64; TIMED] = [const { AtomicU64::new(0) }; TIMED];
+
+/// The kind of call `op` is ([`KINDS`]).
+fn kind_of(op: u64) -> usize {
+    let is = |p: Plain| op == p as u64;
+    if is(Plain::DRAW) || is(Plain::DRAW_INDEXED) {
+        0
+    } else if is(Plain::DISPATCH) || is(Plain::DISPATCH_X) {
+        1
+    } else if is(Plain::DISPATCH_MESH) || is(Plain::DISPATCH_MESH_X) {
+        2
+    } else if is(Plain::EXECUTE_INDIRECT) {
+        3
+    } else if op == BARRIER || op == BARRIER_GROUPS {
+        5
+    } else if op == COPY_TEXTURE
+        || op == CLEAR_RTV
+        || op == CLEAR_DSV
+        || is(Plain::COPY_BUFFER)
+        || is(Plain::COPY_RESOURCE)
+        || is(Plain::COPY_RESOURCE_X)
+        || is(Plain::COPY_MEMORY)
+        || is(Plain::RESOLVE)
+        || is(Plain::RESOLVE_QUERIES)
+    {
+        6
+    } else if op == RESET || op == CLOSE || op == UPLOAD || op == EXTERNAL {
+        7
+    } else if op < Plain::END as u64 || (VIEWPORTS..=TARGETS).contains(&op) {
+        4
+    } else {
+        8
+    }
+}
+
+/// Adds `ns` to part `part` of a bind ([`PARTS`]), with [`times_on`].
+pub(crate) fn timed_part(part: usize, ns: u64) {
+    let at = 2 * KINDS.len() + 2 * part;
+    TIMES[at].fetch_add(ns, Relaxed);
+    TIMES[at + 1].fetch_add(1, Relaxed);
+}
+
+/// The calls of a stream timed by kind ([`times_on`]), added to [`TIMES`]
+/// when the stream is done.
+struct Timed {
+    ns: [u64; KINDS.len()],
+    n: [u64; KINDS.len()],
+    /// When the call being made began, and its kind.
+    last: Option<(std::time::Instant, usize)>,
+}
+
+impl Timed {
+    /// The call being made ends now; `next` (a kind) begins.
+    fn next(&mut self, next: Option<usize>) {
+        let now = std::time::Instant::now();
+        if let Some((began, kind)) = self.last {
+            self.ns[kind] += now.duration_since(began).as_nanos() as u64;
+            self.n[kind] += 1;
+        }
+        self.last = next.map(|kind| (now, kind));
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        self.next(None);
+        for k in 0..KINDS.len() {
+            if self.n[k] > 0 {
+                TIMES[2 * k].fetch_add(self.ns[k], Relaxed);
+                TIMES[2 * k + 1].fetch_add(self.n[k], Relaxed);
+            }
+        }
+    }
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let mut timed = times_on().then(|| Timed { ns: [0; KINDS.len()], n: [0; KINDS.len()], last: None });
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+        if let Some(t) = &mut timed {
+            t.next(Some(kind_of(op)));
+        }
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;

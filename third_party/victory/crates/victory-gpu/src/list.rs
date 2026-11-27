@@ -259,6 +259,12 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// Host lists kept idle now.
+#[cfg(windows)]
+pub(crate) fn idle() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -433,14 +439,17 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // reset, which has nothing to reset in it: left open for it (or
+        // closed, `crate::host::HostList::leave_open`).
+        fresh.leave_open();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
+        // (Submitted again with nothing recorded since it was taken.)
+        host.closed_if_left_open();
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -505,8 +514,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // reset, which has nothing to reset in it: left open for it (or
+        // closed, `crate::host::HostList::leave_open`).
+        fresh.leave_open();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -514,6 +524,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
+            // (Submitted again with nothing recorded since it was taken.)
+            host.closed_if_left_open();
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
@@ -2169,6 +2181,18 @@ impl ValueWait {
             return true;
         }
         self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    /// What is waited for, in words (the book of frames' lines).
+    #[cfg(windows)]
+    pub(crate) fn said(&self) -> String {
+        format!(
+            "{} bits at {:#x} against {:#x} (comparison {})",
+            if self.wide { 64 } else { 32 },
+            self.address,
+            self.reference,
+            self.comparison
+        )
     }
 
     /// Where the value waited for is: address and bytes.

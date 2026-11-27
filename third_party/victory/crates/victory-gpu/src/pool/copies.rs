@@ -189,6 +189,7 @@ fn block(device: &ID3D12Device) -> Option<(ID3D12Heap, u64)> {
         return None;
     }
     crate::host::name(&heap, || "copies of views' own bytes (a block)".into());
+    crate::ram::track(&heap, crate::ram::Heap::Shared, BLOCK);
     let ticket = crate::host::mapping::made(device, &heap, crate::host::mapping::What::CopyBlock);
     COUNTS[2].fetch_add(1, Ordering::Relaxed);
     Some((heap, ticket))

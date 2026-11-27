@@ -13,7 +13,7 @@
 //! its upload followed by the next texture's aliasing).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -44,11 +44,55 @@ pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
     any: AtomicBool,
     held: Mutex<Held>,
+    /// Uses of the list since its allocator was last reset ([`Rec::restart`]),
+    /// and the most of any recording on it: the driver's allocator keeps the
+    /// memory of its longest recording ([`crate::ram`]).
+    calls: AtomicU64,
+    peak: AtomicU64,
+}
+
+/// Of every host list alive, the sum of their [`Rec`] peaks, and the
+/// longest recording since the start: what command memory the allocators
+/// keep, in calls ([`recorded`]).
+static RECORDED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`RECORDED`].
+pub(crate) fn recorded() -> [u64; 2] {
+    [RECORDED[0].load(Relaxed), RECORDED[1].load(Relaxed)]
 }
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
+        Self {
+            list,
+            any: AtomicBool::new(false),
+            held: Mutex::new(Held(Vec::new())),
+            calls: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+        }
+    }
+
+    /// The longest recording on the list's allocator so far, the one going
+    /// on included, in uses of the list.
+    #[cfg(test)]
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak.load(Relaxed).max(self.calls.load(Relaxed))
+    }
+
+    /// The recording is closed: its length counts toward the peak.
+    pub(crate) fn closed(&self) {
+        let calls = self.calls.load(Relaxed);
+        let was = self.peak.fetch_max(calls, Relaxed);
+        if calls > was {
+            RECORDED[0].fetch_add(calls - was, Relaxed);
+            RECORDED[1].fetch_max(calls, Relaxed);
+        }
+    }
+
+    /// The allocator was reset: a new recording begins.
+    pub(crate) fn restart(&self) {
+        self.closed();
+        self.calls.store(0, Relaxed);
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -120,7 +164,14 @@ impl std::ops::Deref for Rec {
         if self.any.load(Relaxed) {
             self.flush();
         }
+        self.calls.fetch_add(1, Relaxed);
         &self.list
+    }
+}
+
+impl Drop for Rec {
+    fn drop(&mut self) {
+        RECORDED[0].fetch_sub(self.peak.load(Relaxed), Relaxed);
     }
 }
 

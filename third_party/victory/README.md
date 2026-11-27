@@ -76,6 +76,9 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+| `VICTORY_RAM_LINE=10` | Every 10 s (the default; `0`: never) a log line splits the process's private memory by owner: the title's own commits, our buffers in the PC's memory by heap and by what holds them, host lists, the process heap, and the rest (the driver's own) |
+| `VICTORY_SHARE_PRELUDE=1` | A host list's prelude records on the list's own command allocator: about 1,100 allocators fewer in the world, 0.9 MB of the driver's memory each (off by default while it is tested) |
+| `VICTORY_RAM_MAP=<s>` | Every that many seconds the address space is walked (0.6-0.9 s, on a thread of its own) and what is committed is logged by kind and by allocation size, with what of it is in memory (off by default) |
 | `VICTORY_DLSS=1` | NVIDIA DLSS upscales in place of the title's FidelityFX, which the title is made to use (RTX cards; untested in game). Needs `VICTORY_DLSS_DLL=<your nvngx_dlss.dll or its folder>` (from a game of yours; never shipped here) and the driver's NGX; without them the title runs as before. `VICTORY_DLSS_MODE=quality` (0.667, default), `balanced`, `performance`, `ultra-performance`, `dlaa` |
 
 What is known to be wrong:

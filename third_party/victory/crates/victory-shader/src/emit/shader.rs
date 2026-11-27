@@ -108,6 +108,17 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host sets at a dispatch
+/// whose groups along X it laid out in rows (one of more than 65,535 groups
+/// along X and one along Y, which a D3D12 host other than AMD's cuts at
+/// 65,535: the title's tile lists): the groups of a row (0: not laid out,
+/// the dispatch is as the title asked); [`USER_GROUP_ROWS`] + 1: the groups
+/// the title asked for along X. The program's group number along X is then
+/// its row times the row's groups plus its place in the row, along Y 0, and
+/// the groups of the last row past the count leave at once. Asked for by
+/// every compute program that reads its group's number
+/// (`VICTORY_GROUP_ROWS=0`: by none).
+pub const USER_GROUP_ROWS: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
