@@ -74,7 +74,7 @@ pub(crate) extern "system" fn set_interval(
     _: This,
     _output: This,
     length: u32,
-    _period: u32,
+    period: u32,
     _flags: u32,
 ) -> HRESULT {
     let asked_by_title = match length {
@@ -82,7 +82,7 @@ pub(crate) extern "system" fn set_interval(
         us => Duration::from_micros(u64::from(us)),
     };
     let interval = asked().unwrap_or(asked_by_title);
-    tracing::info!(?interval, title = ?asked_by_title, "frame interval");
+    tracing::info!(?interval, title = ?asked_by_title, period, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -193,6 +193,8 @@ pub(crate) extern "system" fn wait(
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
+    #[cfg(windows)]
+    crate::framebook::add(crate::framebook::Part::Paced, wait.min(limit).as_micros() as u64);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};
