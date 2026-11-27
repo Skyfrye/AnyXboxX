@@ -2617,6 +2617,19 @@ impl Landed {
 
 static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
 
+/// [`LANDED`] for the pages shaders' writes went into at the address they were
+/// landed at, not at the other addresses of the same pages (`elsewhere`): for
+/// the count of uploads that send landed bytes up again
+/// (`VICTORY_UPLOAD_SPLIT=1`, `crate::shadow::upload_split`).
+static LANDED_HERE: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+
+/// Whether shaders' writes went into a page of `[at, at + len)` at that address
+/// in the last `frames` frames ([`LANDED_HERE`]; noted with `VICTORY_UPLOAD_SPLIT=1` only).
+pub(crate) fn landed_here_lately(at: usize, len: usize, frames: u64) -> bool {
+    let now = crate::frame::current();
+    (at / 4096..=(at + len.max(1) - 1) / 4096).any(|page| LANDED_HERE.since(page, now.saturating_sub(frames), now))
+}
+
 /// A page's number, spread.
 #[derive(Default)]
 struct PageHash(u64);
@@ -2647,6 +2660,9 @@ pub(crate) fn landing(at: usize, len: usize) {
         let frame = crate::frame::current();
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
         (first..=last).for_each(|page| LANDED.note(page, frame));
+        if crate::shadow::upload_split_on() {
+            (first..=last).for_each(|page| LANDED_HERE.note(page, frame));
+        }
         for (block, others) in elsewhere(at, len) {
             let block = block / KERNEL_PAGE;
             let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
@@ -2686,6 +2702,9 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
         let frame = crate::frame::current();
         for &page in pages {
             LANDED.note(page, frame);
+        }
+        if crate::shadow::upload_split_on() {
+            pages.iter().for_each(|&page| LANDED_HERE.note(page, frame));
         }
         for (block, others) in &elsewhere {
             let first = block / KERNEL_PAGE;
