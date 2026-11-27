@@ -526,6 +526,10 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// What draws draw into, for the card's times by pipeline
+    /// (`crate::host::passes`; looked at only in a timed recording).
+    #[cfg(feature = "diagnostics")]
+    pass_target: crate::host::passes::Target,
 }
 
 impl Drop for State {
@@ -1268,6 +1272,10 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        #[cfg(feature = "diagnostics")]
+        if list.pass_timed().is_some() {
+            self.pass_target = pass_target(&views, dsv.as_ref().map(|(texture, _)| *texture));
+        }
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1643,6 +1651,10 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // What is recorded from here on for the draw or dispatch is its
+        // pipeline's, when the card's times are taken by pipeline.
+        #[cfg(feature = "diagnostics")]
+        list.pass_open(p, if compute { Default::default() } else { self.pass_target });
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -4838,6 +4850,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        list.pass_indirect();
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -4857,6 +4871,34 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+/// What draws into `views` (with the depth texture `depth`) draw into, for
+/// the card's times by pipeline (`crate::host::passes`): the first render
+/// target's view format and its texture's size, or the depth texture's
+/// format and size when no render target has a texture.
+#[cfg(feature = "diagnostics")]
+fn pass_target(
+    views: &[(Option<&ID3D12Resource>, Option<D3D12_RENDER_TARGET_VIEW_DESC>)],
+    depth: Option<&ID3D12Resource>,
+) -> crate::host::passes::Target {
+    let target = crate::host::passes::Target {
+        count: views.len().min(usize::from(u8::MAX)) as u8,
+        depth: depth.is_some(),
+        ..Default::default()
+    };
+    let first = views.iter().find_map(|(texture, desc)| texture.map(|t| (t, desc.map_or(0, |d| d.Format.0 as u32))));
+    let Some((texture, format)) = first.or(depth.map(|t| (t, 0))) else {
+        return target;
+    };
+    // SAFETY: a host texture the list binds, alive while it records.
+    let desc = unsafe { texture.GetDesc() };
+    crate::host::passes::Target {
+        format: if format != 0 { format } else { desc.Format.0 as u32 },
+        width: u32::try_from(desc.Width).unwrap_or(u32::MAX),
+        height: desc.Height,
+        ..target
     }
 }
 

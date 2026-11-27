@@ -1372,6 +1372,10 @@ pub(crate) struct HostList {
     /// The card's times of passes of ours recorded into the list
     /// ([`ours`]), resolved when it is closed.
     timed: Mutex<ours::Pairs>,
+    /// The card's times of the title's work in the list, by pipeline, when
+    /// its frame is timed ([`passes`]).
+    #[cfg(feature = "diagnostics")]
+    passes: passes::Lane,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3939,6 +3943,8 @@ pub(crate) mod awake;
 pub(crate) mod mapping;
 mod card_steps;
 pub(crate) mod ours;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod passes;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 mod panel;
@@ -4385,6 +4391,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
                 timed: Mutex::new(ours::Pairs::default()),
+                #[cfg(feature = "diagnostics")]
+                passes: passes::Lane::default(),
             })
         }
     }
@@ -6100,7 +6108,19 @@ impl Host {
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
         }
-        // A list sent again after its pairs went to another (`ours`).
+        // The card's time for all of the submission's lists, if one of them
+        // is timed by pipeline (`passes`).
+        #[cfg(feature = "diagnostics")]
+        if let Some((front, behind)) = passes::around(runs.iter().map(|l| l.passes.recorded())) {
+            lists.insert(0, Some(front));
+            marks.iter_mut().for_each(|m| m.0 += 1);
+            marks.insert(0, (0, crate::copystat::Timed::Other));
+            marks.push((lists.len(), crate::copystat::Timed::Other));
+            lists.push(Some(behind));
+            firsts.iter_mut().for_each(|first| *first += 1);
+        }
+        // A list sent again after its pairs went to another (`ours`,
+        // `passes`).
         for list in runs {
             list.timed_sent();
         }
@@ -6682,6 +6702,9 @@ impl HostList {
     /// The first timestamp of a pair around a pass of ours about to be
     /// recorded ([`ours`]).
     pub(crate) fn timed_begin(&self, kind: ours::Kind) -> Option<ours::Mark> {
+        // Among the title's work timed by pipeline, a span of its own.
+        #[cfg(feature = "diagnostics")]
+        self.passes.ours(&self.list, kind.text());
         if !ours::on() {
             return None;
         }
@@ -6700,6 +6723,43 @@ impl HostList {
         if ours::on() {
             self.timed.lock().unwrap_or_else(|e| e.into_inner()).sent();
         }
+        #[cfg(feature = "diagnostics")]
+        self.passes.sent();
+    }
+
+    /// The title's recording of this list begins while `frame` frames have
+    /// been presented: its work is timed by pipeline if that frame is
+    /// ([`passes`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_arm(&self, frame: u64) {
+        self.passes.arm(frame);
+    }
+
+    /// The frame the recording going on is timed for ([`passes`]), if it is.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_timed(&self) -> Option<u64> {
+        self.passes.armed()
+    }
+
+    /// A draw or dispatch of `p` into `target` is about to be recorded
+    /// ([`passes`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_open(&self, p: &crate::pipeline::host::HostPipeline, target: passes::Target) {
+        self.passes.open(&self.list, p.pso.as_raw() as usize, || passes::Work::of(p), target);
+    }
+
+    /// The draw or dispatch just counted is an indirect execution
+    /// ([`passes`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_indirect(&self) {
+        self.passes.indirect();
+    }
+
+    /// One of the title's copies, clears or resolves is about to be
+    /// recorded ([`passes`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_copies(&self) {
+        self.passes.copies(&self.list);
     }
 
     pub(crate) fn close(&self) {
@@ -6716,6 +6776,8 @@ impl HostList {
         if ours::on() {
             self.timed.lock().unwrap_or_else(|e| e.into_inner()).resolve(&self.list);
         }
+        #[cfg(feature = "diagnostics")]
+        self.passes.close(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6769,6 +6831,8 @@ impl HostList {
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.timed.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.passes.clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -9559,6 +9623,8 @@ impl Meter {
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
             ours::line(frames);
+            #[cfg(feature = "diagnostics")]
+            passes::gather();
             upq::line(frames);
             rec::line(frames);
             #[cfg(feature = "diagnostics")]
@@ -9626,6 +9692,8 @@ impl Meter {
             if !five {
                 return;
             }
+            #[cfg(feature = "diagnostics")]
+            passes::line();
                 tracing::info!(
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
