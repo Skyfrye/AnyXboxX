@@ -1107,8 +1107,8 @@ impl Player {
 
     /// What the heap slots hold that a draw's constants name, as the title's
     /// shaders find them: byte offsets in the view heap among its first
-    /// constants, a descriptor of 32 bytes each.
-    pub fn slots(&self, list: u32, command: usize, say: &mut dyn FnMut(String)) -> Result<()> {
+    /// constants, a descriptor of 32 bytes each; and the slots `extra` names.
+    pub fn slots(&self, list: u32, command: usize, extra: &[u32], say: &mut dyn FnMut(String)) -> Result<()> {
         let mut here = 0;
         for (i, s) in self.frame.submits.iter().enumerate() {
             for &l in s.lists.iter().filter(|&&l| l != MISSING) {
@@ -1153,6 +1153,14 @@ impl Player {
                             } else {
                                 say(format!("  slot {base}+{k}: never written"));
                             }
+                        }
+                    }
+                    for &k in extra {
+                        let s = self.slot_at(heap, k, i);
+                        if s.kind != slot::EMPTY {
+                            say(format!("  heap slot {k}: {}", self.slot_text(&s)));
+                        } else {
+                            say(format!("  heap slot {k}: never written"));
                         }
                     }
                 }

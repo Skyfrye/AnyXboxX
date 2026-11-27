@@ -140,6 +140,10 @@ pub(crate) struct Replay {
     /// `<list>:<command>`.
     #[arg(long)]
     slots: Option<String>,
+    /// With --slots: also the heap slots this file lists (numbers apart by
+    /// white space), as the command saw them.
+    #[arg(long)]
+    slot_file: Option<PathBuf>,
     /// Only write the DXIL of pipelines with this in their name to the
     /// capture's `shaders` folder.
     #[arg(long)]
@@ -304,8 +308,16 @@ pub(crate) fn run(r: Replay) -> Result<()> {
             .split_once(':')
             .and_then(|(l, c)| Some((l.parse().ok()?, c.parse().ok()?)))
             .with_context(|| format!("--slots {text}: not <list>:<command>"))?;
+        let extra: Vec<u32> = match &r.slot_file {
+            Some(path) => std::fs::read_to_string(path)
+                .with_context(|| format!("--slot-file {}", path.display()))?
+                .split_whitespace()
+                .map(|w| w.parse().with_context(|| format!("--slot-file: not a slot: {w}")))
+                .collect::<Result<_>>()?,
+            None => Vec::new(),
+        };
         let player = play::Player::load(&r.folder, &options)?;
-        return player.slots(list, command, &mut |line| println!("{line}"));
+        return player.slots(list, command, &extra, &mut |line| println!("{line}"));
     }
     if let Some(folder) = &r.images {
         let mut which = Vec::new();
