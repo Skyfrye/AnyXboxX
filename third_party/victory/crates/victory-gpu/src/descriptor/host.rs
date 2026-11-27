@@ -6782,6 +6782,9 @@ pub(crate) mod tests {
         };
         let copy = crate::resource::host_copy(texture)?;
         *copy.holds.lock().unwrap() = Some((0, held));
+        // That upload was sent, as the texture pass's are (`crate::pool::fill`:
+        // a copy cut from a block is shown nowhere before one was).
+        copy.fill.sent();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(!crate::pool::fresh(&copy.texture));
         Some((view, texture, copy))
