@@ -564,6 +564,7 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
+    crate::ram::tick();
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
@@ -1355,6 +1356,14 @@ pub(crate) struct HostList {
     /// next reset of its list ([`HostList::leave_open`]): that reset has
     /// nothing to reset.
     left_open: std::sync::atomic::AtomicBool,
+    /// Open for recording (made, or reset, and not closed since): a prelude
+    /// records on the list's allocator only while the list does not
+    /// ([`share_prelude`]).
+    open: std::sync::atomic::AtomicBool,
+    /// The prelude's own allocator, for a prelude made on the list's
+    /// allocator ([`share_prelude`]) that must record while the list is
+    /// open.
+    prelude_allocator: OnceLock<Option<ID3D12CommandAllocator>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1386,6 +1395,38 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a host list's prelude records on the list's own command
+/// allocator, after the list (`VICTORY_SHARE_PRELUDE=1`; off by default).
+/// A prelude is recorded at submission, when its list is closed, and runs
+/// with it: one allocator serves both, as D3D12 allows for lists recorded
+/// one after the other. Each allocator with its list takes 0.9 MB of the
+/// driver's private memory when made, in memory, and keeps its longest
+/// recording; a list made on no allocator takes nothing (`crate::ram`).
+/// 1,073 preludes stood beside 1,491 host lists in run dc2; in run ram1,
+/// with the switch, 1,090 of 1,125 preludes were made on their list's
+/// allocator: about 1 GB of the driver's arenas not taken (the private
+/// bytes at 200 s 28.1 GB against run pic-combo's 30.0, in another scene).
+/// A prelude made before its list is closed (`VICTORY_LAZY_PRELUDE=0`), or
+/// recorded while the list is open, takes an allocator of its own as before.
+fn share_prelude() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SHARE_PRELUDE"))
+}
+
+/// Preludes made on their list's allocator ([`share_prelude`]) since the
+/// start.
+pub(crate) static SHARED_PRELUDES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`rec::recorded`]: what host lists' allocators keep, in calls.
+pub(crate) fn recorded() -> [u64; 2] {
+    rec::recorded()
+}
+
+/// Bytes of upload memory sends keep for the next submissions.
+pub(crate) fn sends_kept() -> u64 {
+    send::kept_bytes()
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4394,6 +4435,26 @@ impl Host {
         }
     }
 
+    /// A closed list for a prelude that records on `allocator`, a host
+    /// list's own ([`share_prelude`]); else [`Host::make_prelude`]'s.
+    fn prelude_on(&self, allocator: &ID3D12CommandAllocator) -> Option<Prelude> {
+        // SAFETY: plain object creation; the list is made closed, on no
+        // allocator.
+        let made: windows::core::Result<ID3D12GraphicsCommandList> = unsafe {
+            self.device.cast::<ID3D12Device4>().and_then(|device| {
+                device.CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE)
+            })
+        };
+        match made {
+            Ok(list) => {
+                LISTS[1].fetch_add(1, Ordering::Relaxed);
+                SHARED_PRELUDES.fetch_add(1, Ordering::Relaxed);
+                Some((allocator.clone(), list))
+            }
+            Err(_) => self.make_prelude(),
+        }
+    }
+
     fn make_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
@@ -4451,6 +4512,8 @@ impl Host {
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 left_open: std::sync::atomic::AtomicBool::new(false),
+                open: std::sync::atomic::AtomicBool::new(true),
+                prelude_allocator: OnceLock::new(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6860,6 +6923,8 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.list.closed();
+        self.open.store(false, Ordering::Release);
     }
 
     /// In place of [`HostList::close`], for a list just taken (made, or reset
@@ -6941,6 +7006,7 @@ impl HostList {
         if self.left_open.swap(false, Ordering::AcqRel) {
             return;
         }
+        self.list.restart();
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -6950,6 +7016,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.open.store(true, Ordering::Release);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -7323,15 +7390,34 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| {
+                host().and_then(|h| if share_prelude() { h.prelude_on(&self.allocator) } else { h.make_prelude() })
+            })
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        // On the list's own allocator (`share_prelude`) the prelude adds to
+        // what the list recorded there, which the list's reset lets go of,
+        // as both have run by then; while the list is open, on an allocator
+        // of the prelude's own.
+        let on_list = allocator.as_raw() == self.allocator.as_raw();
+        let own = if on_list && self.open.load(Ordering::Acquire) {
+            self.prelude_allocator
+                .get_or_init(|| {
+                    // SAFETY: plain object creation.
+                    unsafe { host()?.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok() }
+                })
+                .as_ref()
+        } else {
+            None
+        };
+        let allocator = own.unwrap_or(allocator);
+        let shared = allocator.as_raw() == self.allocator.as_raw();
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
+            (if shared { Ok(()) } else { allocator.Reset() }).and_then(|()| {
                 list.Reset(allocator, None)?;
                 let mut pairs = ours::Pairs::default();
                 let twins = if syncs.is_empty() { None } else { pairs.begin(list, ours::Kind::PreludeTwins) };
@@ -9501,6 +9587,11 @@ impl Host {
                 &mut buffer,
             )
         };
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::ram::track(b, crate::ram::Heap::ReadBack, size);
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -9581,6 +9672,11 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "an upload buffer".into());
+        }
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::ram::track(b, crate::ram::Heap::Upload, size);
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
@@ -10611,6 +10707,11 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "a shared buffer".into());
+        }
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::ram::track(b, crate::ram::Heap::Shared, size);
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
