@@ -2263,7 +2263,12 @@ fn whole_units_idle(
             && std::sync::Arc::strong_count(host) == 1
             && crate::host::references(&host.texture) == 1
         {
-            idle.push(crate::vram::Idle { at, block: host.block, bytes: host.bytes, used });
+            // A copy made level by level (`crate::tiles`, levels on demand)
+            // has no bytes of its own: it gives back its tiles. (With none it
+            // was never let go under pressure in this way: `plan` leaves out
+            // what gives nothing. Round 2's review, item 8.)
+            let bytes = host.bytes.max(host.tiled.as_ref().map_or(0, crate::tiles::Tiled::given_bytes));
+            idle.push(crate::vram::Idle { at, block: host.block, bytes, used });
         }
     }
     idle
