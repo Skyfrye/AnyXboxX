@@ -65,8 +65,17 @@ const WHOLE: u32 = 512;
 /// Frames presented after a timed one before its stamps are read: its
 /// lists have run by then (the queue's line runs a frame or two behind).
 const LAG: u64 = 6;
-/// Pipelines the line names.
+/// Pipelines the line names (`VICTORY_PASS_TIMES_TOP` sets another count).
 const TOP: usize = 25;
+
+/// How many pipelines the line names: `VICTORY_PASS_TIMES_TOP`, [`TOP`]
+/// unless set.
+fn top() -> usize {
+    static TOP_SET: OnceLock<usize> = OnceLock::new();
+    *TOP_SET.get_or_init(|| {
+        std::env::var("VICTORY_PASS_TIMES_TOP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(TOP).max(1)
+    })
+}
 
 /// Whether the title's work is timed by pipeline (`VICTORY_PASS_TIMES=1`).
 pub(crate) fn on() -> bool {
@@ -636,7 +645,7 @@ pub(crate) fn line() {
     if totals.frames == 0 {
         return;
     }
-    let text = rank::text(&totals, clock.per_ms, every(), TOP, props::text);
+    let text = rank::text(&totals, clock.per_ms, every(), top(), props::text);
     tracing::info!("{text}");
 }
 

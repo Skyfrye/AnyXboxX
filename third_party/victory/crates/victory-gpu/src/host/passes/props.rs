@@ -98,6 +98,10 @@ pub(super) struct Props {
     pub(super) counts: Option<Counts>,
     /// Bytes of the host program.
     pub(super) dxil: usize,
+    /// The program's name in its container (`Shader::title_name`), and
+    /// whether it is one of the ray-tracing structure builder's.
+    pub(super) name: Option<String>,
+    pub(super) builder: bool,
 }
 
 impl Props {
@@ -117,6 +121,12 @@ impl Props {
             }
         }
         let _ = write!(text, " dxil {}k", self.dxil.div_ceil(1024));
+        if self.builder {
+            text.push_str(" builder");
+        }
+        if let Some(name) = &self.name {
+            let _ = write!(text, " {name}");
+        }
         text
     }
 }
@@ -143,6 +153,8 @@ fn of(shader: &Shader) -> Option<Props> {
         lds,
         counts: count(&program.code),
         dxil: translated.map_or(0, |t| t.host.dxil.len()),
+        name: shader.title_name(),
+        builder: programs.iter().any(victory_shader::spill::is_spilled),
     })
 }
 
@@ -236,7 +248,11 @@ mod tests {
             lds: 8192,
             counts: Some(Counts { all: 1234, samples: 6, images: 0, lds: 40, memory: 30 }),
             dxil: 61 * 1024 - 10,
+            name: None,
+            builder: false,
         };
         assert_eq!(p.text(), "cs w64 paired v128 lds 8192 isa 1234 smp 6 ds 40 mem 30 dxil 61k");
+        let named = Props { name: Some("CS_Trace_1234_Wrapped".to_owned()), builder: true, ..p };
+        assert_eq!(named.text(), "cs w64 paired v128 lds 8192 isa 1234 smp 6 ds 40 mem 30 dxil 61k builder CS_Trace_1234_Wrapped");
     }
 }
