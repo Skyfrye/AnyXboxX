@@ -2524,26 +2524,27 @@ impl State {
         if run_pass && served && exact {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
-        let whole = Self::bake_left(host, served);
+        let whole = Self::bake_left(host, served, frame);
         BAKED_MS.fetch_add(began.elapsed().saturating_sub(waited).as_millis() as u64, Ordering::Relaxed);
         [served, whole]
     }
 
-    /// Counts a bake draw recorded while slots of its heap still showed a
-    /// stand-in for a texture on its way: behind a flip, a list's flip or an
-    /// upload ahead, left due by a pass that ran out of its budget or had
-    /// none left (`served` false), or in the queue showing no texture of
-    /// theirs, due or not (waiting for their memory, a full card, a table's
-    /// grace: [`HostHeap::queued_without_texture`]). A line at the first such
-    /// and at each power of two. Returns whether there was none.
+    /// Counts a bake draw recorded at `frame` while slots of its heap still
+    /// showed a stand-in for a texture on its way: behind a flip, a list's
+    /// flip or an upload ahead, left due by a pass that ran out of its budget
+    /// or had none left (`served` false), or written for it (this frame or
+    /// the one before) and in the queue showing no texture of theirs, due or
+    /// not (waiting for their memory, a full card, a table's grace:
+    /// [`HostHeap::fresh_without_texture`]). A line at the first such and at
+    /// each power of two. Returns whether there was none. (The queue is
+    /// looked through only when nothing else says so, or for the line.)
     ///
-    /// [`HostHeap::queued_without_texture`]: crate::descriptor::host::HostHeap::queued_without_texture
-    fn bake_left(host: &crate::descriptor::host::HostHeap, served: bool) -> bool {
+    /// [`HostHeap::fresh_without_texture`]: crate::descriptor::host::HostHeap::fresh_without_texture
+    fn bake_left(host: &crate::descriptor::host::HostHeap, served: bool, frame: u64) -> bool {
         let [flips, listed] = host.stand_ins_left();
         let ahead = crate::texture::ahead::on_their_way();
-        let queued = host.queued_without_texture();
         let all = BAKES_LEFT[0].fetch_add(1, Ordering::Relaxed) + 1;
-        if flips == 0 && listed == 0 && ahead == 0 && queued == 0 && served {
+        if flips == 0 && listed == 0 && ahead == 0 && served && host.fresh_without_texture(frame) == 0 {
             return true;
         }
         let n = BAKES_LEFT[1].fetch_add(1, Ordering::Relaxed) + 1;
@@ -2554,7 +2555,7 @@ impl State {
                 flips,
                 list_flips = listed,
                 uploads_ahead = ahead,
-                queued_without_their_texture = queued,
+                written_for_it_without_their_texture = host.fresh_without_texture(frame),
                 pass_served_all = served,
                 "a draw of the title's decoration bake was recorded while slots of its heap still showed a stand-in"
             );
@@ -5337,8 +5338,10 @@ mod bake_tests {
         let (_record, _) = host.test_write_texture(7, texture);
         let frame = crate::frame::current();
         assert!(host.texture_slots_any_due(frame, crate::host::now_ms()));
-        // (Queued and showing the stand-in: counted as such for the warning.)
-        assert_eq!(host.queued_without_texture(), 1);
+        // (Queued, written for the bake and showing the stand-in: counted as
+        // such for the warning; not by a bake long after.)
+        assert_eq!(host.fresh_without_texture(frame), 1);
+        assert_eq!(host.fresh_without_texture(frame + 1000), 0);
         // (The heap the bake's pass would read: with no budget there is none.)
         let heap = crate::descriptor::heap(crate::descriptor::test_view_heap(16));
         let before = BAKES_LEFT[1].load(Ordering::Relaxed);

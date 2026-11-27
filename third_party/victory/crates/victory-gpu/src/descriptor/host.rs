@@ -2407,12 +2407,18 @@ impl HostHeap {
     }
 
     /// Slots of the queue that show no texture of theirs now (the stand-in,
-    /// or a null view): what a bake that picks one by index reads, whether
-    /// the slot is due or waits (for its memory, a full card, a table's
-    /// grace).
-    pub(crate) fn queued_without_texture(&self) -> usize {
+    /// or a null view) and were written at `frame` or the frame before: what
+    /// a bake drawn at `frame` most likely reads by index (a title writes
+    /// its bake's slots just before it draws it), whether the slot is due or
+    /// waits (for its memory, a full card, a table's grace).
+    ///
+    /// (Every queued slot showing none was counted: thousands while textures
+    /// stream, and the bake warning came at nearly every bake, which said
+    /// nothing. A slot the bake reads that was written long before and
+    /// still waits is missed now. Round 2's review, item 8.)
+    pub(crate) fn fresh_without_texture(&self, frame: u64) -> usize {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.slots.keys().filter(|&&index| self.made.get(index) == Some(0)).count()
+        textures.slots.iter().filter(|&(&index, w)| w.written.saturating_add(1) >= frame && self.made.get(index) == Some(0)).count()
     }
 
     /// Up to `max` slots a pass before a bake takes at `frame` and `now`
