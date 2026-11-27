@@ -9,7 +9,7 @@ This repository contains no game files, no game code, no keys and no console or 
 ![The launcher's Home page](docs/images/launcher-home.png)
 
 > [!NOTE]
-> **Where we are (2026-11-27).** The first cutscene runs at about 23 fps at native 2560x1440 on an RTX 5080, up from about 10 fps on the combined base. With ray tracing on, it runs at about 14 fps, up from about 6. The open world is not measured yet.
+> **Where we are (2026-11-27, evening).** The first cutscene runs at about 25 fps in most seconds at native 2560x1440 on an RTX 5080, up from about 10 fps on the combined base, with dips at its scene cuts. Its frames are steadier: in the same shot, 5% of frames take over 50 ms, against 12% in the morning's build. With ray tracing on, it runs at about 14 fps, up from about 6. The open world (a save at the docks) runs at about 20-25 fps, with texture pop-in, one-frame texture swaps and dark blocks on the water still to fix.
 
 ## Measured gains
 
@@ -19,10 +19,13 @@ Setup: first cutscene, 2560x1440 native (`VICTORY_OUTPUT=2560x1440`, `VICTORY_RE
 |---|---|---|---|
 | Combined base (VIctory's `play.ps1` set) | 9.9 | 10.4 | 7.6 |
 | + card budgets and RAM relief | 20.8 | 22.7 | 16.1 |
-| + submission-thread fixes (this line's set) | 22.8 | 26.7 | 18.6 |
+| + submission-thread fixes | 22.8 | 26.7 | 18.6 |
+| + the evening's set: memory line off the submitting thread, card steps that no longer wait for every flight, picture fixes (this line's set) | 22.0 | 25.2 | 15.0 |
 
 - **GPU work per frame** fell from 82.8 ms to 28.5 ms with the card budgets: the title's buffers stay in the card's memory, with a reservation, instead of being read by the GPU from the PC's memory.
 - **Ray tracing on** (`VICTORY_BVH_BUILDER=1`, correct indoor lighting): about 14 fps, up from about 6.
+- **Steadier frames**: the memory-by-owner line walked the process heap under its lock on the submitting thread, one 300-460 ms frame every 10 s. It no longer does. In the cell-window shot, frames over 50 ms fell from 11.9% to 5.1%.
+- **Scene cuts** still stall for 240-570 ms, and how many land in the measured span varies from run to run: that is what the "fps over the scene" and "Low" columns of the last row show, not the steady shots.
 - **Caveats**: each build was measured once, on about 2 minutes of the same cutscene, on one machine. The open world has not been measured with this line yet. The game caps itself at 30 fps.
 
 ## Requirements
@@ -96,7 +99,7 @@ The Play page also has presets for 12 GB and 8 GB cards (not measured), the wind
 |---|---|---|
 | Engine base | Vice-Tay ([LooperSalty/AnyXboxX#454](https://github.com/LooperSalty/AnyXboxX/pull/454)) | The combined base of 26 November, plus our work |
 | Tuned on | AMD (RX 7900 XTX on Windows, RX 9070 XT on Linux) | NVIDIA (RTX 5080) |
-| NVIDIA settings | VIctory's `play.ps1` set, not measured on NVIDIA | Measured set: card budgets, RAM relief, submission-thread switches, no `VICTORY_CARD_AWAKE` |
+| NVIDIA settings | VIctory's `play.ps1` set, not measured on NVIDIA | Measured set: card budgets, RAM relief, submission-thread switches, the picture fixes (skin, eyes, intro video), no `VICTORY_CARD_AWAKE` |
 | Output size | The console's 3840x2160, rendered at two thirds | The screen's size, rendered at native size |
 | DLSS | No | Yes, experimental (`VICTORY_DLSS=1`) |
 | Stats overlay | Diagnostics builds only | Release builds too (F3) |
@@ -112,14 +115,17 @@ The engine is `third_party/victory`:
 - **Vice-Tay ports**: card budgets with a reservation, RAM relief under memory pressure, and BC7 decode fixes.
 - **Fixes**: the bake stamp, and the submission thread (helpers above normal, a core of its own, the D3D runtime's background threads on the first cores).
 - **Ray tracing**: pages that will never arrive no longer slow the structure walks.
-- **Picture**: the reflection bound (`VICTORY_AMBIENT_SPECULAR`), and the skin confetti fix behind a switch.
+- **Picture**: the reflection bound (`VICTORY_AMBIENT_SPECULAR`), the skin confetti fix (`VICTORY_FIRST_UPLOAD_FRONT`), light tiles in rows on NVIDIA (no blocks or stripes of light), and the intro video's planes in their own upload buffers (`VICTORY_MOVIE_PLANES`, no colour-only frames).
+- **Hitches**: card steps read a copy's source instead of waiting for every flight (`VICTORY_PLACED_SOURCE`), and the memory line no longer locks the process heap.
 - **Additions**: NVIDIA DLSS (`VICTORY_DLSS=1`), and the stats overlay in release builds.
 
 Every source and its author is credited in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Known issues
 
-- Skin sometimes shows coloured "confetti". A fix exists behind `VICTORY_FIRST_UPLOAD_FRONT=1` (the launcher's "Skin confetti fix").
+- Textures sometimes swap to another image, or show noise, for a single frame, and some appear late (pop-in).
+- In the open world, dark rectangular blocks show on the water.
+- Scene cuts in the first cutscene stall for 240-570 ms while their pipelines are made.
 - Some interiors show blocky bands.
 - The game caps itself at 30 fps.
 - The game uses about 30 GB of RAM.

@@ -78,6 +78,13 @@ pub const LINUX_AMD: &[(&str, &str)] = &[
 /// threads on core 0. Measured 2026-11-27 on an RTX 5080, Ryzen 7 9800X3D, 31 GB, first cutscene at
 /// 2560x1440 native (`VICTORY_OUTPUT=2560x1440 VICTORY_RENDER_SCALE=1.0`): 9.9 fps over the scene
 /// with [`TUNED`] alone, 22.8 with this set.
+///
+/// Then, the same day: the journal port (the submitting thread's lock waits), card steps that read a
+/// copy's source instead of waiting for every flight (`VICTORY_PLACED_SOURCE`), preludes on their
+/// list's own allocator (about 1 GB less RAM), no upload over a texture the card wrote (the bake's
+/// skin and tattoos), reflections bounded so eyes are not lit white, the intro video's planes in
+/// per-list upload buffers (no colour-only frames). (The faster texture records, `VICTORY_COPIED_AT_ONCE` and
+/// `VICTORY_TABLED_ORPHANS`, stay out: with them faces turned to black masks in 2 of 6 runs.)
 pub const DIFFBASE_EXTRA: &[(&str, &str)] = &[
     ("VICTORY_PLACED_ORDER", "1"),
     ("VICTORY_CARD_RESERVE_BUDGETS", "1"),
@@ -88,6 +95,12 @@ pub const DIFFBASE_EXTRA: &[(&str, &str)] = &[
     ("VICTORY_BACKGROUND_CORES", "1"),
     ("VICTORY_LANE_CORE", "1"),
     ("VICTORY_HELPERS_ABOVE", "1"),
+    ("VICTORY_PORT_JOURNAL", "1"),
+    ("VICTORY_PLACED_SOURCE", "1"),
+    ("VICTORY_SHARE_PRELUDE", "1"),
+    ("VICTORY_FIRST_UPLOAD_FRONT", "1"),
+    ("VICTORY_AMBIENT_SPECULAR", "1.5"),
+    ("VICTORY_MOVIE_PLANES", "1"),
 ];
 
 /// The switch [`DIFFBASE`] leaves out of [`TUNED`]: on NVIDIA the keep-awake loop halved the
@@ -122,6 +135,12 @@ pub const DIFFBASE: &[(&str, &str)] = &[
     ("VICTORY_BACKGROUND_CORES", "1"),
     ("VICTORY_LANE_CORE", "1"),
     ("VICTORY_HELPERS_ABOVE", "1"),
+    ("VICTORY_PORT_JOURNAL", "1"),
+    ("VICTORY_PLACED_SOURCE", "1"),
+    ("VICTORY_SHARE_PRELUDE", "1"),
+    ("VICTORY_FIRST_UPLOAD_FRONT", "1"),
+    ("VICTORY_AMBIENT_SPECULAR", "1.5"),
+    ("VICTORY_MOVIE_PLANES", "1"),
 ];
 
 /// Picture first (`--quality`): applied after the tuned set, before `--override`. Draw-data windows

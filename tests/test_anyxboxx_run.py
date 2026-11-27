@@ -78,7 +78,8 @@ def test_the_diffbase_table_is_the_tuned_set_without_card_awake_then_its_additio
     assert dict(extra) == {
         "VICTORY_PLACED_ORDER": "1", "VICTORY_CARD_RESERVE_BUDGETS": "1", "VICTORY_CARD_BUFFERS_MB": "1536",
         "VICTORY_CARD_WINDOWS_MB": "1024", "VICTORY_CARD_BUFFERS_MIN_KB": "64", "VICTORY_RESIDENCY": "1",
-        "VICTORY_BACKGROUND_CORES": "1", "VICTORY_LANE_CORE": "1", "VICTORY_HELPERS_ABOVE": "1"}
+        "VICTORY_BACKGROUND_CORES": "1", "VICTORY_LANE_CORE": "1", "VICTORY_HELPERS_ABOVE": "1",
+        "VICTORY_PORT_JOURNAL": "1", "VICTORY_PLACED_SOURCE": "1", "VICTORY_SHARE_PRELUDE": "1", "VICTORY_FIRST_UPLOAD_FRONT": "1", "VICTORY_AMBIENT_SPECULAR": "1.5", "VICTORY_MOVIE_PLANES": "1"}
 
 
 def test_the_quality_set_names_only_switches_of_this_base():

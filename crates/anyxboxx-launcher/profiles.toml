@@ -31,7 +31,7 @@ name = "Windows + NVIDIA (diffbase set)"
 os = "windows"
 gpu = "nvidia"
 status = "measured"
-note = "Measured on an RTX 5080 (first cutscene, 2560x1440 native): about 10 fps with VIctory's play.ps1 set, about 23 with this one."
+note = "Measured on an RTX 5080 (first cutscene, 2560x1440 native): about 10 fps with VIctory's play.ps1 set, about 25 with this one; faces, tattoos and the intro video clean."
 
 [profile.env]
 VICTORY_TEXTURE_NO_WAIT = "1"
@@ -58,6 +58,12 @@ VICTORY_RESIDENCY = "1"
 VICTORY_BACKGROUND_CORES = "1"
 VICTORY_LANE_CORE = "1"
 VICTORY_HELPERS_ABOVE = "1"
+VICTORY_PORT_JOURNAL = "1"
+VICTORY_PLACED_SOURCE = "1"
+VICTORY_SHARE_PRELUDE = "1"
+VICTORY_FIRST_UPLOAD_FRONT = "1"
+VICTORY_AMBIENT_SPECULAR = "1.5"
+VICTORY_MOVIE_PLANES = "1"
 
 # ---------------------------------------------------------------------------------------------
 # Windows + AMD: the set VIctory's own launcher plays with (third_party/victory/scripts/play.ps1,
