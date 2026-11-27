@@ -91,6 +91,8 @@ mod diff_tests;
 #[cfg(all(test, windows))]
 mod f16_tests;
 #[cfg(all(test, windows))]
+mod forms_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
