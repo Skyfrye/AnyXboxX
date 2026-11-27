@@ -122,6 +122,23 @@ struct Last {
     hot_until: u64,
 }
 
+impl Last {
+    /// Whether a read of a partly mapped texture (`bytes`, its holes read
+    /// as zeros) is to be detiled: not if it is what the staging buffer
+    /// holds, nor if it is all holes. Only a read to be detiled becomes the
+    /// digest: one that caught nothing mapped took the place of the digest
+    /// of the texels staged, and the next read that found those texels
+    /// again detiled and uploaded them a second time.
+    fn accept_partial(&mut self, bytes: &[u8]) -> bool {
+        let hash = digest(bytes);
+        if self.hash == Some(hash) || bytes.iter().all(|&b| b == 0) {
+            return false;
+        }
+        self.hash = Some(hash);
+        true
+    }
+}
+
 /// Frames a guarded texture is hashed at every check from its first check,
 /// and after the hash found a change the guard did not see.
 const HOT_FRAMES: u64 = 64;
@@ -1627,12 +1644,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = digest(read);
-                if last.hash == Some(hash) {
-                    return false;
-                }
-                last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if !last.accept_partial(read) {
                     return false;
                 }
                 self.detile(read);
@@ -2318,6 +2330,24 @@ mod late_upload_tests {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    /// A read of only holes changes nothing, and leaves the digest of what
+    /// is staged: the same texels read again are not detiled again.
+    #[test]
+    fn a_zero_sparse_read_keeps_the_digest_of_the_staged_texels() {
+        use super::{Last, digest};
+        let mut last = Last::default();
+        let missing = [0; 128];
+        let visible = [0x7a; 128];
+        assert!(!last.accept_partial(&missing));
+        assert_eq!(last.hash, None, "nothing staged yet: the next read with texels is detiled");
+        assert!(last.accept_partial(&visible));
+        assert!(!last.accept_partial(&missing));
+        assert_eq!(last.hash, Some(digest(&visible)));
+        // Before, the read of holes took the digest's place, and this was
+        // detiled and uploaded a second time.
+        assert!(!last.accept_partial(&visible));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
