@@ -5117,12 +5117,25 @@ pub(crate) mod tests {
         }
         assert!(writes(one, one + BLOCK, true).is_some() && writes(two, two + BLOCK, true).is_some());
         put_count(one / BLOCK).store(0, std::sync::atomic::Ordering::Relaxed);
-        let put = |byte: u8| loop {
-            // SAFETY: a byte of the section's only page.
-            let done = put_beside(one / BLOCK, 1, |delta| unsafe { ((one + 100).wrapping_add(delta) as *mut u8).write(byte) });
-            // (Other tests hold changes of mapping.)
-            if done != Beside::Cannot {
-                return done;
+        // (Other tests hold changes of mapping now and then: again, for a
+        // while. It spun for good when the block stayed unguarded, eight
+        // minutes and more in a run of the whole suite.)
+        let put = |byte: u8| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                // SAFETY: a byte of the section's only page.
+                let done = put_beside(one / BLOCK, 1, |delta| unsafe { ((one + 100).wrapping_add(delta) as *mut u8).write(byte) });
+                if done != Beside::Cannot {
+                    return done;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "nothing put in for 10 s: guarded {}, mapping free {}, our view of the page {}",
+                    PROTECTED.any(one / BLOCK, one / BLOCK + 1),
+                    title_memory_reading_now().is_some(),
+                    crate::inplace::beside_page(one).is_some()
+                );
+                std::thread::yield_now();
             }
         };
         for round in 1..4 {
