@@ -1520,8 +1520,12 @@ mod tests {
     /// goes back to the system, which then counts its 64 MiB less in use.
     /// (By hand, alone: `cargo test -p victory-gpu --lib -- --ignored
     /// an_emptied_block`; other tests' textures would share the pool. With
-    /// `VICTORY_POOL_CLASSES=0` it fails: the small textures share blocks
-    /// with the large ones, and none empties.)
+    /// `VICTORY_POOL_CLASSES=0` it fails at the first check: the small
+    /// textures share blocks with the large ones. Each emptied block is
+    /// checked gone from the pool, and the system's count must fall by every
+    /// block that went back, the empty ones made ahead with them: the round-1
+    /// figure, "400 MB to 144 MB once 2 blocks emptied", was four blocks,
+    /// two emptied and two made ahead.)
     #[test]
     #[ignore = "on the card, by hand"]
     fn an_emptied_block_of_small_textures_goes_back_to_the_system() {
@@ -1562,14 +1566,31 @@ mod tests {
         drop(small);
         let lives = lock(&TEXTURES).lives();
         // The blocks only these textures were in.
-        let emptied = small_blocks.iter().filter(|&&b| lives[b as usize] == 0).count() as u64;
-        assert!(emptied >= 1, "{lives_before:?} {lives:?}");
+        let emptied: Vec<u32> = small_blocks.iter().copied().filter(|&b| lives[b as usize] == 0).collect();
+        assert!(!emptied.is_empty(), "{lives_before:?} {lives:?}");
         std::thread::sleep(std::time::Duration::from_millis(REST + 200));
         let before = used();
-        lock(&TEXTURES).reclaim(now(), 0, false);
+        // (With no spare kept, the empty blocks made ahead go too, `ahead`:
+        // the system's count falls by all that go back. Each emptied block
+        // must be one of them.)
+        let (released, ahead) = {
+            let mut pool = lock(&TEXTURES);
+            let released = pool.released;
+            pool.reclaim(now(), 0, false);
+            for &b in &emptied {
+                assert!(pool.blocks[b as usize].is_none(), "block {b}, emptied, went back");
+            }
+            let released = pool.released - released;
+            (released, released - emptied.len() as u64)
+        };
         let after = used();
-        println!("in use as the system counts: {} MB, then {} MB once {emptied} blocks emptied", before >> 20, after >> 20);
-        assert!(before >= after + emptied * BLOCK, "{before} {after}");
+        println!(
+            "in use as the system counts: {} MB, then {} MB once {released} blocks went back: {} emptied, {ahead} made ahead",
+            before >> 20,
+            after >> 20,
+            emptied.len()
+        );
+        assert!(before >= after + released * BLOCK, "{before} {after}");
         assert!(large.iter().all(|t| block_of(t).is_some_and(|b| large_blocks.contains(&b))));
         // A texture of its own was placed in no block.
         let mut own: Option<ID3D12Resource> = None;
