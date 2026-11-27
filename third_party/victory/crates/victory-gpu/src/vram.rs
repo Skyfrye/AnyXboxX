@@ -22,13 +22,19 @@ pub(crate) fn system_room() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SYSTEM_ROOM").is_none_or(|v| v != "0"))
 }
 
-/// What the card's memory in use comes to for the texture queue's line
-/// and the sweep: what the system says is in use (`used`), less what is on
-/// its way back to it (`giving_back`, blocks the sweep emptied). As before
-/// ([`system_room`] off): less the bytes free in texture blocks
-/// (`free_in_blocks`) too, which the system counts as used.
-pub(crate) fn counted(used: u64, free_in_blocks: u64, giving_back: u64, system: bool) -> u64 {
-    if system { used.saturating_sub(giving_back) } else { used.saturating_sub(free_in_blocks) }
+/// What the card's memory in use comes to for the texture queue's line:
+/// what the system says is in use (`used`), with `kept` (what is kept for
+/// targets and buffer copies to come). As before ([`system_room`] off):
+/// less the bytes free in texture blocks (`free_in_blocks`), which the
+/// system counts as used. Blocks on their way back count: they are not back.
+pub(crate) fn queue_count(used: u64, free_in_blocks: u64, kept: u64, system: bool) -> u64 {
+    if system { used } else { used.saturating_sub(free_in_blocks) }.saturating_add(kept)
+}
+
+/// The same for the sweep: less what is on its way back to the system
+/// (`giving_back`, blocks the sweep left to empty), which it let go already.
+pub(crate) fn sweep_count(queue: u64, giving_back: u64, system: bool) -> u64 {
+    if system { queue.saturating_sub(giving_back) } else { queue }
 }
 
 /// A host copy the sweep may let go while the card is short: its title
@@ -140,8 +146,8 @@ pub(crate) fn line() -> String {
     format!(
         "card memory (VICTORY_SYSTEM_ROOM={}: {}): the system's budget {} MB, in use {} MB ({:.1} %), past the budget {} MB (what the \
          system may move to the PC's memory); the PC's memory in use by the card {} MB, of it {} MB of our staging blocks; counted in \
-         use {} MB, less {} MB on its way back, with {} MB kept for targets and buffer copies to come: textures picked by index are \
-         made up to {} MB, idle ones let go from {} MB down to {} MB. Ours: {} blocks of textures {} MB, textures in {} pieces {} MB, free \
+         use {} MB, with {} MB kept for targets and buffer copies to come, by the sweep less {} MB on its way back: textures picked \
+         by index are made up to {} MB, idle ones let go from {} MB down to {} MB. Ours: {} blocks of textures {} MB, textures in {} pieces {} MB, free \
          in them {} MB, resting {} MB, {} empty, {} left to empty, {classes}; host copies the title fills {} alive {} MB, {} MB of \
          them outside blocks; other host textures (targets, depth, unordered access, twins) {} MB; buffer copies' card sides {} MB, \
          their bytes from before {} MB, windows' {} MB. Since the last line: {} copies let go ({} MB), {} blocks let go whole ({} MB \
@@ -157,8 +163,8 @@ pub(crate) fn line() -> String {
         mb(shared),
         mb(staging.blocks * crate::pool::BLOCK),
         mb(counted),
-        mb(giving_back),
         mb(kept),
+        mb(giving_back),
         mb(made_to),
         mb(from),
         mb(to),
@@ -200,11 +206,33 @@ mod tests {
         // Run nbc-measure's end: 14,081 MB in use of 14,580, 1,769 MB free
         // in blocks. As before that was 12,312 MB, under nine tenths.
         let mb = |n: u64| n << 20;
-        assert_eq!(counted(mb(14_081), mb(1_769), 0, false), mb(12_312));
-        assert_eq!(counted(mb(14_081), mb(1_769), 0, true), mb(14_081));
-        assert_eq!(counted(mb(14_081), mb(1_769), mb(128), true), mb(13_953));
-        assert!(counted(mb(14_081), mb(1_769), 0, false) < mb(14_580) / 100 * 90);
-        assert!(counted(mb(14_081), mb(1_769), 0, true) > mb(14_580) / 100 * 90);
+        assert_eq!(queue_count(mb(14_081), mb(1_769), 0, false), mb(12_312));
+        assert_eq!(queue_count(mb(14_081), mb(1_769), 0, true), mb(14_081));
+        assert_eq!(queue_count(mb(14_081), mb(1_769), mb(800), true), mb(14_881));
+        assert!(queue_count(mb(14_081), mb(1_769), 0, false) < mb(14_580) / 100 * 90);
+        assert!(queue_count(mb(14_081), mb(1_769), 0, true) > mb(14_580) / 100 * 90);
+    }
+
+    /// Blocks on their way back to the system are no room for the queue
+    /// until they are back, and the sweep counts them as gone. At 96.6 % of
+    /// the budget with 1.7 GB of blocks emptying, the queue sees 96.6 %, past
+    /// its line of nine tenths, and the sweep 85 %, so it lets no more go for
+    /// them. (The queue saw 85 % too and made new textures, which the blocks
+    /// emptying would not take: past the budget until those were back.
+    /// Round 2's review, item 2.)
+    #[test]
+    fn memory_on_its_way_back_is_no_room_yet() {
+        let mb = |n: u64| n << 20;
+        let budget = mb(14_580);
+        let used = budget / 1000 * 966;
+        let back = mb(1_700);
+        let queue = queue_count(used, 0, 0, true);
+        assert_eq!(queue, used);
+        assert!(queue > budget / 100 * 90, "no room for the queue");
+        let sweep = sweep_count(queue, back, true);
+        assert!(sweep < budget / 100 * 86, "{} MB for the sweep", sweep >> 20);
+        // As before: nothing on its way back.
+        assert_eq!(sweep_count(queue, back, false), queue);
     }
 
     /// The line is made from counters alone, with or without a card, and

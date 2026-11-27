@@ -1900,19 +1900,34 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
 }
 
-/// The card's memory in use as the texture queue ([`room`]) and the sweep
-/// ([`let_go_idle`]) count it, from what the system says is in use
-/// (`used`): as the system counts it, less the blocks on their way back to
-/// it ([`crate::vram::system_room`]; off: less the bytes free in texture
+/// The card's memory in use as the texture queue ([`room`]) counts it, from
+/// what the system says is in use (`used`): as the system counts it
+/// ([`crate::vram::system_room`]; off: less the bytes free in texture
 /// blocks, which the system counts as used), with what is kept for card
 /// copies of title buffers not made yet (`crate::shadow::card_room_kept`)
 /// and for the render targets a world makes in its first frame
-/// ([`targets_room_kept`]).
+/// ([`targets_room_kept`]). Blocks on their way back to the system count:
+/// they are not back yet ([`counted_for_sweep`]).
 #[cfg(windows)]
 pub(crate) fn counted_in_use(used: u64) -> u64 {
     let system = crate::vram::system_room();
-    let (free, back) = if system { (0, crate::pool::giving_back()) } else { (crate::pool::texture_room(), 0) };
-    crate::vram::counted(used, free, back, system) + crate::shadow::card_room_kept() + targets_room_kept()
+    let free = if system { 0 } else { crate::pool::texture_room() };
+    crate::vram::queue_count(used, free, crate::shadow::card_room_kept() + targets_room_kept(), system)
+}
+
+/// [`counted_in_use`] as the sweep ([`let_go_idle`]) counts it: less the
+/// blocks on their way back ([`crate::pool::giving_back`]), which it let go
+/// already, so that it does not let go more for them.
+///
+/// (The queue counted them as room too: with 1.7 GB of blocks emptying at
+/// 96.6 % of the budget it saw 85 % and made up to 5 % of the budget of new
+/// textures, which could not go into the blocks emptying and went into new
+/// ones: past the budget for the 3 to 10 s until those were back.)
+#[cfg(windows)]
+pub(crate) fn counted_for_sweep(used: u64) -> u64 {
+    let system = crate::vram::system_room();
+    let back = if system { crate::pool::giving_back() } else { 0 };
+    crate::vram::sweep_count(counted_in_use(used), back, system)
 }
 
 /// For the memory line: with the card's `budget`, the bytes counted in use
@@ -2266,7 +2281,7 @@ pub(crate) fn let_go_idle() {
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => crate::host::vram_keep(budget, counted_in_use(used)),
+        Some([budget, used, ..]) if keep => crate::host::vram_keep(budget, counted_for_sweep(used)),
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,

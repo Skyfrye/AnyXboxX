@@ -160,9 +160,10 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
-/// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 88 % of its budget, else enough to come
-/// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
+/// of the card (`used`, as the sweep counts it: `crate::resource::counted_for_sweep`,
+/// with what is kept free for others, less the blocks on their way back) is
+/// under 88 % of its budget, else enough to come down to 85 %.
+/// `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
