@@ -1351,6 +1351,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Open, empty and reset since its last run, and left so for the title's
+    /// next reset of its list ([`HostList::leave_open`]): that reset has
+    /// nothing to reset.
+    left_open: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2133,7 +2137,54 @@ fn trim_spare_chunks() {
     ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
-    drop(freed);
+    let_go_beside(freed);
+}
+
+/// Whether a host list just taken for a title's list is left open for the
+/// title's reset ([`HostList::leave_open`]; `VICTORY_LEAVE_OPEN=0`: closed).
+fn leave_open() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEAVE_OPEN").is_none_or(|v| v != "0"))
+}
+
+/// Whether what nothing names any more is let go on a thread of its own
+/// ([`let_go_beside`]; `VICTORY_LET_GO_BESIDE=0`: where it is let go, as
+/// before).
+fn let_go_aside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LET_GO_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// Drops `what` on a thread kept for that, not on this one: things nothing
+/// names any more (no list records into them, none that runs or is recorded
+/// names them), whose release is the kernel's, such as the scratch chunks no
+/// list holds. Under memory pressure those were all let go once a second on
+/// the submitting thread, which stood some 30 ms in their release each
+/// time (2.9% of its time in run s2-prof1's profile, in the opening
+/// cutscene). Here if there is no such thread.
+fn let_go_beside<T: Send + 'static>(what: T) {
+    type Gone = Box<dyn std::any::Any + Send>;
+    static THREAD: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Gone>>>> = OnceLock::new();
+    if !let_go_aside() {
+        drop(what);
+        return;
+    }
+    let thread = THREAD.get_or_init(|| {
+        let (send, gone) = std::sync::mpsc::channel::<Gone>();
+        std::thread::Builder::new()
+            .name("victory-let-go".into())
+            .spawn(move || gone.into_iter().for_each(drop))
+            .ok()
+            .map(|_| Mutex::new(send))
+    });
+    let gone: Gone = Box::new(what);
+    match thread {
+        Some(send) => {
+            // (A thread that is gone hands it back: dropped here.)
+            let _ = send.lock().unwrap_or_else(|e| e.into_inner()).send(gone);
+        }
+        None => drop(gone),
+    }
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -3255,16 +3306,27 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
     let mut places: ByCopy<Option<usize>> = ByCopy::default();
     let scanning = std::time::Instant::now();
+    // The copy of the step before and its place: most refreshes come several
+    // times on end for the same copy, and the table was 1.8% of the
+    // submitting thread's time (run s2-prof1).
+    let mut last: (usize, Option<usize>) = (0, None);
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
-                    shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
-                        spans.len() - 1
-                    })
-                });
-                if let Some(i) = *place {
+                let key = Arc::as_ptr(shadow) as usize;
+                let place = if key == last.0 {
+                    last.1
+                } else {
+                    let place = *places.entry(key).or_insert_with(|| {
+                        shadow.writes_pending().then(|| {
+                            spans.push((shadow.clone(), *address, *address + *len));
+                            spans.len() - 1
+                        })
+                    });
+                    last = (key, place);
+                    place
+                };
+                if let Some(i) = place {
                     let s = &mut spans[i];
                     (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
                 }
@@ -3317,24 +3379,29 @@ fn joins_asked() -> (usize, usize) {
     (parts, lists)
 }
 
-/// Whether the part `next` can be prepared together with `ahead`, which goes
-/// before it and has not been sent: nothing done on the CPU for it reads what
-/// those give their shaders, write back or write when they are done, and it
-/// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
-pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if writes_title_memory(next) {
-        return false;
-    }
-    let ahead: Vec<&HostList> = ahead.collect();
-    let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
-    for list in &ahead {
+/// Whether the part `next` can be prepared together with the parts ahead
+/// of it, which have not been sent: nothing done on the CPU for it reads
+/// `written`, what those give their shaders, write back or write when they
+/// are done ([`written_by`]); the caller has seen that it changes no title
+/// memory that they read ([`writes_title_memory`]). The line keeps
+/// `written` for the parts it joins and adds each part's as it takes it
+/// along; each try went over all the parts ahead again before (0.5 ms a
+/// frame of the submitting thread, run s2-b1).
+pub(crate) fn joinable_after(written: &[(usize, usize)], next: &[&HostList]) -> bool {
+    blocked_by(written, next, false).is_none()
+}
+
+/// `written` (joined) and what the shaders of `lists` may write, write back or
+/// write when they are done, joined ([`joinable_after`]).
+pub(crate) fn written_by(lists: &[&HostList], mut written: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut more: Vec<(usize, usize)> = declared_writes(lists).into_iter().flat_map(|(_, ranges)| ranges).collect();
+    for list in lists {
         let deferred = list.deferred();
-        written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
-        written.extend(deferred.backs.iter().map(|(_, at, rows)| (at + rows.title_start, at + rows.title_start + rows.title_span())));
+        more.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
+        more.extend(deferred.backs.iter().map(|(_, at, rows)| (at + rows.title_start, at + rows.title_start + rows.title_span())));
     }
-    let mut joined = Vec::new();
-    join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    join_ranges(&mut written, more);
+    written
 }
 
 /// Whether a step of `lists` on the CPU changes title memory ([`Step::Copy`],
@@ -4383,6 +4450,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                left_open: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5927,18 +5995,31 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            // The copy of the refreshes on end, its span so far (or `None`
+            // if it is not asked about): most come several times on end.
+            let mut run: Option<(usize, Option<(usize, usize)>)> = None;
+            let mut put = |run: Option<(usize, Option<(usize, usize)>)>| {
+                if let Some((key, Some((from, to)))) = run {
+                    let span = spans.entry(key).or_insert((from, to));
+                    *span = (span.0.min(from), span.1.max(to));
+                }
+            };
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    if let Step::Refresh(shadow, address, len) = step {
+                        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, *address + *len);
+                        match &mut run {
+                            Some((k, span)) if *k == key => {
+                                if let Some(span) = span {
+                                    *span = (span.0.min(*address), span.1.max(end));
+                                }
+                            }
+                            _ => put(run.replace((key, shadow.asked_ahead().then_some((*address, end))))),
+                        }
                     }
                 }
             }
+            put(run);
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -6748,6 +6829,8 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        // (A list left open is closed as any other: its reset resets.)
+        self.left_open.store(false, Ordering::Release);
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6776,6 +6859,29 @@ impl HostList {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
+        }
+    }
+
+    /// In place of [`HostList::close`], for a list just taken (made, or reset
+    /// since its last run, and nothing recorded since) that the title's list
+    /// holds from now on until the title resets it: left open, and that reset
+    /// ([`HostList::reset`]) resets nothing; closed if it goes to the card
+    /// first ([`HostList::closed_if_left_open`]). The driver's close of such
+    /// an empty list was 2.5% of the submitting thread's time (run s2-prof1,
+    /// a fresh list for each list a submission took), and the title's reset
+    /// then reset it again. `VICTORY_LEAVE_OPEN=0`: closed, as before.
+    pub(crate) fn leave_open(&self) {
+        if !leave_open() || !self.untouched() {
+            self.close();
+            return;
+        }
+        self.left_open.store(true, Ordering::Release);
+    }
+
+    /// Closed if it was left open ([`HostList::leave_open`]).
+    pub(crate) fn closed_if_left_open(&self) {
+        if self.left_open.load(Ordering::Acquire) {
+            self.close();
         }
     }
 
@@ -6829,6 +6935,11 @@ impl HostList {
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
+        }
+        // Left open since it was made or reset, with nothing recorded: as
+        // it would be after the reset ([`HostList::leave_open`]).
+        if self.left_open.swap(false, Ordering::AcqRel) {
+            return;
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -8354,6 +8465,17 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
 /// each list's part beside the submitting thread (renderer port #6).
 const WIDE_PLAN_STEPS: usize = 4096;
 
+/// Whether [`Batch::refresh_front`] makes each list's part beside the
+/// submitting thread without renderer port #6 too (`VICTORY_WIDE_PLAN=0`: only
+/// with it). The same spans in the same order (`front_tests`); the port's
+/// other changes stay its own. The planning on the submitting thread alone
+/// was 3% of its time (run s2-prof1), most of it the submission a frame that
+/// holds most of the frame's steps.
+fn wide_plan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_PLAN").is_none_or(|v| v != "0"))
+}
+
 /// One list's part of [`front_spans`] (renderer port #6, [`list_front`]).
 #[derive(Default)]
 struct ListFront {
@@ -8743,7 +8865,7 @@ impl Batch {
         // a frame has most of the frame's steps, 3-6 ms of this alone (run
         // guard-4).
         let steps: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
-        if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
+        if (crate::watch::port_guard_plan() || wide_plan()) && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
             #[derive(Clone, Copy)]
             struct Lists(*const *const HostList, usize);
             // SAFETY: the lists outlive the call, which waits for every job.
@@ -8778,7 +8900,8 @@ impl Batch {
             return;
         }
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-        let mut touches = Vec::new();
+        // (Room for all at once: 20,000 a frame.)
+        let mut touches = Vec::with_capacity(steps + parts.len());
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);
@@ -11845,5 +11968,72 @@ mod window_mode_tests {
         assert!(super::is_borderless(" Borderless "));
         assert!(!super::is_borderless("windowed"));
         assert!(!super::is_borderless(""));
+    }
+}
+
+#[cfg(test)]
+mod leave_open_tests {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    /// Runs `list` (closed) on the host's queue and waits for it on a fence
+    /// of its own.
+    fn run(host: &super::Host, list: &super::HostList) {
+        // SAFETY: a closed list of ours; the fence is ours and waited for.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("a fence");
+            host.queue.ExecuteCommandLists(&[Some(list.list.cast().expect("a command list"))]);
+            host.queue.Signal(&fence, 1).expect("signalled");
+            while fence.GetCompletedValue() < 1 {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// A list taken for a title's list and left open, as a submission takes
+    /// a fresh one (`crate::list::detach`), takes the title's reset with
+    /// nothing to reset, records, closes and runs; one left open that goes
+    /// to the card first is closed. (Resetting a D3D12 list that is open
+    /// fails: a reset that did not know the list was left open ends the run.)
+    #[test]
+    fn a_list_left_open_takes_the_titles_reset_and_runs() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().expect("a list");
+        list.leave_open();
+        assert!(list.left_open.load(std::sync::atomic::Ordering::Relaxed), "an untouched list is left open");
+        list.reset();
+        assert!(!list.left_open.load(std::sync::atomic::Ordering::Relaxed));
+        list.close();
+        run(host, &list);
+        // Its next life: reset after it ran, taken again, submitted again
+        // without the title's reset.
+        list.reset();
+        list.leave_open();
+        list.closed_if_left_open();
+        assert!(!list.left_open.load(std::sync::atomic::Ordering::Relaxed));
+        run(host, &list);
+        list.reset();
+        list.close();
+    }
+}
+
+#[cfg(test)]
+mod let_go_tests {
+    /// What is let go beside is dropped on another thread than the one that
+    /// lets it go, and is dropped.
+    #[test]
+    fn what_is_let_go_beside_is_dropped_on_another_thread() {
+        struct Told(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for Told {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+        let (tell, told) = std::sync::mpsc::channel();
+        super::let_go_beside(Told(tell));
+        let by = told.recv_timeout(std::time::Duration::from_secs(10)).expect("dropped");
+        assert_ne!(by, std::thread::current().id(), "dropped where it was let go");
     }
 }

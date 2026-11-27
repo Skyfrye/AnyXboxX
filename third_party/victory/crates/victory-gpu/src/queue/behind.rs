@@ -453,8 +453,10 @@ enum Job {
     /// the parts of it are known when they are.
     Lists(usize, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
-    /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
+    /// begin in the order, the signals given behind them, and what their
+    /// lists' shaders may write, joined, once a part after them asked
+    /// ([`crate::host::written_by`]).
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>, Option<Vec<(usize, usize)>>),
     /// A signal of the queue's.
     Signal(usize, u64),
     /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
@@ -559,11 +561,13 @@ impl Work for Job {
             return Err(next);
         }
         // Nothing but waits and signals that a submission may follow.
-        let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+        let (count, lists, signals, known) = match self {
+            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..], None),
+            Job::Joined(_, lists, order, parts, signals, known) => (1 + parts.len(), (&*lists, &*order), &signals[..], known.as_ref()),
             _ => return Err(next),
         };
+        // What the lists before it write, with the part's own if it is taken.
+        let mut written = None;
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
         match &next {
             Job::Value(wait) => {
@@ -591,16 +595,21 @@ impl Work for Job {
                 if crate::host::writes_title_memory(&runs) {
                     return Err(refused(NOT_COPIES, next));
                 }
-                if !crate::host::joinable(hosts(), &runs) {
+                let before = match known {
+                    Some(known) => known.clone(),
+                    None => crate::host::written_by(&hosts().collect::<Vec<_>>(), Vec::new()),
+                };
+                if !crate::host::joinable_after(&before, &runs) {
                     return Err(refused(NOT_JOINABLE, next));
                 }
+                written = Some(crate::host::written_by(&runs, before));
             }
             Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(refused(NOT_OTHER, next)),
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
-        let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
-            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
-            Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
+        let (queue, mut lists, mut order, mut parts, mut signals, known) = match taken {
+            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new(), None),
+            Job::Joined(queue, lists, order, parts, signals, known) => (queue, lists, order, parts, signals, known),
             other => {
                 *self = other;
                 return Err(next);
@@ -617,7 +626,7 @@ impl Work for Job {
             Job::Signal(fence, value) => signals.push((fence, value)),
             _ => {}
         }
-        *self = Job::Joined(queue, lists, order, parts, signals);
+        *self = Job::Joined(queue, lists, order, parts, signals, written.or(known));
         Ok(run)
     }
 
@@ -650,7 +659,7 @@ impl Work for Job {
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
-            Job::Joined(queue, lists, order, parts, signals) => {
+            Job::Joined(queue, lists, order, parts, signals, _) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
@@ -720,7 +729,7 @@ const JOINED: usize = 10;
 /// Where the joining of parts ended ([`Job::take_along`]), from here on by
 /// why: nothing behind it in its queue yet, the next not translated yet, a
 /// memory value or a fence the next waits for not met, the most parts or
-/// lists, the next reads what those before it write ([`crate::host::joinable`]),
+/// lists, the next reads what those before it write ([`crate::host::joinable_after`]),
 /// a present or another, the next changes title memory on the CPU.
 const NOT_JOINED: usize = 11;
 const NONE_BEHIND: usize = 0;

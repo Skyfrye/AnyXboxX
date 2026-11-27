@@ -53,6 +53,10 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// How many ranges `pending` holds, set under its lock: whether shaders
+    /// may be writing the copy is asked of thousands of copies a submission
+    /// ([`Shadow::writes_pending`]).
+    pending_now: std::sync::atomic::AtomicUsize,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -3612,6 +3616,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_now: std::sync::atomic::AtomicUsize::new(0),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3690,6 +3695,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_now.store(pending.len(), Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3714,6 +3720,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.pending_now.store(pending.len(), Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -4003,6 +4010,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.pending_now.store(pending.len(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -4067,7 +4075,10 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        // (Set under the lock where the ranges change: the same answer, as
+        // of a moment, without the lock, 1.2% of the submitting thread's
+        // time in run s2-b1.)
+        self.pending_now.load(Ordering::Acquire) != 0
     }
 
     /// Whether one of those submissions may be writing in title memory
@@ -4234,12 +4245,16 @@ impl Shadow {
             let t = under_ns(3, t);
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
+            let done: Vec<Done> = done.into_iter().map(|runs| runs.into_inner().unwrap_or_else(|e| e.into_inner())).collect();
             // The runs of all the pages, noted at once (`card.dirty` is
-            // sorted and joined when it is taken).
-            let mut changed: Vec<(usize, usize)> = Vec::new();
+            // sorted and joined when it is taken). Room for all of them at
+            // once: some 100,000 a frame, and growing to them was 1.7% of
+            // the submitting thread's time (run s2-prof1).
+            let mut changed: Vec<(usize, usize)> =
+                Vec::with_capacity(if self.card.is_some() { done.iter().flatten().map(Vec::len).sum() } else { 0 });
             let (mut runs_in, mut bytes_in) = (0u64, 0u64);
             for (i, runs) in done.into_iter().enumerate() {
-                let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+                let Some(runs) = runs else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
@@ -4384,14 +4399,18 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        // (Most copies have no range shaders may be writing: no lock then.)
+        let mut busy: Vec<(usize, usize)> = if self.pending_now.load(Ordering::Acquire) == 0 {
+            Vec::new()
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -4428,7 +4447,9 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.pending_now.load(Ordering::Acquire) != 0
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -5347,6 +5368,24 @@ mod land_tests {
         *seed ^= *seed >> 7;
         *seed ^= *seed << 17;
         (*seed >> 8) as usize
+    }
+
+    /// Whether shaders may be writing the copy follows its declared ranges:
+    /// yes from the first one declared, no once every one is copied back.
+    #[test]
+    fn shaders_writing_follows_the_declared_ranges() {
+        let title = memory(PIECE, false);
+        let Some(shadow) = copy_of(title, PIECE) else {
+            return; // no host GPU
+        };
+        assert!(!shadow.writes_pending());
+        shadow.writing(title, 64);
+        shadow.writing(title + 128, 64);
+        assert!(shadow.writes_pending());
+        shadow.copy_back_done(&[(title, title + 64)]);
+        assert!(shadow.writes_pending(), "one range is still declared");
+        shadow.copy_back_done(&[(title + 128, title + 192)]);
+        assert!(!shadow.writes_pending());
     }
 
     /// [`Shadow::land_card`] leaves title memory and the CPU's side as
