@@ -35,7 +35,8 @@
 //! (`ours`'s bench), and stamps keep the card from overlapping the work on
 //! either side of them: a timed frame runs somewhat longer than the
 //! others, which are not touched. Every 5 s a line ranks the pipelines
-//! that took the most time a timed frame ([`rank`]).
+//! that took the most time a timed frame ([`rank`]), with what their
+//! programs are ([`props`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -49,6 +50,7 @@ use super::{Host, host};
 use crate::pipeline::Shader;
 use crate::pipeline::host::HostPipeline;
 
+mod props;
 mod rank;
 
 pub(crate) use rank::Target;
@@ -634,7 +636,7 @@ pub(crate) fn line() {
     if totals.frames == 0 {
         return;
     }
-    let text = rank::text(&totals, clock.per_ms, every(), TOP, |_| String::new());
+    let text = rank::text(&totals, clock.per_ms, every(), TOP, props::text);
     tracing::info!("{text}");
 }
 
@@ -649,7 +651,7 @@ fn stage(stage: &str) -> &'static str {
     }
 }
 
-/// The shaders a row names: those of a pipeline.
+/// The shaders a row names, for [`props`]: those of a pipeline.
 fn shaders(work: &Work) -> impl Iterator<Item = &Arc<Shader>> {
     let none: &[Option<Arc<Shader>>] = &[];
     match work {
