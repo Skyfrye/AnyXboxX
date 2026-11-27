@@ -51,6 +51,8 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Resolves the light that opaque surfaces reflect (`sr_denoising`).
+    Specular,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +64,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_TemporalResolve2_Opaque") {
+        Some(Role::Specular)
     } else {
         None
     }
@@ -75,6 +79,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the reflected light's resolve writes it (R9G9B9E5 as 32-bit
+/// integers, as the diffuse light).
+pub(crate) const SPECULAR: (u8, u32) = (1, 128);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -109,6 +116,28 @@ fn air() -> f32 {
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
+/// The most the light opaque surfaces reflect may be, as a multiple of the
+/// light around (`VICTORY_AMBIENT_SPECULAR=<multiple>`; unset or 0: what the
+/// title has).
+///
+/// Without structures the reflection rays that the screen does not answer
+/// miss, and their fallback is the sky: a room's glossy surfaces reflect
+/// the sky's light, the eyes of everyone indoors a bright blue-white
+/// (Lucia looking up in the diner, capture skin rec1: 1.4, 3.7, 10.7 where
+/// the light around is about 0.8). The bound is of the light around at the
+/// pixel's own depth, as the resolve's stand-in found it (`estimate`).
+/// With 1.5, run a2: her eyes looking up at the menu board as the room
+/// lights them, as with the builder (m1-rt), against bright blue-white
+/// where the bound did not run (c1). Off unless set: it changes the picture.
+/// shortcut: a bound of the luminance; the colour stays the sky's.
+fn specular() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| match std::env::var("VICTORY_AMBIENT_SPECULAR") {
+        Ok(v) => v.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(0.0),
+        Err(_) => 0.0,
     })
 }
 
@@ -199,7 +228,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3), UAV(u4)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -209,7 +238,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
-    float jump; float fresh; float dt;
+    float jump; float fresh; float dt; uint estimating;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -220,6 +249,10 @@ RWStructuredBuffer<float4> points : register(u2);
 // For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
 // what the title's resolve left, what was found and what was written.
 RWByteAddressBuffer stats : register(u3);
+// The light around each pixel as the last resolve's stand-in found it (its
+// luminance, by the pixel's place in the picture), for the reflected light's
+// bound: taken at the pixel's own depth.
+RWStructuredBuffer<float> estimate : register(u4);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
@@ -330,7 +363,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
+#if defined(RAISE) || defined(SPECULAR)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -344,6 +377,27 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
+
+#ifdef SPECULAR
+// No more than `most` times the light around, as the resolve's stand-in
+// found it at this pixel's depth (`estimate`; the reflected light's program
+// names no depth of the scene to find it here).
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void bound_specular(uint3 at : SV_DispatchThreadID) {
+    // (A root view has no size to ask: the host says whether the picture
+    // fits the buffer.)
+    if (at.x >= width || at.y >= height || estimating == 0) return;
+    uint ei = at.y * width + at.x;
+    float3 was = unpack(light[at.xy]);
+    float has = dot(was, LUMA);
+    float top = max(estimate[ei] * most, 1e-6);
+    if (has > top) light[at.xy] = pack(was * (top / has));
+}
+#endif
+
+#ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -375,9 +429,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
+    uint ei = at.y * width + at.x;
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
         light[p] = pack(found);
+        if (estimating != 0) estimate[ei] = dot(found, LUMA);
         return;
     }
     // Between the four points around, those at its own depth first; which
@@ -399,6 +455,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
         sum += w;
     }
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    if (estimating != 0) estimate[ei] = dot(all, LUMA);
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
@@ -430,6 +487,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
+/// The per-pixel light around the reflected light's bound reads: a float a
+/// pixel, up to 3840x2160 (past that, pixels are left as the title has them).
+const ESTIMATE_BYTES: u64 = 3840 * 2160 * 4;
 /// Where the slow mean is among the cells (float4s).
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
 
@@ -441,7 +501,9 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    specular: ID3D12PipelineState,
     cells: ID3D12Resource,
+    estimate: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
 }
@@ -473,6 +535,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let specular = pipeline("SPECULAR", s!("bound_specular"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -482,7 +545,10 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        specular,
         cells: made(CELL_BYTES)?,
+        // (Without the bound, one float: the passes write past it nothing.)
+        estimate: made(if self::specular() > 0.0 { ESTIMATE_BYTES } else { 4 })?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
     })
@@ -513,6 +579,11 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     // SAFETY: an open list; the barrier names no resource.
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
+
+/// The size of the picture the last resolve's stand-in found the light
+/// around for (`estimate`; width in the high half, 0: none yet): the
+/// reflected light's bound reads it only for a picture of that size.
+static ESTIMATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
@@ -548,32 +619,44 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    static SAID: Mutex<u32> = Mutex::new(0);
+    let size = u64::from(views.size[0]) << 32 | u64::from(views.size[1]);
+    if role == Role::Specular && (specular() == 0.0 || ESTIMATED.load(Ordering::Relaxed) != size) {
+        return false;
+    }
+    // The first few of each role.
+    static SAID: Mutex<[u32; 4]> = Mutex::new([0; 4]);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 4 {
-            *said += 1;
+        let n = &mut said[role as usize];
+        if *n < 2 {
+            *n += 1;
             tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
     list.keep(&pass.stats);
+    list.keep(&pass.estimate);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = if role == Role::Specular { specular() } else { 4.0f32 }.to_bits();
     words[10] = air().to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    // The light around each pixel is kept for the reflections' bound, where
+    // the picture fits its buffer.
+    words[15] = u32::from(
+        specular() > 0.0 && u64::from(views.size[0]) * u64::from(views.size[1]) * 4 <= ESTIMATE_BYTES,
+    );
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -581,12 +664,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(6, pass.estimate.GetGPUVirtualAddress());
         let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
@@ -599,7 +683,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Specular => run(&pass.specular, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
+                ESTIMATED.store(size, Ordering::Relaxed);
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
@@ -630,6 +716,7 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_TemporalResolve2_Opaque_FrameStatistics_357e0818_Wrapped.."), Some(Role::Specular));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 

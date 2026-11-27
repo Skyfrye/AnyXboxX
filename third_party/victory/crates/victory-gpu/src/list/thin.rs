@@ -87,12 +87,16 @@ impl Front {
         self.words.clear();
     }
 
-    /// Begins a recording, with `pipeline` bound.
+    /// Begins a recording, with `pipeline` bound (and, for the card's times
+    /// by pipeline, the frames presented as it begins: `crate::host::passes`).
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
         self.leave();
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        #[cfg(feature = "diagnostics")]
+        self.put(RESET, &[pipeline as u64, crate::host::passes::frame_now()]);
+        #[cfg(not(feature = "diagnostics"))]
         self.put(RESET, &[pipeline as u64]);
     }
 
@@ -753,6 +757,12 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 // (Only whether there is an allocator is looked at.)
                 let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
                 super::reset(list, allocator, w[0] as This);
+                // Timed by the frame the title began the recording in, not
+                // the one it is translated in.
+                #[cfg(feature = "diagnostics")]
+                if let Some(&frame) = w.get(1) {
+                    super::pass_arm(list, frame);
+                }
             }
             CLOSE => {
                 super::close(list);

@@ -1,10 +1,15 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
-indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
-card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
-default. **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
-for next to nothing (below).
+Status, 2026-11-27: **with `VICTORY_BVH_BUILDER=1` the picture is right**
+(the eyes, the rooms' light and reflections as the console has them, runs
+m1-rt, b1, r1), at 14 fps against 24-27 without it on the RTX 5080 at
+2560x1440 (run r1; 6 before the faults were made quiet). Off by default.
+**`VICTORY_AMBIENT=<share>`** puts an estimate of the indirect light in its
+place for next to nothing (below); what it does not mend is listed there.
+
+2026-11-25, midday: with the builder rooms got their indirect light (runs
+light-10, light-11, n19), for some 40 ms more of the card's time a frame
+(the dorm: 75 of 90 ms busy against 34 of 64).
 
 ## What the title does
 
@@ -123,6 +128,29 @@ dispatches, faults and what came.
   commands 84 ms): `CopyForBVHUpdate` 13.3 ms in 63 dispatches (before the
   bound), traces 24 ms (`RaytraceVBuffer` 7.9, screen probes 6.4, irradiance
   cache 3.5, primary probes 2.3, shadows 1.6).
+- The card's time with the builder on the combined base (run m1-rt,
+  2026-11-27, RTX 5080 at 2560x1440, diner and prison cell, a diagnostics
+  build with `VICTORY_PASS_TIMES=1`; 16 timed frames): 107 ms a frame against
+  some 27 without it. The builder's own programs take 3.7 ms of that
+  (`XboxBvhBuilder` 1.5, `FIndexBufferOffset` 1.0); the walks the rest:
+  `CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed_ShaderBinning_WithFar`
+  45.4 ms (19 to 126 ms from frame to frame), `CS_RaytraceVBuffer` (the
+  reflections) 14.7 ms, the irradiance cache's walks
+  (`CS_IrradianceCache_GatherVBuffer_WithFar` 6.4, `CS_GatherAlphaVBuffer`
+  2.1, `CS_Primary_GatherVBuffer` 1.4) and shadows 2.2 ms; the programs that
+  shade hits 0.4 ms. So building only part of the structures saves next to
+  nothing: what costs is the emulated walk (a look in the directory, a view
+  picked from the heap and the node's loads, one after another, for every
+  node of every ray). With it the picture is right: no blocks, eyes as the
+  room lights them.
+- Most of that walk was the faults: a lane that finds a page without a copy
+  notes it in the PC's memory, over the bus, and pages that are never taken
+  (not the title's, or after the first 2,048) were noted by every ray in
+  every frame. They are quiet now (`memory.rs`, `VICTORY_BVH_QUIET=0`: as
+  before): run b1 against m1-rt, the last eight timed frames (prison cell),
+  57 ms a frame against 113, the screen probes' walk 6.8 ms against 44.9, the
+  reflections' 7.8 against 17.1; 13-14 fps steady against 4-7 (diagnostics
+  builds), the same picture.
 - Captures made on 2026-11-25 (builder on or off) hang the card in a replay
   (cause unknown; do not try).
 - Five shadow-mask trace programs do not translate (a structure's address out
@@ -159,8 +187,36 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_SPECULAR=<multiple>` | the light opaque surfaces reflect, after its resolve (`CS_TemporalResolve2_Opaque`), is bounded by a multiple of the light around each pixel as the resolve's stand-in found it (off unless set) |
 
-It is off while the builder runs.
+The reflections can be bounded too (`VICTORY_AMBIENT_SPECULAR`): their rays
+that the screen does not answer miss, and their fallback is the sky, so
+indoors glossy surfaces and eyes reflect the sky's light. The resolve is
+dispatched indirectly, and the per-pixel light around was asked its size
+through a root view, which has none: before 2026-11-27 the bound never ran.
+With 1.5 (run a2) Lucia's eyes looking up at the menu board are as the room
+lights them, as with the builder (m1-rt), where without the bound they are a
+glowing blue-white (c1; also with the builder running and only the shadows'
+walks finding anything, run p1: it is the reflections, not the lamps'
+shadows). Off unless set, as it changes the picture.
+
+Tried and not kept (2026-11-27):
+
+- Making every ray miss while the builder is off (the walks given a
+  directory of nothing, so the title's own programs for misses answer them;
+  run c1, without a working reflections' bound) brought the sky into every
+  reflection, the diner's floor and tables blue, and left the blocks below.
+- The builder with only the shadows' walks finding anything (run p1): 18.8
+  fps median, 22-23 steady, the eyes as without it.
+
+Not mended: the band of 16x16 blocks along the bottom of the picture in the
+prison cell (sky blue and streaks of the yard), and blocks by the diner's
+window: they are there with the builder on too (runs m1-rt, b1), so they are
+not the rays.
+
+It is off while the builder runs (`VICTORY_BVH_BUILDER=1`: see the card's
+time above; with quiet pages 14.1 fps median and 14-15 steady over the diner and the cell, run r1, against 24-27
+without it, on the RTX 5080 at 2560x1440).
 
 ## Where to look
 

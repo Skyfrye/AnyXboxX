@@ -609,6 +609,10 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// What draws draw into, for the card's times by pipeline
+    /// (`crate::host::passes`; looked at only in a timed recording).
+    #[cfg(feature = "diagnostics")]
+    pass_target: crate::host::passes::Target,
 }
 
 impl Drop for State {
@@ -1351,6 +1355,10 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        #[cfg(feature = "diagnostics")]
+        if list.pass_timed().is_some() {
+            self.pass_target = pass_target(&views, dsv.as_ref().map(|(texture, _)| *texture));
+        }
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1726,6 +1734,10 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // What is recorded from here on for the draw or dispatch is its
+        // pipeline's, when the card's times are taken by pipeline.
+        #[cfg(feature = "diagnostics")]
+        list.pass_open(p, if compute { Default::default() } else { self.pass_target });
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -3471,6 +3483,16 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.after_dispatch(list, p);
+        #[cfg(feature = "diagnostics")]
+        self.dispatch_dump(list, p, None);
+    }
+
+    /// Our passes after a dispatch of `p`, direct or indirect: the stand-in
+    /// for the indirect light (`crate::ambient`) and the light probe. The
+    /// title dispatches some of the programs they follow indirectly (the
+    /// reflections' resolve, `sr_denoising:CS_TemporalResolve2_Opaque`).
+    fn after_dispatch(&mut self, list: &HostList, p: &HostPipeline) {
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -3481,8 +3503,6 @@ impl State {
         if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
             self.light_probe(list, p, true);
         }
-        #[cfg(feature = "diagnostics")]
-        self.dispatch_dump(list, p, None);
     }
 
     /// `crate::dispatchdump` after a dispatch of `p` (with the arguments
@@ -3547,7 +3567,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, SPECULAR, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3556,18 +3576,19 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Specular => SPECULAR,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Specular => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Specular) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
@@ -4844,6 +4865,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        list.pass_indirect();
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -4857,12 +4880,41 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.after_dispatch(list, p);
             #[cfg(feature = "diagnostics")]
             self.dispatch_dump(list, p, Some((&bounded, at)));
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+/// What draws into `views` (with the depth texture `depth`) draw into, for
+/// the card's times by pipeline (`crate::host::passes`): the first render
+/// target's view format and its texture's size, or the depth texture's
+/// format and size when no render target has a texture.
+#[cfg(feature = "diagnostics")]
+fn pass_target(
+    views: &[(Option<&ID3D12Resource>, Option<D3D12_RENDER_TARGET_VIEW_DESC>)],
+    depth: Option<&ID3D12Resource>,
+) -> crate::host::passes::Target {
+    let target = crate::host::passes::Target {
+        count: views.len().min(usize::from(u8::MAX)) as u8,
+        depth: depth.is_some(),
+        ..Default::default()
+    };
+    let first = views.iter().find_map(|(texture, desc)| texture.map(|t| (t, desc.map_or(0, |d| d.Format.0 as u32))));
+    let Some((texture, format)) = first.or(depth.map(|t| (t, 0))) else {
+        return target;
+    };
+    // SAFETY: a host texture the list binds, alive while it records.
+    let desc = unsafe { texture.GetDesc() };
+    crate::host::passes::Target {
+        format: if format != 0 { format } else { desc.Format.0 as u32 },
+        width: u32::try_from(desc.Width).unwrap_or(u32::MAX),
+        height: desc.Height,
+        ..target
     }
 }
 

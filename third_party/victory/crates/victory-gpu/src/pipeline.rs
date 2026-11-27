@@ -249,6 +249,31 @@ impl Shader {
         let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
         victory_shader::native_programs(part.data).ok()
     }
+
+    /// The program's name as its container holds it, for reports: the
+    /// identifier that ends in `_Wrapped` (the title's shaders), else the
+    /// longest identifier of at least 12 characters; `None` if neither.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn title_name(&self) -> Option<String> {
+        title_name(&self.container)
+    }
+}
+
+/// [`Shader::title_name`] of a container's bytes.
+#[cfg(feature = "diagnostics")]
+fn title_name(container: &[u8]) -> Option<String> {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+    let runs = container.split(|&b| !word(b)).filter(|r| r.len() >= 12);
+    let mut longest: Option<&[u8]> = None;
+    for run in runs {
+        if run.ends_with(b"_Wrapped") {
+            return Some(String::from_utf8_lossy(run).into_owned());
+        }
+        if longest.is_none_or(|l| run.len() > l.len()) {
+            longest = Some(run);
+        }
+    }
+    longest.map(|l| String::from_utf8_lossy(l).into_owned())
 }
 
 #[cfg(windows)]
