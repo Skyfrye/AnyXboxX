@@ -760,22 +760,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(read.sums[Kind::Submission.index()][1], 64 * 5 - 48);
     }
 
-    /// A pair around a pass says how long the pass ran, and is read once;
-    /// a pair whose list never ran is not read. (Run with the others on
-    /// WARP, or `-- --ignored` for the card's times.)
+    /// A pair around a pass holds how long the pass ran; a pair whose list
+    /// never ran holds nothing. Each is looked at in its own slot, not in
+    /// the sums, which other tests' passes in the same process add to (and
+    /// which [`take`] empties). Reading a pair once is
+    /// `a_pair_taken_again_before_it_was_read_is_counted`'s. (Run with the
+    /// others on WARP, or `-- --ignored` for the card's times.)
     #[test]
     fn a_pair_times_the_pass_it_is_around() {
         take_times();
         let Some(host) = host() else {
             return;
         };
-        if !on() || clock().is_none() {
+        let Some(clock) = clock() else {
             return;
-        }
+        };
         let pass = long_pass(host);
-        let _ = take();
         // Recorded, never run.
-        {
+        let never = {
             // SAFETY: a list of the test's own, never sent.
             let list: ID3D12GraphicsCommandList = unsafe {
                 let allocator: ID3D12CommandAllocator =
@@ -784,25 +786,27 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let mut pairs = Pairs::default();
             let mark = pairs.begin(&list, Kind::Planes);
+            let at = mark.as_ref().map(|m| m.0).unwrap();
             pairs.end(&list, mark);
             pairs.resolve(&list);
-        }
+            at
+        };
+        let mut around = None;
         let started = std::time::Instant::now();
         run(host, |list| {
             timing(list, |pairs| {
                 let mark = pairs.begin(list, Kind::Compares);
+                around = mark.as_ref().map(|m| m.0);
                 dispatch(list, &pass, 4096);
                 pairs.end(list, mark);
             })
         });
         let wall = started.elapsed().as_secs_f64() * 1e3;
-        let sums = take().unwrap();
-        let (ms, pairs) = sums[Kind::Compares.index()];
-        assert_eq!(pairs, 1, "{sums:?}");
-        assert_eq!(sums[Kind::Planes.index()].1, 0, "a pair that never ran");
-        assert!(ms > 0.0 && ms <= wall + 1.0, "{ms} ms timed, {wall} ms waited");
-        // Read once.
-        assert_eq!(take().unwrap()[Kind::Compares.index()].1, 0);
+        let [from, to] = clock.slots.stamps(around.unwrap()).map(|s| s.load(Ordering::Relaxed));
+        let ms = to.saturating_sub(from) as f64 / clock.per_ms;
+        assert!(from > 0 && to > from, "{from} to {to}");
+        assert!(ms <= wall + 1.0, "{ms} ms timed, {wall} ms waited");
+        assert_eq!(clock.slots.stamps(never).map(|s| s.load(Ordering::Relaxed)), [0, 0], "a pair that never ran");
     }
 
     /// A timestamp is written when what was recorded before it has run: a
