@@ -713,22 +713,59 @@ fn current_copy(view: &View) -> bool {
         return false;
     }
     let first = crate::resource::first_mip(desc);
-    let Some((_, bytes)) = crate::texture::title_span(texture, first) else {
-        return false;
-    };
-    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-    static SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Charged what the comparison reads: from the level the copy holds on,
+    // which may lie below the view's (charged the view's levels alone, a
+    // view of a texture's small levels read the whole texture).
+    match crate::texture::unchanged_within(texture, first, |bytes| compared(bytes, budget)) {
+        Some(same) => {
+            CURRENT_COPIES[1].fetch_add(u64::from(same), Relaxed);
+            same
+        }
+        None => {
+            CURRENT_COPIES[2].fetch_add(1, Relaxed);
+            false
+        }
+    }
+}
+
+/// Whether [`current_copy`] may read `bytes` more of title memory this frame,
+/// within `budget` ([`mirror_current`]); if so they are counted. (Tests: the
+/// frame's bytes are each thread's, with a budget of its own if it set one:
+/// other tests' writes in the same frame do not take them.)
+fn compared(bytes: u64, budget: u64) -> bool {
     let frame = crate::frame::current();
-    if FRAME.swap(frame, Relaxed) != frame {
-        SPENT.store(0, Relaxed);
+    #[cfg(test)]
+    {
+        let budget = COMPARE_IN_TEST.get().unwrap_or(budget);
+        let (at, spent) = COMPARED_HERE.get();
+        let spent = if at == frame { spent } else { 0 };
+        let more = spent.saturating_add(bytes);
+        COMPARED_HERE.set((frame, if more > budget { spent } else { more }));
+        more <= budget
     }
-    if SPENT.fetch_add(bytes, Relaxed).saturating_add(bytes) > budget {
-        CURRENT_COPIES[2].fetch_add(1, Relaxed);
-        return false;
+    #[cfg(not(test))]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        static SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if FRAME.swap(frame, Relaxed) != frame {
+            SPENT.store(0, Relaxed);
+        }
+        // (What is refused is not counted: a smaller texture may still fit.)
+        if SPENT.fetch_add(bytes, Relaxed).saturating_add(bytes) > budget {
+            SPENT.fetch_sub(bytes, Relaxed);
+            return false;
+        }
+        true
     }
-    let same = crate::texture::unchanged(texture, first);
-    CURRENT_COPIES[1].fetch_add(u64::from(same), Relaxed);
-    same
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`compared`]'s budget for this thread, and the frame and the bytes it
+    /// took then.
+    static COMPARE_IN_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static COMPARED_HERE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) };
 }
 
 /// Texture slots made to show the [`neutral`] stand-in and made null, since
@@ -6450,6 +6487,37 @@ mod tests {
         assert!(heap.shows_none(2), "waits for its pass");
         let stand_in = neutral(Neutral::Flat).unwrap();
         assert_eq!(heap.kept_in(2).map(|r| r.as_raw()), Some(stand_in.as_raw()));
+    }
+
+    /// The bytes a frame's slot writes may compare with their copies are
+    /// charged what the comparison reads: a view of a texture's smaller
+    /// levels whose copy holds the whole texture reads all of it, and within
+    /// a budget that holds the view's levels and not the texture it waits
+    /// for the pass. (It was charged the view's levels alone: a view of level
+    /// 2 of a 16 MB texture counted about 1 MB and read 16. Round 2's
+    /// review, item 3.)
+    #[test]
+    fn a_frames_comparisons_are_charged_what_they_read() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let Some((view, texture, copy)) = filled_placed(1024, 11, 2, 0x5a) else { return };
+        let (_, whole) = crate::texture::title_span(texture, 0).unwrap();
+        let (_, viewed) = crate::texture::title_span(texture, 2).unwrap();
+        assert!(viewed < whole / 4, "the view's levels {viewed} of {whole}");
+        // A budget for the view's levels, not for the whole texture.
+        COMPARE_IN_TEST.set(Some(whole / 2));
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, view.clone());
+        assert!(heap.mirror(1, handle, false).is_some());
+        assert!(heap.shows_none(1), "past the frame's budget: left to the pass");
+        // With room for all of it: the same view is made at once.
+        COMPARE_IN_TEST.set(Some(2 * whole));
+        let mut again = [0u32; 4];
+        let handle = write_record(&mut again, view);
+        assert!(heap.mirror(2, handle, false).is_some());
+        COMPARE_IN_TEST.set(None);
+        assert_eq!(heap.made.get(2), Some(record_key(handle)), "made at once");
+        assert_eq!(heap.kept_in(2).map(|r| r.as_raw()), Some(copy.texture.as_raw()));
     }
 
     /// A slot that goes on showing another record's texture while its new
