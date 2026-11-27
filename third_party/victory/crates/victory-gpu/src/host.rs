@@ -10070,6 +10070,27 @@ impl Meter {
                     );
                 }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
+                {
+                    // Over the frames since the last such line.
+                    static LAST: std::sync::Mutex<(u64, [u64; 2])> = std::sync::Mutex::new((0, [0; 2]));
+                    let now = crate::descriptor::host::RECYCLED.each_ref().map(|n| n.load(Ordering::Relaxed));
+                    let frame = crate::frame::current();
+                    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                    let frames = frame.saturating_sub(last.0).max(1) as f64;
+                    let [table, other] = [0, 1].map(|i| now[i].saturating_sub(last.1[i]) as f64 / frames);
+                    *last = (frame, now);
+                    let [over, held] =
+                        [0, 1].map(|i| crate::descriptor::host::KEPT_OVERWRITES[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "uploads into a host copy another slot showed for a texture that moved away, since the start: \
+                         {over}, {held} of them held back until that slot's own copy came (VICTORY_KEPT_FIRST)"
+                    );
+                    tracing::info!(
+                        "texture slots made from another record while a draw had read them through a table in this frame                          or the one before (its lists may read the new one), a frame lately: {table:.1} by a draw's table,                          {other:.1} otherwise; since the start: {}, {}",
+                        now[0],
+                        now[1]
+                    );
+                }
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");
                 }
