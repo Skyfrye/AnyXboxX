@@ -3375,24 +3375,29 @@ fn joins_asked() -> (usize, usize) {
     (parts, lists)
 }
 
-/// Whether the part `next` can be prepared together with `ahead`, which goes
-/// before it and has not been sent: nothing done on the CPU for it reads what
-/// those give their shaders, write back or write when they are done, and it
-/// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
-pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if writes_title_memory(next) {
-        return false;
-    }
-    let ahead: Vec<&HostList> = ahead.collect();
-    let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
-    for list in &ahead {
+/// Whether the part `next` can be prepared together with the parts ahead
+/// of it, which have not been sent: nothing done on the CPU for it reads
+/// `written`, what those give their shaders, write back or write when they
+/// are done ([`written_by`]); the caller has seen that it changes no title
+/// memory that they read ([`writes_title_memory`]). The line keeps
+/// `written` for the parts it joins and adds each part's as it takes it
+/// along; each try went over all the parts ahead again before (0.5 ms a
+/// frame of the submitting thread, run s2-b1).
+pub(crate) fn joinable_after(written: &[(usize, usize)], next: &[&HostList]) -> bool {
+    blocked_by(written, next, false).is_none()
+}
+
+/// `written` (joined) and what the shaders of `lists` may write, write back or
+/// write when they are done, joined ([`joinable_after`]).
+pub(crate) fn written_by(lists: &[&HostList], mut written: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut more: Vec<(usize, usize)> = declared_writes(lists).into_iter().flat_map(|(_, ranges)| ranges).collect();
+    for list in lists {
         let deferred = list.deferred();
-        written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
-        written.extend(deferred.backs.iter().map(|(_, at, rows)| (at + rows.title_start, at + rows.title_start + rows.title_span())));
+        more.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
+        more.extend(deferred.backs.iter().map(|(_, at, rows)| (at + rows.title_start, at + rows.title_start + rows.title_span())));
     }
-    let mut joined = Vec::new();
-    join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    join_ranges(&mut written, more);
+    written
 }
 
 /// Whether a step of `lists` on the CPU changes title memory ([`Step::Copy`],
