@@ -45,17 +45,19 @@
 //! read is merged after this. While the read waits, that thread lands what
 //! is ahead of the flight read, and not it ([`landing_limit`]).
 //!
-//! Where that cannot be said the old wait is taken ([`needs`], [`plan`]): a
-//! step of ours that may read or write anything; a title buffer copy into
-//! memory flights may write (it must land over what they wrote, after them,
-//! and the submission's own refreshes would leave it out); a copy at its
-//! place that waits; what a copy done on the card wrote read through
-//! another host copy; a texture's or a copy's bytes read back there, or a
-//! value written there behind a flight (a landing writes those); two host copies
-//! written over the same title memory; more than [`MOST`] bytes to bring
-//! back; a copy in the card's memory without the relay's copy queue
-//! (`VICTORY_RELAY_COPY=1`), where the landing's fetches go to the drawing
-//! queue and a fetch beside it would be new.
+//! Where that cannot be said the old wait is taken ([`needs`], [`plan`],
+//! [`Plan::fits`]), and the reason is told before anything is waited for
+//! where it can be: a step of ours that may read or write anything; a title
+//! buffer copy into memory flights may write (it must land over what they
+//! wrote, after them, and the submission's own refreshes would leave it
+//! out); a copy at its place that waits; what a copy done on the card wrote
+//! read through another host copy; a texture's or a copy's bytes read back
+//! there, or a value written there behind a flight (a landing writes those);
+//! two host copies written over the same title memory; more than [`MOST`]
+//! bytes to bring back; a copy in the card's memory without the relay's copy
+//! queue (`VICTORY_RELAY_COPY=1`), where the landing's fetches go to the
+//! drawing queue and a fetch beside it would be new; a copy in the PC's
+//! memory without its snapshot.
 
 use std::sync::Arc;
 
@@ -79,20 +81,21 @@ const MOST: usize = 16 << 20;
 /// microseconds bringing back; bytes brought back; of them bytes put into
 /// title memory; parts of copies in the PC's memory and in the card's;
 /// reads that took the old wait; microseconds of the fetches; microseconds
-/// waiting for landings (of the flights ahead, or one in its course).
-static STATS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+/// waiting for landings (of the flights ahead, or one in its course); of
+/// the reads that took the old wait, microseconds they had waited before.
+static STATS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 /// Why reads took the old wait, since the last frame-rate line.
 static REFUSED: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
-fn refused(why: &'static str) -> bool {
+/// A read takes the old wait for `why`.
+fn refused(why: &'static str) {
     STATS[8].fetch_add(1, Ordering::Relaxed);
     let mut all = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|(w, _)| *w == why) {
         Some((_, n)) => *n += 1,
         None => all.push((why, 1)),
     }
-    false
 }
 
 /// For the frame-rate line.
@@ -108,7 +111,8 @@ pub(super) fn log(frames: f64) {
         "title memory read under flights, per frame (VICTORY_READ_WAIT=0: until the flights have landed): {:.2} reads waited \
          for the card's fence and the landings ahead of it, behind {:.1} flights each, {:.1} ms for the card, {:.2} ms for \
          the landings, then {:.2} ms bringing back {:.1} KB ({:.1} KB of it new to title memory; {:.1} parts of copies in the \
-         PC's memory, {:.1} fetched from the card's in {:.2} ms); {:.2} waited for landings{}{}",
+         PC's memory, {:.1} fetched from the card's in {:.2} ms); {:.2} waited for landings ({:.1} ms of it before they \
+         were refused){}{}",
         s[0],
         if s[0] > 0.0 { s[1] / s[0] } else { 0.0 },
         s[2] / 1000.0,
@@ -120,6 +124,7 @@ pub(super) fn log(frames: f64) {
         s[7],
         s[9] / 1000.0,
         s[8],
+        s[11] / 1000.0,
         if refused.is_empty() { "" } else { ": " },
         refused.join("; "),
     );
@@ -204,6 +209,23 @@ struct Plan {
     /// The send to copies in the card's memory those flights ran behind
     /// (`CardPlan::sent_as`; 0: none).
     sent: u64,
+}
+
+impl Plan {
+    /// Whether what it brings back can be brought back; asked as soon as
+    /// it is made, before anything is waited for, and again just before.
+    fn fits(&self) -> Result<(), &'static str> {
+        let carded = self.back.iter().any(|p| p.0.carded());
+        // A fetch on a queue of its own, beside the flights that follow, is
+        // what the relay does only with its switch: without it, as before.
+        if carded && !relay_copy() {
+            return Err("copies in the card's memory are fetched on the drawing queue (VICTORY_RELAY_COPY=0)");
+        }
+        if self.back.iter().any(|(shadow, ..)| !shadow.carded() && !shadow.snapshot_held()) {
+            return Err("a copy in the PC's memory holds no snapshot");
+        }
+        Ok(())
+    }
 }
 
 /// What lies of `[a, b)`, a declared write of `shadow`, in what is read
@@ -373,32 +395,51 @@ impl Host {
     /// the air may write, and the card does not do it ([`card_steps`]):
     /// waits for the card to have run the last flight that declared a write
     /// over what is read, and for the flights ahead of it to land, and
-    /// brings that back into title memory (see the file). Whether that was
-    /// done; if not, the caller waits as before.
-    /// Under the submission lock (`submitted`), whose event it waits with.
-    pub(super) fn read_wait(&self, submitted: &mut u64, runs: &[&HostList]) -> bool {
+    /// brings that back into title memory (see the file). If that was not
+    /// done, the caller waits for the landings as before, counted from the
+    /// moment given (`Err(Some(..))`: this waited already) or from its own
+    /// wait (`Err(None)`). Under the submission lock (`submitted`), whose
+    /// event it waits with.
+    pub(super) fn read_wait(&self, submitted: &mut u64, runs: &[&HostList]) -> Result<(), Option<std::time::Instant>> {
         let _ = submitted;
         let (written, copies) = {
             let line = line();
             (line.written.clone(), card_steps::copies(&line))
         };
         if card_steps::copied_read(&copies, runs) {
-            return refused("what a copy done on the card wrote is read through another host copy");
+            refused("what a copy done on the card wrote is read through another host copy");
+            return Err(None);
         }
         let needs = match needs(&written, runs) {
             Ok(needs) if !needs.is_empty() => needs,
             // (What blocked it is not among the reads: as before.)
-            Ok(_) => return refused("no read of what flights write was found"),
-            Err(why) => return refused(why),
+            Ok(_) => {
+                refused("no read of what flights write was found");
+                return Err(None);
+            }
+            Err(why) => {
+                refused(why);
+                return Err(None);
+            }
         };
         let began = std::time::Instant::now();
         let _waiting = crate::timeline::span("waiting for the card: title memory read");
         let (mut card_us, mut landing_us, mut flights) = (0u64, 0u64, 0usize);
+        let mut waited = false;
         // Lets the thread that lands flights take them all again.
         let release = |mut line: std::sync::MutexGuard<'_, Line>| {
             (line.reading, line.hold) = (false, 0);
             drop(line);
             RELAY_MOVED.notify_one();
+        };
+        // Refused once something was waited for: that time is the old
+        // wait's ([`relay_wait_since`]).
+        let late = |why: &'static str, waited: bool| {
+            refused(why);
+            waited.then(|| {
+                STATS[11].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                began
+            })
         };
         let mut held = line();
         loop {
@@ -406,10 +447,16 @@ impl Host {
             // be older than what is brought back here.
             if held.settling {
                 held = landings(held, &mut landing_us);
+                waited = true;
                 continue;
             }
             let plan = match plan(&held.line, &needs) {
                 Ok(Some(plan)) => plan,
+                // Nothing in the air writes it: as if nothing blocked it.
+                Ok(None) if !waited => {
+                    release(held);
+                    return Ok(());
+                }
                 // Landed meanwhile: title memory holds it.
                 Ok(None) => {
                     release(held);
@@ -417,9 +464,13 @@ impl Host {
                 }
                 Err(why) => {
                     release(held);
-                    return refused(why);
+                    return Err(late(why, waited));
                 }
             };
+            if let Err(why) = plan.fits() {
+                release(held);
+                return Err(late(why, waited));
+            }
             flights = flights.max(plan.flights);
             // From here on what is ahead of it lands meanwhile, and not it.
             if held.hold != plan.fence {
@@ -430,6 +481,7 @@ impl Host {
             if unsafe { self.fence.GetCompletedValue() } < plan.fence {
                 drop(held);
                 card_us += self.card_wait(plan.fence);
+                waited = true;
                 held = line();
                 continue;
             }
@@ -437,6 +489,7 @@ impl Host {
             // bytes never reach title memory before an earlier flight's.
             if plan.flights > 1 {
                 held = landings(held, &mut landing_us);
+                waited = true;
                 continue;
             }
             // The card has run it, and it is the first of the line: no
@@ -453,7 +506,7 @@ impl Host {
                     STATS[5].fetch_add(put, Ordering::Relaxed);
                     COPY_BACK[1].fetch_add(put, Ordering::Relaxed);
                 }
-                Err(why) => return refused(why),
+                Err(why) => return Err(late(why, true)),
             }
             break;
         }
@@ -471,7 +524,7 @@ impl Host {
         SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         blamed(WHY_READ, us);
-        true
+        Ok(())
     }
 
     /// Waits for the host's fence to reach `fence`, standing as
@@ -501,16 +554,9 @@ impl Host {
     fn bring_back(&self, plan: &Plan) -> Result<(u64, u64), &'static str> {
         let (mut now, mut title) = (Vec::new(), Vec::new());
         let (mut bytes, mut put) = (0u64, 0u64);
-        // (Checked first: nothing is merged where something is refused.)
-        if plan.back.iter().any(|(shadow, ..)| !shadow.carded() && !shadow.snapshot_held()) {
-            return Err("a copy in the PC's memory holds no snapshot");
-        }
-        let carded: Vec<&(Arc<Shadow>, usize, usize)> = plan.back.iter().filter(|p| p.0.carded()).collect();
-        // A fetch on a queue of its own, beside the flights that follow, is
-        // what the relay does only with its switch: without it, as before.
-        if !carded.is_empty() && !relay_copy() {
-            return Err("copies in the card's memory are fetched on the drawing queue (VICTORY_RELAY_COPY=0)");
-        }
+        // (Asked again first: nothing is merged where something is refused.)
+        plan.fits()?;
+        let carded: Vec<&Part> = plan.back.iter().filter(|p| p.0.carded()).collect();
         if !carded.is_empty() {
             put += self.fetch_back(&carded, plan.sent)?;
             STATS[7].fetch_add(carded.len() as u64, Ordering::Relaxed);
@@ -766,6 +812,11 @@ mod tests {
         // More than the most.
         let line = [flight(5, vec![(copy(0x1000_0000, 64 << 20), vec![(0x1000_0000, 0x1400_0000)])], Vec::new())];
         assert!(plan(&line, &[(0x1000_0000, 0x1000_0000 + MOST + 1)]).is_err());
+        // A copy in the PC's memory without its snapshot: refused before
+        // anything is waited for.
+        let line = [flight(5, vec![(a.clone(), vec![(0x10_0000, 0x10_2000)])], Vec::new())];
+        let p = plan(&line, &[(0x10_0800, 0x10_0900)]).unwrap().unwrap();
+        assert!(!a.snapshot_held() && p.fits().is_err());
     }
 
     /// What steps read of what flights write, and the steps that take the

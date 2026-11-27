@@ -3557,8 +3557,15 @@ fn late_threads() {
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    relay_wait_since(why, done, None);
+}
+
+/// [`relay_wait`], counted as one settle with a wait for the same reason
+/// that began at `since`, if given: the time is counted from then, the
+/// settle once, waited for now or not.
+fn relay_wait_since(why: usize, done: impl Fn(&Line) -> bool, since: Option<std::time::Instant>) {
     let mut line = line();
-    if done(&line) {
+    if since.is_none() && done(&line) {
         return;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -3580,7 +3587,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     drop(line);
     stood(waiting);
     working(was_working);
-    let us = waiting.elapsed().as_micros() as u64;
+    let us = since.unwrap_or(waiting).elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
@@ -5799,10 +5806,12 @@ impl Host {
                 // read, and that is brought back ([`reads`]); or until they
                 // have landed: their copy-back's end, not the card's other
                 // work.
-                if !(reads::on() && self.read_wait(&mut submitted, runs)) {
-                    relay_wait(why, |line| {
+                let read = if reads::on() { self.read_wait(&mut submitted, runs) } else { Err(None) };
+                if let Err(since) = read {
+                    let done = |line: &Line| {
                         blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
-                    });
+                    };
+                    relay_wait_since(why, done, since);
                 }
             } else {
                 self.settle(&mut submitted, why);
