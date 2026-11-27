@@ -208,16 +208,21 @@ fn recheck_soon() -> bool {
 
 /// Frames and milliseconds ahead the pass before a bake takes slots from
 /// that are due only then ([`bake_exact`]): those of notices (due in a
-/// frame or two), and at the frame's first bake alone the writes of tables'
-/// slots (due `TABLED_GRACE` frames on) and the first two looks again
+/// frame or two) and the writes of tables' slots (due `TABLED_GRACE` frames
+/// on), and at the frame's first bake alone the first two looks again
 /// ([`RECHECK_MS`]; a look reads 48 KiB, and a frame bakes up to sixteen
 /// times). Slots whose memory a look found away are taken by their own
 /// look's time only (`HostHeap::texture_slots_ahead`). (It was 12 frames
 /// at the first bake and 2 after, counted in frames for the looks again
 /// too; then 2 frames at the first bake as well, which left the tables'
-/// writes to bake as the stand-in.)
-pub(crate) const BAKE_AHEAD: [(u64, u64); 2] =
-    [(crate::descriptor::host::TABLED_GRACE + 4, RECHECK_MS[0] + RECHECK_MS[1]), (2, 0)];
+/// writes to bake as the stand-in. At 2 frames after the first bake, a
+/// table's slot written between two bakes of a frame was left to the later
+/// bake as whatever the slot showed before: 61 such slots at bakes in run
+/// sk3.)
+pub(crate) const BAKE_AHEAD: [(u64, u64); 2] = [
+    (crate::descriptor::host::TABLED_GRACE + 4, RECHECK_MS[0] + RECHECK_MS[1]),
+    (crate::descriptor::host::TABLED_GRACE + 4, 0),
+];
 
 /// What the pass before a bake last served all of ([`BakeServed`]): until
 /// that heap's queue is written again, the next bakes need no pass.
