@@ -2,9 +2,8 @@ name: voisins
 # Toutes les heures : TomBox et Xbox2Windows ont-ils avancé ? Si oui, la branche « auto/voisins »
 # est force-poussée avec le sous-module avancé et les copies recopiées sans modification, et la CI (tests.yml)
 # la teste. Aucune pull request n'est ouverte par Actions : un mainteneur relit la branche et ouvre la PR.
+# Dans anyXboxx-diffbase, lancé à la main seulement (cette lignée ne suit pas l'amont).
 on:
-  schedule:
-    - cron: "17 * * * *"            # minute 17 : hors du pic de début d'heure de GitHub
   workflow_dispatch:
 
 permissions:

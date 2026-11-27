@@ -1,9 +1,7 @@
 name: site
 # Site GitHub Pages : site/index.html (peut-on lancer GTA VI ? espace disque), publié tel quel.
+# Dans anyXboxx-diffbase, lancé à la main seulement : le site est celui d'AnyXboxX en amont.
 on:
-  push:
-    branches: [main]
-    paths: ["site/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
