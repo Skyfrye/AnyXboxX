@@ -1359,6 +1359,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// The card's times of passes of ours recorded into the list
+    /// ([`ours`]), resolved when it is closed.
+    timed: Mutex<ours::Pairs>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3925,6 +3928,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 pub(crate) mod mapping;
 mod card_steps;
+pub(crate) mod ours;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 mod panel;
@@ -4370,6 +4374,7 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                timed: Mutex::new(ours::Pairs::default()),
             })
         }
     }
@@ -4566,6 +4571,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let mut pairs = ours::Pairs::default();
+                    let sends = pairs.begin(list, ours::Kind::SendsUp);
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4632,6 +4639,8 @@ impl Host {
                     if !sent.is_empty() {
                         list.ResourceBarrier(&sent);
                     }
+                    pairs.end(list, sends);
+                    let hashes = pairs.begin(list, ours::Kind::Hashes);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -4670,6 +4679,8 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    pairs.end(list, hashes);
+                    pairs.resolve(list);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4768,6 +4779,8 @@ impl Host {
                             }),
                         },
                     }]);
+                    let mut pairs = ours::Pairs::default();
+                    let compares = pairs.begin(list, ours::Kind::Compares);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -4782,6 +4795,8 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    pairs.end(list, compares);
+                    pairs.resolve(list);
                     list.Close()?;
                     list.cast()
                 })()
@@ -5033,9 +5048,14 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                }
+                // (A copy queue's timestamps are not asked for.)
+                ours::timing(&list, |pairs| {
+                    let fetches = if copy_queue.is_none() { pairs.begin(&list, ours::Kind::Fetches) } else { None };
+                    for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    pairs.end(&list, fetches);
+                });
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
@@ -5342,9 +5362,13 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
-                    }
+                    ours::timing(list, |pairs| {
+                        let fetches = pairs.begin(list, ours::Kind::Fetches);
+                        for &(i, lo, hi, at) in &pieces {
+                            list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
+                        }
+                        pairs.end(list, fetches);
+                    });
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -6050,6 +6074,22 @@ impl Host {
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
         }
+        // The card's time for all of the submission's lists (`ours`).
+        if let Some((front, behind)) = ours::whole() {
+            lists.insert(0, Some(front));
+            #[cfg(feature = "diagnostics")]
+            {
+                marks.iter_mut().for_each(|m| m.0 += 1);
+                marks.insert(0, (0, crate::copystat::Timed::Other));
+                marks.push((lists.len(), crate::copystat::Timed::Other));
+            }
+            lists.push(Some(behind));
+            firsts.iter_mut().for_each(|first| *first += 1);
+        }
+        // A list sent again after its pairs went to another (`ours`).
+        for list in runs {
+            list.timed_sent();
+        }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
@@ -6625,6 +6665,29 @@ impl HostList {
         times
     }
 
+    /// The first timestamp of a pair around a pass of ours about to be
+    /// recorded ([`ours`]).
+    pub(crate) fn timed_begin(&self, kind: ours::Kind) -> Option<ours::Mark> {
+        if !ours::on() {
+            return None;
+        }
+        self.timed.lock().unwrap_or_else(|e| e.into_inner()).begin(&self.list, kind)
+    }
+
+    /// The second timestamp of `mark`'s pair, behind the pass.
+    pub(crate) fn timed_end(&self, mark: Option<ours::Mark>) {
+        if mark.is_some() {
+            self.timed.lock().unwrap_or_else(|e| e.into_inner()).end(&self.list, mark);
+        }
+    }
+
+    /// The list goes to the card ([`ours::Pairs::sent`]).
+    fn timed_sent(&self) {
+        if ours::on() {
+            self.timed.lock().unwrap_or_else(|e| e.into_inner()).sent();
+        }
+    }
+
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
@@ -6636,6 +6699,9 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        if ours::on() {
+            self.timed.lock().unwrap_or_else(|e| e.into_inner()).resolve(&self.list);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6688,6 +6754,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.timed.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -6890,10 +6957,12 @@ impl HostList {
         const DEPTH_WRITE: u32 = 0x10;
         const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         let Some(plane) = &twin.plane else { return };
+        let mark = self.timed_begin(ours::Kind::Planes);
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
+        self.timed_end(mark);
     }
 
     /// Records the copy of a depth texture into its colour twin (`colour`)
@@ -6913,10 +6982,12 @@ impl HostList {
         } else {
             (&twin.colour, depth)
         };
+        let mark = self.timed_begin(ours::Kind::ListTwins);
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
+        self.timed_end(mark);
     }
 
     /// Before the list closes: the depth textures whose twins it wrote last
@@ -7089,18 +7160,24 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                let mut pairs = ours::Pairs::default();
+                let twins = if syncs.is_empty() { None } else { pairs.begin(list, ours::Kind::PreludeTwins) };
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
+                pairs.end(list, twins);
+                let ups = if uploads.is_empty() { None } else { pairs.begin(list, ours::Kind::PreludeUploads) };
                 for (staging, copy) in uploads {
                     staging.record_into(list, &copy.texture);
                 }
+                pairs.end(list, ups);
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                pairs.resolve(list);
                 list.Close()
             })
         };
@@ -9467,6 +9544,7 @@ impl Meter {
             late_line(frames);
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
+            ours::line(frames);
             upq::line(frames);
             rec::line(frames);
             #[cfg(feature = "diagnostics")]
