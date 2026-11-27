@@ -5189,13 +5189,39 @@ impl RecordHash {
     }
 }
 
+/// [`readable`]'s calls, and those of buffer views, of all threads (each
+/// thread adds its own every 1,024 calls).
+static READABLE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+thread_local! {
+    static READABLE_HERE: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// See [`READABLE`] (for the line of the translating threads).
+pub(crate) fn readable_counts() -> [u64; 2] {
+    [READABLE[0].load(Ordering::Relaxed), READABLE[1].load(Ordering::Relaxed)]
+}
+
+fn readable_count(buffer: bool) {
+    let mut c = READABLE_HERE.get();
+    c[0] += 1;
+    c[1] += u32::from(buffer);
+    if c[0] >= 1024 {
+        READABLE[0].fetch_add(u64::from(c[0]), Ordering::Relaxed);
+        READABLE[1].fetch_add(u64::from(c[1]), Ordering::Relaxed);
+        c = [0; 2];
+    }
+    READABLE_HERE.set(c);
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
+    let copy = crate::descriptor::host::buffer_copy(view);
+    readable_count(copy.is_some());
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    if let Some((shadow, address, len)) = copy {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as

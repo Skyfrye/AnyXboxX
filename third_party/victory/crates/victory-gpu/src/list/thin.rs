@@ -387,6 +387,27 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    // What the translating took to bind views: the views of lists asked for
+    // and made (`crate::descriptor::host::HostHeap::make_listed`; the rest
+    // were copied from the thread's own), the views made ready to be read
+    // (`crate::draw`'s `readable`).
+    static LAST_VIEWS: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    let [asked, made] = crate::descriptor::host::listed_counts();
+    let [read, buffers] = crate::draw::readable_counts();
+    let g: Vec<f64> = {
+        let now = [asked, made, read, buffers];
+        let mut last = held(&LAST_VIEWS);
+        let g = now.iter().zip(last.iter()).map(|(n, l)| n.saturating_sub(*l) as f64 / frames).collect();
+        *last = now;
+        g
+    };
+    tracing::info!(
+        "views of lists per frame: {:.0} asked, {:.0} made; made ready to be read {:.0}, {:.0} of them of buffers",
+        g[0],
+        g[1],
+        g[2],
+        g[3]
+    );
 }
 
 #[inline]
