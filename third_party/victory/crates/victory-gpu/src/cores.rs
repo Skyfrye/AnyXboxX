@@ -236,6 +236,11 @@ fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
 /// process goes (`VICTORY_LANE_CORE=1`): nothing else of it runs on the
 /// core's two threads. It was the one a frame waited for (94 % of it in a
 /// street), and shared its core's units with whatever ran beside it.
+///
+/// Also where all cores are alike (one class, one cache: 9800X3D), where
+/// nothing else is asked for: the core is the last one there too. The
+/// submitting thread worked 38 ms of a 40 ms frame in the opening (run
+/// p1-full2), with the process on about ten of the sixteen threads.
 fn lane_core() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
@@ -344,6 +349,13 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// Whether a thread asks for processors: where there are fast ones; where
+/// all are alike (or nothing is known) only the submitting thread, for a
+/// core of its own ([`lane_core`]), if there is one to give it.
+fn asks(fast: bool, own_core: bool, one: impl FnOnce() -> bool) -> bool {
+    fast || (own_core && one())
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThreadId, OpenThread, THREAD_SET_LIMITED_INFORMATION,
@@ -358,8 +370,11 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    let lane = what == "victory-submit";
+    // (In diagnostics builds a core of its own may be switched on later,
+    // `crate::ab`.)
+    let wanted = lane && (lane_core() || cfg!(feature = "diagnostics"));
+    if !asks(!fast.is_empty(), wanted, || one_core(&cpu_sets()).is_some()) {
         return;
     }
     // SAFETY: our own thread; the handle stays open.
@@ -368,7 +383,7 @@ fn ask(what: &str, from: u32) {
         tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
         return;
     }
-    ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, what == "victory-submit"));
+    ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, lane));
     settle();
     tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
 }
@@ -376,6 +391,21 @@ fn ask(what: &str, from: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where all cores are alike (9800X3D) the submitting thread still asks
+    /// for a core of its own if it wants one and there is one; nothing else
+    /// asks there.
+    #[test]
+    fn the_submitting_thread_asks_for_its_own_core_where_all_are_alike() {
+        assert!(asks(false, true, || true));
+        assert!(!asks(false, true, || false));
+        assert!(!asks(false, false, || true));
+        assert!(asks(true, false, || false));
+        let eight: Vec<(u32, u8, u8)> = (0..16).map(|n| (256 + n, 0, n as u8 / 2)).collect();
+        let (own, others) = one_core(&eight).unwrap();
+        assert_eq!((own, others.len()), (vec![270, 271], 14));
+        assert!(fast_by_class(&eight).is_empty());
+    }
 
     /// The first cores' logical processors, both of each core, by the
     /// cores' numbers whatever the order the system says them in.
