@@ -991,7 +991,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // A destination made level by level gets its levels' memory
             // ahead of this list (`crate::tiles`).
             crate::texture::card_writes(list, dst, to, None);
-            crate::texture::host_written(dst);
+            crate::texture::host_written_in(list, dst, None);
             if same {
                 SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1203,7 +1203,7 @@ extern "system" fn copy_texture_region(
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
-        crate::texture::host_written(dst.resource);
+        crate::texture::host_written_in(list, dst.resource, Some(dst.footprint.offset as u32));
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
@@ -1409,7 +1409,7 @@ extern "system" fn resolve(
         crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
+        crate::texture::host_written_in(list, dst, Some(dst_sub));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

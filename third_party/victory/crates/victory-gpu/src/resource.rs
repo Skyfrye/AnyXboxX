@@ -1301,6 +1301,13 @@ pub(crate) struct HostTexture {
     /// many levels the copy put in (its views show them).
     pub(crate) prefill: std::sync::Mutex<Option<(u32, std::sync::Arc<Vec<u8>>)>>,
     pub(crate) prefilled: std::sync::atomic::AtomicU32,
+    /// What sent lists wrote of it on the card (a copy or resolve of the
+    /// title's, a library's pass): each list's place in the order of sent
+    /// lists ([`crate::texture::list_steps_begin`]) and the title's
+    /// subresources it wrote (a bit each; all bits: all of them, or one past
+    /// the 64th). An upload from title memory sent after such a write would
+    /// put over those subresources what the write never reached.
+    pub(crate) written: std::sync::Mutex<Vec<(u64, u64)>>,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -2549,6 +2556,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),
             prefilled: Default::default(),
+            written: Default::default(),
             flags,
         }
     }
@@ -2576,6 +2584,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),
             prefilled: Default::default(),
+            written: Default::default(),
             flags,
         }
     }
@@ -3345,6 +3354,14 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
+}
+
+/// Placed textures made so far whose address lies in `[from, to)`: address
+/// and description words 4, 6, 7 and 8 (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_between(from: u64, to: u64) -> Vec<(u64, [u32; 4])> {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.range((from, [0; 14])..(to, [0; 14])).map(|((at, d), _)| (*at, [d[4], d[6], d[7], d[8]])).collect()
 }
 
 /// From which level on the title texture's host copy was filled, and from

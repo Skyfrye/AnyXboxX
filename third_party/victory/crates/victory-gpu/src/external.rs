@@ -143,7 +143,7 @@ impl<'a> Pass<'a> {
             // when the list closes (`crate::texback`).
             crate::texture::card_writes(self.list, title, host, None);
             self.list.texture_written(title);
-            crate::texture::host_written(title);
+            crate::texture::host_written_in(self.list, title, None);
         }
         crate::list::ensure_state(self.list, title, state);
         Some(host)

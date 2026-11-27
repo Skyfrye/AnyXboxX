@@ -5970,7 +5970,11 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        // (Each list's place in the order of sent lists, for the uploads in
+        // front of them: `crate::texture::late_uploads`.)
+        let mut orders = Vec::with_capacity(runs.len());
         for list in runs {
+            orders.push(crate::texture::list_steps_begin());
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         batch.fill();
@@ -5981,7 +5985,7 @@ impl Host {
         // samples that changed, with no upload ahead of it in the
         // submission, is uploaded by its prelude (`crate::texture::late_uploads`).
         let sampled: Vec<Vec<crate::texture::Sampled>> = runs.iter().map(|list| list.deferred().sampled.clone()).collect();
-        let late_uploads = crate::texture::late_uploads(&sampled);
+        let late_uploads = crate::texture::late_uploads(&sampled, &orders);
         drop(sampled);
         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
         for ((_run, list), uploads) in runs.iter().enumerate().zip(&late_uploads) {
@@ -7067,7 +7071,7 @@ impl HostList {
     /// (`crate::texture::late_uploads`).
     fn prelude(
         &self,
-        uploads: &[(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)],
+        uploads: &[(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>, bool, u64)],
     ) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
@@ -7123,7 +7127,7 @@ impl HostList {
                 }
             }
         }
-        for (_, copy) in uploads {
+        for (_, copy, _, _) in uploads {
             let key = std::sync::Arc::as_ptr(copy) as usize;
             let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
             copying.insert(key, COPY_DEST);
@@ -7165,8 +7169,31 @@ impl HostList {
                 }
                 pairs.end(list, twins);
                 let ups = if uploads.is_empty() { None } else { pairs.begin(list, ours::Kind::PreludeUploads) };
-                for (staging, copy) in uploads {
-                    staging.record_into(list, &copy.texture);
+                // A texture cut from a block may lie where another did: what
+                // the card holds of that one is done with before the first
+                // upload into this one (as `crate::texture::record_upload`).
+                if crate::pool::on() {
+                    let aliasing: Vec<D3D12_RESOURCE_BARRIER> = uploads
+                        .iter()
+                        .filter(|(_, _, first, _)| *first)
+                        .map(|(_, copy, _, _)| D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                                    pResourceBefore: std::mem::ManuallyDrop::new(None),
+                                    // SAFETY: a borrowed pointer the barrier never releases.
+                                    pResourceAfter: std::mem::transmute_copy(&copy.texture),
+                                }),
+                            },
+                        })
+                        .collect();
+                    if !aliasing.is_empty() {
+                        list.ResourceBarrier(&aliasing);
+                    }
+                }
+                for (staging, copy, _, skip) in uploads {
+                    staging.record_parts_into(list, &copy.texture, *skip);
                 }
                 pairs.end(list, ups);
                 if !barriers.is_empty() {
