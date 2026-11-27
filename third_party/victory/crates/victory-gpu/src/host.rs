@@ -2639,8 +2639,9 @@ pub(crate) fn relay() -> bool {
 /// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
 /// title memory a flight's shaders may write (a title buffer copy, a fill
 /// of upload memory, a texture) waits only until the flights that declared
-/// that memory have landed, not for everything in the air; and at
-/// [`late_most`] lists in the air it waits until there are fewer. At `1`
+/// that memory have landed, not for everything in the air (with [`reads`]
+/// only until the card has run them, and what is read is brought back); and
+/// at [`late_most`] lists in the air it waits until there are fewer. At `1`
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -2855,6 +2856,13 @@ struct Line {
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
     /// With [`card_steps`]: what the flights being landed write.
     landing: Vec<card_steps::Writer>,
+    /// A read brings bytes of flights the card has run back into title
+    /// memory ([`reads`]): no landing starts until it is done.
+    reading: bool,
+    /// A read waits for the card to run the flight behind which the host's
+    /// fence takes this value ([`reads`]; 0: none): what is ahead of it is
+    /// landed meanwhile, it and what follows it are not.
+    hold: u64,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2871,6 +2879,8 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     landed: Vec::new(),
     in_hand: Vec::new(),
     landing: Vec::new(),
+    reading: false,
+    hold: 0,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3547,8 +3557,15 @@ fn late_threads() {
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    relay_wait_since(why, done, None);
+}
+
+/// [`relay_wait`], counted as one settle with a wait for the same reason
+/// that began at `since`, if given: the time is counted from then, the
+/// settle once, waited for now or not.
+fn relay_wait_since(why: usize, done: impl Fn(&Line) -> bool, since: Option<std::time::Instant>) {
     let mut line = line();
-    if done(&line) {
+    if since.is_none() && done(&line) {
         return;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -3570,7 +3587,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     drop(line);
     stood(waiting);
     working(was_working);
-    let us = waiting.elapsed().as_micros() as u64;
+    let us = since.unwrap_or(waiting).elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
@@ -3617,7 +3634,7 @@ fn relay_worker() {
         let next = {
             let mut line = line();
             loop {
-                if line.line.is_empty() {
+                if !reads::may_land(&line) {
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
@@ -3631,10 +3648,18 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let n = landable(&fences, reads::landing_limit(completed, line.hold));
                 if n == 0 {
-                    // The first thing is a flight the card has not run.
-                    break Err(fences[0].unwrap_or(0));
+                    match fences[0] {
+                        // Run, and held for a read ([`reads`]): told when
+                        // it is done.
+                        Some(fence) if fence <= completed => {
+                            line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
+                            continue;
+                        }
+                        // The first thing is a flight the card has not run.
+                        _ => break Err(fences[0].unwrap_or(0)),
+                    }
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -3851,6 +3876,7 @@ fn late_line(frames: f64) {
             );
         }
     }
+    reads::log(frames);
     crate::land::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -3904,6 +3930,7 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
+mod reads;
 pub(crate) mod rec;
 mod send;
 mod upq;
@@ -5775,11 +5802,17 @@ impl Host {
             && let Some(why) = late_blocked(runs)
         {
             if relay_exact() && why == WHY_READ {
-                // Only until the flights that may write what is read have
-                // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| {
-                    blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
-                });
+                // Until the card has run the flights that may write what is
+                // read, and that is brought back ([`reads`]); or until they
+                // have landed: their copy-back's end, not the card's other
+                // work.
+                let read = if reads::on() { self.read_wait(&mut submitted, runs) } else { Err(None) };
+                if let Err(since) = read {
+                    let done = |line: &Line| {
+                        blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
+                    };
+                    relay_wait_since(why, done, since);
+                }
             } else {
                 self.settle(&mut submitted, why);
             }
