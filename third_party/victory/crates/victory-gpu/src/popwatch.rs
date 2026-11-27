@@ -68,7 +68,7 @@ struct Job {
     /// The submission that copies it.
     flown: u64,
     ms: u64,
-    causes: [u64; 4],
+    causes: [u64; 6],
     phase: usize,
 }
 
@@ -220,7 +220,7 @@ struct Seen {
 struct Picture {
     frame: u64,
     ms: u64,
-    causes: [u64; 4],
+    causes: [u64; 6],
     phase: usize,
     rgb: Vec<u8>,
     half: Vec<[i16; 3]>,
@@ -364,7 +364,7 @@ fn watch(from: &mpsc::Receiver<Job>) {
             if blips > 0 || lone.len() > 1 || steps.is_some_and(|s| s > 0) {
                 let since: Vec<u64> = now.causes.iter().zip(&first.causes).map(|(a, b)| a.saturating_sub(*b)).collect();
                 tracing::info!(
-                    "pop watch: frame {} at {:.2} s: {blips} blips, {steps:?} steps, lone blocks {lone:?}; in the two frames before it [made null for another texture, kept, neutral, stale] {since:?}",
+                    "pop watch: frame {} at {:.2} s: {blips} blips, {steps:?} steps, lone blocks {lone:?}; in the two frames before it [made null for another texture, kept, neutral, stale, table slots remade before their draw ran, uploads into a kept copy] {since:?}",
                     now.frame,
                     now.ms as f64 / 1e3
                 );
