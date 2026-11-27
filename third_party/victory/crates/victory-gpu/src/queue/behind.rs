@@ -390,6 +390,7 @@ impl<W: Work> Lane<W> {
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
+                STATS[NOT_JOINED + NONE_BEHIND].fetch_add(1, Relaxed);
                 break;
             };
             // (Back where it was: parts of one submission share a number.)
@@ -401,6 +402,7 @@ impl<W: Work> Lane<W> {
                     continue;
                 }
                 state.items.insert(at, next);
+                STATS[NOT_JOINED + NOT_TRANSLATED].fetch_add(1, Relaxed);
                 break;
             }
             let Entry { number, queue, what, mark: theirs } = next;
@@ -569,22 +571,31 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
-                    return Err(next);
+                    return Err(refused(NOT_VALUE, next));
                 }
             }
             &Job::Wait(fence, value) => {
                 if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
-                    return Err(next);
+                    return Err(refused(NOT_FENCE, next));
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
-                    return Err(next);
+                if count >= most {
+                    return Err(refused(NOT_MOST, next));
+                }
+                if lists.1.len() + runs.len() > most_lists {
+                    return Err(refused(NOT_LISTS, next));
+                }
+                if crate::host::writes_title_memory(&runs) {
+                    return Err(refused(NOT_COPIES, next));
+                }
+                if !crate::host::joinable(hosts(), &runs) {
+                    return Err(refused(NOT_JOINABLE, next));
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(refused(NOT_OTHER, next)),
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -693,7 +704,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static STATS: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -706,6 +717,27 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+/// Where the joining of parts ended ([`Job::take_along`]), from here on by
+/// why: nothing behind it in its queue yet, the next not translated yet, a
+/// memory value or a fence the next waits for not met, the most parts or
+/// lists, the next reads what those before it write ([`crate::host::joinable`]),
+/// a present or another, the next changes title memory on the CPU.
+const NOT_JOINED: usize = 11;
+const NONE_BEHIND: usize = 0;
+const NOT_TRANSLATED: usize = 1;
+const NOT_VALUE: usize = 2;
+const NOT_FENCE: usize = 3;
+const NOT_MOST: usize = 4;
+const NOT_LISTS: usize = 5;
+const NOT_JOINABLE: usize = 6;
+const NOT_OTHER: usize = 7;
+const NOT_COPIES: usize = 8;
+
+/// `next` is not taken along, for `why` ([`NOT_JOINED`]).
+fn refused(why: usize, next: Job) -> Job {
+    STATS[NOT_JOINED + why].fetch_add(1, Relaxed);
+    next
+}
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -933,7 +965,10 @@ pub(super) fn line(frames: f64) {
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
          when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \
          line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
-         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
+         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS); joining ended {:.1} times with nothing \
+         behind in the queue yet, {:.1} the next not translated yet, {:.1} it waits for a memory value not met, {:.1} for a \
+         fence not met, {:.1} at the most parts, {:.1} at the most lists, {:.1} it reads what those before write, {:.1} it \
+         changes title memory (a buffer copy or a step of ours), {:.1} a present or another",
         s[RUNS] / frames,
         s[PRESENTS] / frames,
         s[DEPTH] / s[RUNS].max(1.0),
@@ -944,7 +979,16 @@ pub(super) fn line(frames: f64) {
         ms(DRAINING),
         s[DRAINS] / frames,
         s[FORCED] / frames,
-        s[JOINED] / frames
+        s[JOINED] / frames,
+        s[NOT_JOINED + NONE_BEHIND] / frames,
+        s[NOT_JOINED + NOT_TRANSLATED] / frames,
+        s[NOT_JOINED + NOT_VALUE] / frames,
+        s[NOT_JOINED + NOT_FENCE] / frames,
+        s[NOT_JOINED + NOT_MOST] / frames,
+        s[NOT_JOINED + NOT_LISTS] / frames,
+        s[NOT_JOINED + NOT_JOINABLE] / frames,
+        s[NOT_JOINED + NOT_COPIES] / frames,
+        s[NOT_JOINED + NOT_OTHER] / frames
     );
 }
 

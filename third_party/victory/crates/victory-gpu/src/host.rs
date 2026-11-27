@@ -3316,7 +3316,7 @@ fn joins_asked() -> (usize, usize) {
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
+    if writes_title_memory(next) {
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
@@ -3329,6 +3329,12 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
     blocked_by(&joined, next, false).is_none()
+}
+
+/// Whether a step of `lists` on the CPU changes title memory ([`Step::Copy`],
+/// [`Step::Run`]): such a part is never prepared with those before it.
+pub(crate) fn writes_title_memory(lists: &[&HostList]) -> bool {
+    lists.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_))))
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
