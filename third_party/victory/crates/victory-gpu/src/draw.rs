@@ -219,10 +219,86 @@ fn recheck_soon() -> bool {
 pub(crate) const BAKE_AHEAD: [(u64, u64); 2] =
     [(crate::descriptor::host::TABLED_GRACE + 4, RECHECK_MS[0] + RECHECK_MS[1]), (2, 0)];
 
-/// What [`crate::descriptor::host::HostHeap::texture_news`] said when the
-/// pass before a bake last served all there was, plus one (0: it did not):
-/// until something is new, the next bakes of the frame need no pass.
-static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
+/// What the pass before a bake last served all of ([`BakeServed`]): until
+/// that heap's queue is written again, the next bakes need no pass.
+static BAKE_SERVED: BakeServed = BakeServed::new();
+
+/// The last pass before a bake that served all it took, as a
+/// [`BakeStamp`] (`None`: no such pass since the last that was no bake's, or
+/// since one that left slots).
+///
+/// (It was one count for every heap, read after the pass and the wait for
+/// the bake's list. The title writes its heap on other threads meanwhile: a
+/// slot written while the pass ran was counted as served, the next bakes of
+/// the frame skipped their pass and baked what the slot showed before,
+/// another texture's view or the stand-in, into the characters' skin for the
+/// rest of the scene: coloured specks all over the waitress's face in the
+/// diner (run sk4old, with the count read as before). In the runs with the
+/// count read as before, 128 to 203 bakes skipped their pass after a pass
+/// during which the queue was written; none with the count read first. And
+/// a pass on one heap counted for a bake on another whose queue had the same
+/// count of writes.)
+pub(crate) struct BakeServed(std::sync::Mutex<Option<BakeStamp>>);
+
+impl BakeServed {
+    pub(crate) const fn new() -> BakeServed {
+        BakeServed(std::sync::Mutex::new(None))
+    }
+
+    fn get(&self) -> std::sync::MutexGuard<'_, Option<BakeStamp>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether a bake on `host` needs no pass: the last served pass was of
+    /// this heap, nothing was written to its queue since that pass began,
+    /// and no memory was noted since.
+    pub(crate) fn covers(&self, host: &crate::descriptor::host::HostHeap) -> bool {
+        let (writes, noted) = host.texture_news();
+        !noted && *self.get() == Some(BakeStamp { heap: BakeStamp::heap(host), writes })
+    }
+
+    /// A pass that was no bake's, or one that did not serve all: the next
+    /// bake looks again.
+    pub(crate) fn forget(&self) {
+        *self.get() = None;
+    }
+}
+
+/// What a served pass before a bake covers: its heap (the host heap's
+/// address) and the count of that heap's queue's writes
+/// ([`crate::descriptor::host::HostHeap::texture_news`]) when the pass
+/// began ([`BakeServed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BakeStamp {
+    heap: usize,
+    writes: u64,
+}
+
+impl BakeStamp {
+    fn heap(host: &crate::descriptor::host::HostHeap) -> usize {
+        std::ptr::from_ref(host) as usize
+    }
+
+    /// Read before the pass takes the slots due: what is written after this
+    /// is not covered, whenever the pass ends.
+    pub(crate) fn before_pass(host: &crate::descriptor::host::HostHeap) -> BakeStamp {
+        BakeStamp { heap: BakeStamp::heap(host), writes: host.texture_news().0 }
+    }
+
+    /// The pass served all it took: the next bakes on this heap need none
+    /// until its queue is written again.
+    pub(crate) fn served(self, into: &BakeServed) {
+        *into.get() = Some(self);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: run on the heap of a bake while its pass is at work, as the
+    /// title's other threads write its heap meanwhile.
+    static WHILE_BAKE_PASS: std::cell::Cell<Option<fn(&crate::descriptor::host::HostHeap)>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Free-threaded wrapper around a reusable upload-only [`HostList`] protected
 /// by [`BAKE_UPLOAD`]. D3D12 command allocators, lists, and retained COM
@@ -2489,16 +2565,11 @@ impl State {
         crate::texture::BAKING.set(exact);
         let mut waited = self.flush_for_bake(bake_list, host, &mut sync);
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
-        let run_pass = left > 0
-            && (first
-                || !exact
-                || {
-                    let (writes, noted) = host.texture_news();
-                    noted || BAKE_SERVED.load(Ordering::Relaxed) != writes + 1
-                });
+        let run_pass = left > 0 && (first || !exact || !BAKE_SERVED.covers(host));
         // With the frame's bake budget spent, slots due now get no pass: not
         // served (it counted as served, and the warning missed those bakes).
         let mut served = left > 0 || !host.texture_slots_any_due(frame, crate::host::now_ms());
+        let mut stamp = None;
         if run_pass {
             let n = EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
@@ -2512,10 +2583,15 @@ impl State {
                     "a draw of the title's decoration bake: textures picked by index are uploaded synchronously first (VICTORY_BAKE_TEXTURES_MS=0: not)"
                 );
             }
-            BAKE_SERVED.store(0, Ordering::Relaxed);
+            BAKE_SERVED.forget();
+            stamp = Some(BakeStamp::before_pass(host));
             PASS_BUDGET.set(Some((left, 2 << 30, true)));
             served = self.heap_textures(bake_list, heap, host, Some(&mut sync));
             PASS_BUDGET.set(None);
+            #[cfg(test)]
+            if let Some(write) = WHILE_BAKE_PASS.take() {
+                write(host);
+            }
         }
         crate::texture::BAKING.set(false);
         let waiting = std::time::Instant::now();
@@ -2534,8 +2610,8 @@ impl State {
         host.texture_views_remade();
         host.texture_slots_flip();
         drop(sync.keep);
-        if run_pass && served && exact {
-            BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
+        if let Some(stamp) = stamp.filter(|_| served && exact) {
+            stamp.served(&BAKE_SERVED);
         }
         let whole = Self::bake_left(host, served, frame);
         BAKED_MS.fetch_add(began.elapsed().saturating_sub(waited).as_millis() as u64, Ordering::Relaxed);
@@ -2826,7 +2902,7 @@ impl State {
         };
         let began = std::time::Instant::now();
         if sync.is_none() {
-            BAKE_SERVED.store(0, Ordering::Relaxed);
+            BAKE_SERVED.forget();
         }
         let mut served = true;
         for (index, write) in due {
@@ -5362,6 +5438,74 @@ mod bake_tests {
         assert!(!served, "a slot was due and had no pass");
         assert!(!whole);
         assert!(BAKES_LEFT[1].load(Ordering::Relaxed) > before);
+    }
+
+    /// A slot the title writes while a bake's pass is at work (on its other
+    /// threads, while the pass uploads and waits for the card) is not
+    /// covered by that pass: the next bake on the heap runs a pass of its
+    /// own, which takes it. (The count of the queue's writes was read after
+    /// the pass and the wait: the next bakes skipped their pass and baked
+    /// what such a slot showed before, another texture's view or the
+    /// stand-in, into the characters' skin for the scene.)
+    #[test]
+    fn a_slot_written_while_a_bakes_pass_runs_is_left_to_the_next_bakes_pass() {
+        if crate::host::host().is_none() || !bake_exact() {
+            return;
+        }
+        // (Memory noted covers nothing, whatever the stamp: page generations,
+        // noted by heap, and none on a heap of its own.)
+        crate::pagegen::TEST_ON.set(Some(true));
+        let Some(host) = crate::descriptor::host::HostHeap::new(false, 16) else { return };
+        let (_record, _) = host.test_write_texture(3, crate::resource::test_texture(3, 4, 4, 1));
+        let heap = crate::descriptor::heap(crate::descriptor::test_view_heap(16));
+        let frame = crate::frame::current();
+        assert!(!host.texture_news().1);
+        WHILE_BAKE_PASS.set(Some(|host| {
+            let (record, _) = host.test_write_texture(4, crate::resource::test_texture(3, 4, 4, 1));
+            // (Kept: the slot shows it for the rest of the test.)
+            std::mem::forget(record);
+        }));
+        let [served, _] = State::default().bake_textures(heap, &host, frame, false, 60_000);
+        assert!(served, "the pass served all it took");
+        assert!(!BAKE_SERVED.covers(&host), "slot 4 was written after the pass took the slots due");
+        // The next bake's pass takes it, and covers the bakes after it.
+        let [served, _] = State::default().bake_textures(heap, &host, frame, false, 60_000);
+        assert!(served);
+        assert!(BAKE_SERVED.covers(&host), "nothing was written since that pass began");
+        crate::pagegen::TEST_ON.set(None);
+    }
+
+    /// A pass before a bake covers the bakes on its own heap alone: not one
+    /// on another heap whose queue has the same count of writes (one count
+    /// stood for every heap), nor one after a write to its own queue or a
+    /// pass that was no bake's.
+    #[test]
+    fn a_bakes_pass_covers_its_own_heap_alone() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        crate::pagegen::TEST_ON.set(Some(true));
+        let (Some(a), Some(b)) =
+            (crate::descriptor::host::HostHeap::new(false, 16), crate::descriptor::host::HostHeap::new(false, 16))
+        else {
+            return;
+        };
+        let texture = crate::resource::test_texture(3, 4, 4, 1);
+        let _records = [a.test_write_texture(3, texture), b.test_write_texture(3, texture)];
+        assert_eq!(a.texture_news(), b.texture_news(), "the same count of writes, and nothing noted");
+        assert!(!a.texture_news().1);
+        let served = BakeServed::new();
+        assert!(!served.covers(&a), "no pass yet");
+        BakeStamp::before_pass(&a).served(&served);
+        assert!(served.covers(&a));
+        assert!(!served.covers(&b), "a pass of another heap");
+        let _more = a.test_write_texture(5, texture);
+        assert!(!served.covers(&a), "written since the pass began");
+        BakeStamp::before_pass(&a).served(&served);
+        assert!(served.covers(&a));
+        served.forget();
+        assert!(!served.covers(&a), "a pass that was no bake's came since");
+        crate::pagegen::TEST_ON.set(None);
     }
 
     /// How a draw is taken for a bake: by a program, or by its targets
