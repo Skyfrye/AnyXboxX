@@ -190,6 +190,54 @@ pub(crate) fn listed(copy: &HostTexture) {
     }
 }
 
+/// Since the start: lists that were about to write a texture on the card (a
+/// render target, unordered access, a copy into it) while its first upload
+/// was still on its way here, and of them those that waited for it
+/// ([`before_write`]).
+pub(crate) static WRITTEN_WHILE_ON_ITS_WAY: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a list that is about to write a texture whose first upload is on
+/// its way here waits for that upload to run first
+/// (`VICTORY_AHEAD_BEFORE_WRITE=1`; off: counted only).
+fn before_write_waits() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_AHEAD_BEFORE_WRITE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AHEAD_BEFORE_WRITE").is_some_and(|v| v != "0"))
+}
+
+/// A list is about to write title texture `resource` on the card. Its first
+/// upload, taken here before (the texture was new and in the common state),
+/// runs on a queue of its own and copies title memory over the whole
+/// texture: if it lands after this write, what the write put there is gone
+/// (a decoration bake's skin: black). Counted; with
+/// `VICTORY_AHEAD_BEFORE_WRITE=1` the upload runs first, as [`listed`] has a
+/// list's own upload wait.
+pub(crate) fn before_write(resource: This) {
+    if !on() || IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let Some(copy) = crate::resource::made_copy(resource) else {
+        return;
+    };
+    if copy.ahead.load(Relaxed) != PENDING {
+        return;
+    }
+    WRITTEN_WHILE_ON_ITS_WAY[0].fetch_add(1, Relaxed);
+    if !before_write_waits() {
+        return;
+    }
+    WRITTEN_WHILE_ON_ITS_WAY[1].fetch_add(1, Relaxed);
+    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    let started = std::time::Instant::now();
+    while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
+        way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
 /// The copy queue and its threads, made on first use.
 fn workers() -> Option<&'static ID3D12CommandQueue> {
     /// Free-threaded.

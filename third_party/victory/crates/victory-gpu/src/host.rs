@@ -10081,6 +10081,13 @@ impl Meter {
                     *last = (frame, now);
                     let [over, held] =
                         [0, 1].map(|i| crate::descriptor::host::KEPT_OVERWRITES[i].load(Ordering::Relaxed));
+                    let [racing, waited] =
+                        [0, 1].map(|i| crate::texture::ahead::WRITTEN_WHILE_ON_ITS_WAY[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "textures a list was about to write on the card while their first upload was on its way on \
+                         the copy queue, since the start: {racing}, {waited} of them waited for it \
+                         (VICTORY_AHEAD_BEFORE_WRITE)"
+                    );
                     tracing::info!(
                         "uploads into a host copy another slot showed for a texture that moved away, since the start: \
                          {over}, {held} of them held back until that slot's own copy came (VICTORY_KEPT_FIRST)"
