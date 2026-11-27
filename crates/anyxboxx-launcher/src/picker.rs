@@ -11,6 +11,8 @@ pub const GAME_EXE: &str = "game_scarlett_master.exe";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pick {
     GameFolder,
+    /// The user's own `nvngx_dlss.dll` (from a game of theirs), for DLSS.
+    DlssModel,
 }
 
 /// Checks that `dir` is the game folder.
@@ -65,6 +67,10 @@ pub fn open(kind: Pick, start_in: Option<PathBuf>) -> Receiver<(Pick, Option<Pat
             Pick::GameFolder => dialog
                 .set_title("Choose the game folder (it holds game_scarlett_master.exe)")
                 .pick_folder(),
+            Pick::DlssModel => dialog
+                .set_title("Choose your nvngx_dlss.dll (from a game you own)")
+                .add_filter("DLSS model", &["dll"])
+                .pick_file(),
         };
         let _ = tx.send((kind, chosen));
     });

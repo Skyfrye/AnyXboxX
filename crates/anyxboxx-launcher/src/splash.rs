@@ -3,7 +3,7 @@
 //! `ANYXBOXX_LAUNCHER_SPLASH` (a file or a folder), else the folder
 //! `%LOCALAPPDATA%\AnyXboxX\launcher\splash\` (PNG and JPEG, by file name), else the single
 //! `splash.png` next to it. Several pictures rotate as a slideshow with a cross-fade. Without a
-//! picture the gradient and the title "AnyXboxX" are drawn instead. The painting is in
+//! picture of the player's, the launcher's own (`art::HERO`, made for this project) are shown. The painting is in
 //! `ui_launch` and `ui_slides`; this module holds the pictures, the timing and the status line.
 
 use std::collections::{HashMap, HashSet};
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
+use crate::art::Source;
 use crate::progress::Progress;
 
 /// Environment variable that points at the splash picture or folder.
@@ -165,6 +166,11 @@ pub fn status_text(progress: Option<&Progress>, last_line: Option<&str>, idle: &
 /// Decodes a PNG or JPEG into a colour image, shrunk so its longest side is at most `max_side`.
 pub fn load_image(path: &Path, max_side: u32) -> Result<ColorImage, String> {
     let decoded = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(to_color_image(decoded, max_side))
+}
+
+/// A decoded picture as a colour image, shrunk so its longest side is at most `max_side`.
+pub fn to_color_image(decoded: image::DynamicImage, max_side: u32) -> ColorImage {
     let (width, height) = fit_size(decoded.width(), decoded.height(), max_side);
     let shrunk = if (width, height) == (decoded.width(), decoded.height()) {
         decoded
@@ -173,7 +179,7 @@ pub fn load_image(path: &Path, max_side: u32) -> Result<ColorImage, String> {
     };
     let rgba = shrunk.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
-    Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+    ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
 }
 
 /// A picture ready to paint: its texture, opacity and how far into its life it is.
@@ -192,9 +198,9 @@ pub struct Splash {
     started: Instant,
     slides_started: Instant,
     count: usize,
-    requests: Sender<(usize, PathBuf)>,
+    requests: Sender<(usize, Source)>,
     results: Receiver<Decoded>,
-    paths: Vec<PathBuf>,
+    paths: Vec<Source>,
     requested: HashSet<usize>,
     failed: HashSet<usize>,
     textures: HashMap<usize, TextureHandle>,
@@ -205,12 +211,12 @@ pub struct Splash {
 
 impl Splash {
     pub fn new() -> Self {
-        let paths = current_sources();
-        let (request_tx, request_rx) = mpsc::channel::<(usize, PathBuf)>();
+        let paths = crate::art::sources(current_sources());
+        let (request_tx, request_rx) = mpsc::channel::<(usize, Source)>();
         let (result_tx, result_rx) = mpsc::channel::<Decoded>();
         std::thread::spawn(move || {
-            while let Ok((index, path)) = request_rx.recv() {
-                let image = match load_image(&path, MAX_TEXTURE_SIDE) {
+            while let Ok((index, source)) = request_rx.recv() {
+                let image = match crate::art::load(&source, MAX_TEXTURE_SIDE) {
                     Ok(image) => Some(image),
                     Err(error) => {
                         eprintln!("splash picture ignored: {error}");

@@ -28,6 +28,9 @@ pub struct Settings {
     pub keep_open_after_launch: bool,
     /// "Always re-warm before launch": the shader warm runs even when the marker is current.
     pub always_rewarm: bool,
+    /// Translate the game's shaders before PLAY starts it, when the cache is stale (off: the game
+    /// translates them as it meets them, slow for the first minutes).
+    pub warm_before_play: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -59,7 +62,7 @@ pub fn make_plan(
     profile: &Profile,
 ) -> Result<Plan, SessionError> {
     let game_dir = settings.game_path().ok_or(SessionError::NoGameFolder)?;
-    let mut overrides = settings.options.env_pairs();
+    let mut overrides = settings.options.env_pairs(crate::screen::primary_size());
     overrides.extend(env::parse_overrides(&settings.overrides)?);
     let env = env::build_env(&game_dir, profile, &overrides)?;
     let victory = match victory_exe {
@@ -76,8 +79,11 @@ pub fn make_plan(
             marker,
         )
     });
-    let game_log = detached::log_dir(std::env::var_os("LOCALAPPDATA").as_deref())
-        .map(|dir| detached::game_log_path(&dir, unix_now()));
+    let game_log = detached::log_dir(
+        crate::picker::launcher_dir().as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+    )
+    .map(|dir| detached::game_log_path(&dir, unix_now()));
     Ok(Plan {
         repo: repo.to_path_buf(),
         victory_exe: victory_exe.map(Path::to_path_buf),

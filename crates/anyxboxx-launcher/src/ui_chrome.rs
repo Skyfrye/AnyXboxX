@@ -29,7 +29,13 @@ const PAGES: [(Tab, &str, &str); 5] = [
 pub fn sidebar(app: &mut App, ui: &mut Ui) {
     ui.add_space(tokens::S);
     ui.label(RichText::new("AnyXboxX").size(tokens::TITLE + 2.0).strong());
-    ui.label(tokens::caption("Xbox games on Windows"));
+    ui.label(
+        RichText::new("DIFFBASE")
+            .size(tokens::CAPTION)
+            .strong()
+            .color(crate::theme::GLOW),
+    );
+    ui.label(tokens::caption("Our VIctory line, tuned on NVIDIA"));
     ui.add_space(tokens::L);
     for (tab, icon, label) in PAGES {
         if nav_row(ui, app.tab == tab, icon, label) {

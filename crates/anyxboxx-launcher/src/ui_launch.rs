@@ -164,7 +164,7 @@ fn startup(ui: &Ui, rect: Rect) {
     painter.text(
         pos2(col.left(), col.bottom() - 36.0),
         Align2::LEFT_BOTTOM,
-        "Xbox games on Windows. Starting...",
+        "Diffbase: our VIctory line. Starting...",
         FontId::proportional(tokens::SUBTITLE),
         theme::TEXT_MUTED,
     );

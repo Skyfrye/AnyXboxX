@@ -17,11 +17,13 @@ mod anim;
 mod app;
 mod app_check;
 mod app_launch;
+mod art;
 mod bar;
 mod cache;
 mod cover;
 mod detached;
 mod env;
+mod features;
 mod format;
 mod home;
 mod host;
@@ -32,10 +34,12 @@ mod loglevel;
 mod manifest;
 mod noconsole;
 mod options;
+mod output;
 mod picker;
 mod processes;
 mod profile;
 mod progress;
+mod screen;
 mod session;
 mod setup;
 mod shade;
@@ -47,6 +51,7 @@ mod toast;
 mod tokens;
 mod ui;
 mod ui_chrome;
+mod ui_features;
 mod ui_home;
 mod ui_launch;
 mod ui_manifest;
@@ -60,16 +65,23 @@ mod widgets;
 
 use eframe::egui;
 
+/// The window's title (also the name eframe keeps its window state under).
+const TITLE: &str = "AnyXboxX diffbase";
+
 fn main() -> eframe::Result {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(TITLE)
+        .with_inner_size([1180.0, 780.0])
+        .with_min_inner_size([860.0, 560.0]);
+    if let Some(icon) = art::window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("AnyXboxX launcher")
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([860.0, 560.0]),
+        viewport,
         ..eframe::NativeOptions::default()
     };
     eframe::run_native(
-        "AnyXboxX launcher",
+        TITLE,
         options,
         Box::new(|creation| {
             theme::apply(&creation.egui_ctx);

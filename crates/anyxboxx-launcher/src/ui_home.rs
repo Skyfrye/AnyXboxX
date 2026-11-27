@@ -98,9 +98,15 @@ fn paint_hero(ui: &Ui, hero: Rect, column: Rect, layers: &[splash::Layer]) {
 fn hero_text(app: &mut App, ui: &mut Ui, readiness: Readiness) {
     ui.add_space(((ui.available_height() - TEXT_HEIGHT) / 2.0).max(0.0));
     ui.label(tokens::display("AnyXboxX"));
+    ui.label(
+        egui::RichText::new("DIFFBASE")
+            .size(tokens::SUBTITLE)
+            .strong()
+            .color(theme::GLOW),
+    );
     ui.add_space(tokens::XS);
     ui.label(tokens::muted(
-        "Run your own Xbox game build on this PC. Nothing leaves your machine.",
+        "Run your own Xbox Series build on this PC with our VIctory line: card budgets, RAM relief and a lighter submitting thread. Nothing leaves your machine.",
     ));
     ui.add_space(tokens::L);
     ui.horizontal_wrapped(|ui| {
@@ -118,11 +124,18 @@ fn hero_text(app: &mut App, ui: &mut Ui, readiness: Readiness) {
     }
     ui.add_space(tokens::M);
     let options = &app.settings.options;
+    let size = options
+        .size(app.screen)
+        .map_or("title's own size".to_string(), crate::output::format_size);
     ui.label(tokens::caption(format!(
-        "Preset {}. Keyboard: {}. Change them on the Play page.",
+        "{size}{}. Preset {}. Keyboard: {}. Change them on the Play page.",
+        if options.features.dlss { ", DLSS" } else { "" },
         options.preset.label(),
         options.keyboard.label()
     )));
+    ui.label(tokens::caption(
+        "In game: click the picture to use the mouse, F9 lets it go, F3 shows the stats.",
+    ));
 }
 
 fn status_chips(app: &App, ui: &mut Ui, readiness: Readiness) {

@@ -6,9 +6,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The short commit hash of the build, `unknown` outside a git checkout.
 pub const COMMIT: &str = env!("ANYXBOXX_GIT_COMMIT");
 
-/// `AnyXboxX launcher 0.1.0, commit 1a2b3c4d`.
+/// `anyXboxx-diffbase launcher 0.1.0, commit 1a2b3c4d`.
 pub fn line() -> String {
-    format!("AnyXboxX launcher {VERSION}, commit {COMMIT}")
+    format!("anyXboxx-diffbase launcher {VERSION}, commit {COMMIT}")
 }
 
 #[cfg(test)]

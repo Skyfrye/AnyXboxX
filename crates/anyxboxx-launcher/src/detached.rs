@@ -1,9 +1,11 @@
 //! Starting the game so that it outlives the launcher: a detached process (no console, its own
-//! process group), its output written to a log file under `%LOCALAPPDATA%\AnyXboxX\logs` instead
-//! of pipes the launcher would have to hold. The launcher then waits briefly and may close.
+//! process group), its output written to a log file in `logs` next to the launcher (else under
+//! `%LOCALAPPDATA%\AnyXboxX-diffbase\logs`) instead of pipes the launcher would have to hold. The
+//! log starts with the command and its VIctory settings. The launcher then waits briefly and may
+//! close.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,11 +25,53 @@ pub fn spawn_flags() -> u32 {
     DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 }
 
-/// `%LOCALAPPDATA%\AnyXboxX\logs`, `None` when LOCALAPPDATA is not set or empty.
-pub fn log_dir(local_app_data: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    local_app_data
-        .filter(|v| !v.is_empty())
-        .map(|local| PathBuf::from(local).join("AnyXboxX").join("logs"))
+/// Where the game logs go: `logs` next to the launcher when that folder can be written, else
+/// `%LOCALAPPDATA%\AnyXboxX-diffbase\logs`; `None` when neither is known.
+pub fn log_dir(
+    launcher_dir: Option<&Path>,
+    local_app_data: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    launcher_dir
+        .map(|dir| dir.join("logs"))
+        .filter(|logs| writable(logs))
+        .or_else(|| {
+            local_app_data.filter(|v| !v.is_empty()).map(|local| {
+                PathBuf::from(local)
+                    .join(crate::store::APP_DIR)
+                    .join("logs")
+            })
+        })
+}
+
+/// Whether files can be made in `dir` (made first when missing).
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(".write-test");
+    let ok = std::fs::create_dir_all(dir).is_ok() && std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
+/// The first lines of a game log: what was started and with which VIctory settings.
+pub fn header(command: &Command) -> String {
+    let mut text = format!(
+        "== {}\n== {}",
+        crate::about::line(),
+        command.get_program().to_string_lossy()
+    );
+    for arg in command.get_args() {
+        text.push(' ');
+        text.push_str(&arg.to_string_lossy());
+    }
+    text.push('\n');
+    for (key, value) in command.get_envs() {
+        let key = key.to_string_lossy();
+        if key.starts_with("VICTORY_") || key.starts_with("VKD3D_") {
+            let value = value.map_or(String::new(), |v| v.to_string_lossy().into_owned());
+            text.push_str(&format!("== {key}={value}\n"));
+        }
+    }
+    text.push_str("==\n");
+    text
 }
 
 /// `game-<unix seconds>.log` in `dir`: one file per launch.
@@ -41,7 +85,8 @@ pub fn spawn_game(mut command: Command, log: &Path) -> io::Result<Child> {
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let file = File::create(log)?;
+    let mut file = File::create(log)?;
+    file.write_all(header(&command).as_bytes())?;
     let errors = file.try_clone()?;
     command
         .stdin(Stdio::null())
@@ -89,11 +134,18 @@ mod tests {
     }
 
     #[test]
-    fn logs_live_under_appdata_anyxboxx_logs() {
-        let dir = log_dir(Some(std::ffi::OsStr::new(r"C:\Users\me\AppData\Local"))).expect("dir");
-        assert!(dir.ends_with(Path::new("AnyXboxX").join("logs")));
-        assert!(log_dir(None).is_none());
-        assert!(log_dir(Some(std::ffi::OsStr::new(""))).is_none());
+    fn logs_live_next_to_the_launcher_else_under_appdata() {
+        let launcher = tempfile::tempdir().expect("tempdir");
+        let local = std::ffi::OsStr::new(r"C:\Users\me\AppData\Local");
+        let near = log_dir(Some(launcher.path()), Some(local)).expect("dir");
+        assert_eq!(near, launcher.path().join("logs"));
+        assert!(near.is_dir());
+        let a_file = launcher.path().join("a-file");
+        std::fs::write(&a_file, b"x").expect("write");
+        let dir = log_dir(Some(&a_file), Some(local)).expect("dir");
+        assert!(dir.ends_with(Path::new("AnyXboxX-diffbase").join("logs")));
+        assert!(log_dir(None, None).is_none());
+        assert!(log_dir(None, Some(std::ffi::OsStr::new(""))).is_none());
         let log = game_log_path(&dir, 1_795_654_414);
         assert_eq!(
             log.file_name().and_then(|n| n.to_str()),
@@ -117,6 +169,19 @@ mod tests {
             log.is_file(),
             "the log file is created before the child starts"
         );
+    }
+
+    #[test]
+    fn the_log_starts_with_the_command_and_its_victory_settings() {
+        let mut command = Command::new("victory.exe");
+        command
+            .args(["run", "game.exe"])
+            .env("VICTORY_PANEL", "1")
+            .env("PATH", "x");
+        let text = header(&command);
+        assert!(text.contains("victory.exe run game.exe"));
+        assert!(text.contains("== VICTORY_PANEL=1\n"));
+        assert!(!text.contains("PATH="));
     }
 
     #[test]

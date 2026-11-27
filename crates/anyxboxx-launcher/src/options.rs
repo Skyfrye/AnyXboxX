@@ -1,17 +1,18 @@
 //! The launch options of the Play page and the environment each one sets. Every option that
 //! reaches VIctory goes through the one table in `env_pairs`, and `ENV_NAMES` lists the variable
 //! names it may use: a test checks each of them against VIctory's own sources in this tree, so an
-//! option never names a variable nothing reads.
+//! option never names a variable nothing reads. The output size is `output`'s, the optional
+//! features `features`'s.
 //!
 //! Not offered: the Series S console profile (`victory run --console series-s`, an argument, not a
-//! variable). Gone with the Neptune base, which had them: the F10 stats overlay (VIctory's panel,
-//! `VICTORY_PANEL=1`, is in diagnostics builds only), the frame-time CSV and the texture size cap.
+//! variable).
 
 use serde::{Deserialize, Serialize};
 
 use crate::env::Pair;
+use crate::features::Features;
+use crate::output::{self, Output};
 
-pub const DISPLAY_MODE: &str = "VICTORY_DISPLAY_MODE";
 pub const WINDOW_MODE: &str = "VICTORY_WINDOW_MODE";
 pub const KEYBOARD: &str = "VICTORY_KEYBOARD";
 pub const LOG: &str = "VICTORY_LOG";
@@ -21,32 +22,35 @@ pub const KEYS: &str = "VICTORY_KEYS";
 /// Every variable an option may set (the preset's own are in `Preset::overrides`); the tests
 /// check them against VIctory's sources.
 #[cfg(test)]
-pub const ENV_NAMES: [&str; 5] = [DISPLAY_MODE, WINDOW_MODE, KEYBOARD, LOG, KEYS];
-
-/// VIctory accepts a display size inside these bounds and falls back to 4K outside them.
-const WIDTH_RANGE: (u32, u32) = (640, 7680);
-const HEIGHT_RANGE: (u32, u32) = (360, 4320);
+pub const ENV_NAMES: [&str; 6] = [
+    crate::output::OUTPUT,
+    crate::output::RENDER_SCALE,
+    WINDOW_MODE,
+    KEYBOARD,
+    LOG,
+    KEYS,
+];
 
 /// VIctory's own room left for textures when nothing says otherwise (`VICTORY_TEXTURE_ROOM_PERCENT`,
 /// `victory-gpu` `resource.rs`).
 #[cfg(test)]
 pub const DEFAULT_TEXTURE_ROOM_PERCENT: u32 = 90;
 
-/// The "8 GB card" preset: VIctory's buffer copies on the card capped at 512 MB (by default they
-/// scale with the card: 512 MB up to a 12 GB budget, 2048 MB on 16 GB cards) and textures given 85 %
-/// of the card's budget instead of 90 %, so that the card stays under the budget Windows gives the
-/// game. Draw-data windows stay in the PC's memory on this base by default
-/// (`VICTORY_CARD_WINDOWS_MB` unset). The Neptune base's texture size cap
-/// (`VICTORY_TEXTURE_MAX_SIZE`) is not in this base. Not measured on this base.
+/// The "8 GB card" preset: on top of the NVIDIA profile's reservations (1536 MB of buffers and
+/// 1024 MB of draw-data windows on the card), buffer copies capped at 512 MB, no draw-data windows on
+/// the card (read from the PC's memory each frame) and textures given 85 % of the card's budget
+/// instead of 90 %, so that the card stays under the budget Windows gives the game. Not measured.
 pub const LOW_VRAM: &[(&str, &str)] = &[
     ("VICTORY_CARD_BUFFERS_MB", "512"),
+    ("VICTORY_CARD_WINDOWS_MB", "0"),
     ("VICTORY_TEXTURE_ROOM_PERCENT", "85"),
 ];
 
-/// The "12 GB card" preset: buffer copies on the card capped at 1024 MB, textures at VIctory's
-/// default room. Not measured on a 12 GB card yet.
+/// The "12 GB card" preset: buffer copies on the card capped at 1024 MB, draw-data windows at
+/// 512 MB, textures at VIctory's default room. Not measured on a 12 GB card yet.
 pub const MID_VRAM: &[(&str, &str)] = &[
     ("VICTORY_CARD_BUFFERS_MB", "1024"),
+    ("VICTORY_CARD_WINDOWS_MB", "512"),
     ("VICTORY_TEXTURE_ROOM_PERCENT", "90"),
 ];
 
@@ -81,15 +85,15 @@ impl Preset {
 
     pub fn description(self) -> &'static str {
         match self {
-            Preset::Fast => "The profile as measured: the best speed known so far.",
+            Preset::Fast => "The profile as measured: the best speed known so far (16 GB cards).",
             Preset::Quality => {
                 "Picture first: windows and buffers read fresh each frame, fewer copies on the card. Slower; not measured on this VIctory base yet."
             }
             Preset::LowVram => {
-                "For 8 GB cards: smaller buffer reserves on the card and less room for textures, so the card stays within its budget instead of spilling into the PC's memory. Pair it with the 1920x1080 display size. Not measured on this VIctory base yet."
+                "For 8 GB cards: smaller reservations on the card and less room for textures, so the card stays within its budget instead of spilling into the PC's memory. Pair it with 1920x1080. Not measured."
             }
             Preset::MidVram => {
-                "For 12 GB cards: buffer reserves on the card capped at 1024 MB. Not measured on a 12 GB card yet."
+                "For 12 GB cards: reservations on the card capped at 1024 MB of buffers and 512 MB of windows. Not measured on a 12 GB card yet."
             }
         }
     }
@@ -111,55 +115,6 @@ impl Preset {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Resolution {
-    /// VIctory's own default (the 4K display the console reports).
-    #[default]
-    Default,
-    P720,
-    P900,
-    P1080,
-    P1440,
-    P2160,
-    Custom,
-}
-
-impl Resolution {
-    pub const ALL: [Resolution; 7] = [
-        Resolution::Default,
-        Resolution::P720,
-        Resolution::P900,
-        Resolution::P1080,
-        Resolution::P1440,
-        Resolution::P2160,
-        Resolution::Custom,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Resolution::Default => "Default",
-            Resolution::P720 => "1280x720",
-            Resolution::P900 => "1600x900",
-            Resolution::P1080 => "1920x1080",
-            Resolution::P1440 => "2560x1440",
-            Resolution::P2160 => "3840x2160",
-            Resolution::Custom => "Custom",
-        }
-    }
-
-    fn fixed_size(self) -> Option<(u32, u32)> {
-        match self {
-            Resolution::P720 => Some((1280, 720)),
-            Resolution::P900 => Some((1600, 900)),
-            Resolution::P1080 => Some((1920, 1080)),
-            Resolution::P1440 => Some((2560, 1440)),
-            Resolution::P2160 => Some((3840, 2160)),
-            Resolution::Default | Resolution::Custom => None,
         }
     }
 }
@@ -263,9 +218,10 @@ impl LogLevel {
 #[serde(default)]
 pub struct LaunchOptions {
     pub preset: Preset,
-    pub resolution: Resolution,
-    pub custom_width: u32,
-    pub custom_height: u32,
+    /// The size the title draws at (`VICTORY_OUTPUT`).
+    pub output: Output,
+    /// Render at the output size (`VICTORY_RENDER_SCALE=1.0`) instead of the title's two thirds.
+    pub native_render: bool,
     pub window: WindowMode,
     pub keyboard: Keyboard,
     pub log: LogLevel,
@@ -276,48 +232,47 @@ pub struct LaunchOptions {
     /// NVIDIA Smooth Motion (driver frame generation) for victory.exe: written into the driver's
     /// profile before each launch (`smooth_motion`), not into VIctory's environment.
     pub smooth_motion: bool,
+    /// The optional features (overlay, DLSS, ray tracing, natural eyes, confetti fix).
+    pub features: Features,
 }
 
 impl Default for LaunchOptions {
     fn default() -> Self {
         LaunchOptions {
             preset: Preset::Fast,
-            resolution: Resolution::Default,
-            custom_width: 1920,
-            custom_height: 1080,
+            output: Output::Screen,
+            native_render: true,
             window: WindowMode::Windowed,
             keyboard: Keyboard::Auto,
             log: LogLevel::Default,
             warm_first: false,
             auto_a: false,
             smooth_motion: false,
+            features: Features::default(),
         }
     }
 }
 
 impl LaunchOptions {
-    /// The display size to report, `None` for VIctory's default (or an out-of-range custom size).
-    pub fn size(&self) -> Option<(u32, u32)> {
-        match self.resolution {
-            Resolution::Custom => self
-                .custom_valid()
-                .then_some((self.custom_width, self.custom_height)),
-            other => other.fixed_size(),
-        }
+    /// The output size to ask for given the main screen's size, `None` for the title's own.
+    pub fn size(&self, screen: Option<(u32, u32)>) -> Option<(u32, u32)> {
+        self.output.size(screen)
     }
 
-    /// Whether the custom size is one VIctory accepts.
-    pub fn custom_valid(&self) -> bool {
-        (WIDTH_RANGE.0..=WIDTH_RANGE.1).contains(&self.custom_width)
-            && (HEIGHT_RANGE.0..=HEIGHT_RANGE.1).contains(&self.custom_height)
-    }
-
-    /// The variables the options set: the preset's, then one table row per option that left its
-    /// default. The user's own overrides go after these and win.
-    pub fn env_pairs(&self) -> Vec<Pair> {
+    /// The variables the options set: the preset's, the output size (and the native render scale,
+    /// only with an output size: without one the title's 3840x2160 would be rendered whole), then
+    /// one table row per option that left its default, then the features. The user's own overrides
+    /// go after these and win.
+    pub fn env_pairs(&self, screen: Option<(u32, u32)>) -> Vec<Pair> {
         let mut pairs = self.preset.overrides();
-        if let Some((w, h)) = self.size() {
-            pairs.push((DISPLAY_MODE.to_string(), format!("{w}x{h}")));
+        if let Some(size) = self.size(screen) {
+            pairs.push((output::OUTPUT.to_string(), output::format_size(size)));
+            if self.native_render {
+                pairs.push((
+                    output::RENDER_SCALE.to_string(),
+                    output::NATIVE_SCALE.to_string(),
+                ));
+            }
         }
         if self.window == WindowMode::Borderless {
             pairs.push((WINDOW_MODE.to_string(), "borderless".to_string()));
@@ -343,179 +298,11 @@ impl LaunchOptions {
         if self.auto_a {
             pairs.push((KEYS.to_string(), anyxboxx::run::auto_a_keys()));
         }
+        pairs.extend(self.features.env_pairs());
         pairs
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn the_defaults_set_nothing() {
-        assert!(LaunchOptions::default().env_pairs().is_empty());
-    }
-
-    #[test]
-    fn every_choice_maps_to_its_variable() {
-        let options = LaunchOptions {
-            preset: Preset::Quality,
-            resolution: Resolution::P1440,
-            window: WindowMode::Borderless,
-            keyboard: Keyboard::Azerty,
-            log: LogLevel::Debug,
-            ..LaunchOptions::default()
-        };
-        let pairs = options.env_pairs();
-        let get = |name: &str| {
-            pairs
-                .iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.as_str())
-        };
-        assert_eq!(get(DISPLAY_MODE), Some("2560x1440"));
-        assert_eq!(get(WINDOW_MODE), Some("borderless"));
-        assert_eq!(get(KEYBOARD), Some("azerty"));
-        assert_eq!(get(LOG), Some("debug"));
-        assert_eq!(get("VICTORY_CARD_WINDOWS_MB"), Some("0"));
-        assert_eq!(get("VICTORY_TEXTURE_STAGE_MB"), Some("192"));
-    }
-
-    #[test]
-    fn auto_a_is_the_cli_s_key_script() {
-        let options = LaunchOptions {
-            auto_a: true,
-            ..LaunchOptions::default()
-        };
-        let pairs = options.env_pairs();
-        assert_eq!(
-            pairs,
-            vec![(KEYS.to_string(), anyxboxx::run::auto_a_keys())]
-        );
-        assert!(!LaunchOptions::default().auto_a);
-    }
-
-    #[test]
-    fn quality_is_exactly_mains_quality_set() {
-        let quality = Preset::Quality.overrides();
-        let expected: Vec<Pair> = anyxboxx::run::QUALITY
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect();
-        assert_eq!(quality, expected);
-        assert_eq!(quality.len(), 3);
-    }
-
-    #[test]
-    fn the_card_presets_shrink_what_the_card_holds_8_gb_below_12_gb() {
-        let value = |preset: Preset, name: &str| {
-            preset
-                .overrides()
-                .into_iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.parse::<u32>().expect("a number"))
-                .expect("set by the preset")
-        };
-        assert!(
-            value(Preset::LowVram, "VICTORY_CARD_BUFFERS_MB")
-                < value(Preset::MidVram, "VICTORY_CARD_BUFFERS_MB")
-        );
-        assert!(
-            value(Preset::LowVram, "VICTORY_TEXTURE_ROOM_PERCENT") < DEFAULT_TEXTURE_ROOM_PERCENT
-        );
-        assert!(
-            value(Preset::MidVram, "VICTORY_TEXTURE_ROOM_PERCENT") <= DEFAULT_TEXTURE_ROOM_PERCENT
-        );
-        // Neither preset reserves draw-data windows on the card: this base keeps none by default.
-        for preset in [Preset::LowVram, Preset::MidVram] {
-            assert!(
-                preset
-                    .overrides()
-                    .iter()
-                    .all(|(k, _)| k != "VICTORY_CARD_WINDOWS_MB")
-            );
-        }
-        // The profiles leave both reserves to VIctory.
-        assert!(
-            anyxboxx::run::TUNED
-                .iter()
-                .all(|(k, _)| !k.starts_with("VICTORY_CARD_BUFFERS_MB")
-                    && *k != "VICTORY_TEXTURE_ROOM_PERCENT")
-        );
-        assert!(Preset::ALL.contains(&Preset::LowVram) && Preset::ALL.contains(&Preset::MidVram));
-    }
-
-    #[test]
-    fn a_custom_size_is_checked_against_victorys_bounds() {
-        let mut options = LaunchOptions {
-            resolution: Resolution::Custom,
-            custom_width: 1366,
-            custom_height: 768,
-            ..LaunchOptions::default()
-        };
-        assert_eq!(options.size(), Some((1366, 768)));
-        options.custom_width = 100;
-        assert_eq!(options.size(), None);
-        assert!(options.env_pairs().is_empty());
-        options.custom_width = 1366;
-        options.custom_height = 5000;
-        assert!(!options.custom_valid());
-    }
-
-    #[test]
-    fn the_legend_shows_the_keys_of_the_layout() {
-        assert_eq!(Keyboard::Azerty.move_keys(), "Z Q S D");
-        assert_eq!(Keyboard::Qwerty.move_keys(), "W A S D");
-        assert!(Keyboard::Auto.move_keys().contains("AZERTY"));
-        assert!(Keyboard::Qwertz.shoulder_keys().contains("Y C"));
-    }
-
-    #[test]
-    fn every_variable_an_option_names_exists_in_victorys_sources() {
-        let victory = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("third_party")
-            .join("victory")
-            .join("crates");
-        if !victory.is_dir() {
-            return;
-        }
-        let mut sources = String::new();
-        collect_rs(&victory, &mut sources);
-        let preset_names: Vec<String> = Preset::Quality
-            .overrides()
-            .into_iter()
-            .chain(Preset::LowVram.overrides())
-            .chain(Preset::MidVram.overrides())
-            .map(|(k, _)| k)
-            .collect();
-        for name in ENV_NAMES
-            .iter()
-            .copied()
-            .chain(preset_names.iter().map(String::as_str))
-        {
-            assert!(
-                sources.contains(&format!("\"{name}\"")),
-                "{name} is read nowhere in third_party/victory"
-            );
-        }
-    }
-
-    fn collect_rs(dir: &Path, into: &mut String) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_rs(&path, into);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && let Ok(text) = std::fs::read_to_string(&path)
-            {
-                into.push_str(&text);
-            }
-        }
-    }
-}
+#[path = "options_tests.rs"]
+mod tests;

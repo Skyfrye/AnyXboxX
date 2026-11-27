@@ -1,4 +1,5 @@
-//! The settings file: `%LOCALAPPDATA%\AnyXboxX\launcher\settings.toml`. It keeps the game folder,
+//! The settings file: `%LOCALAPPDATA%\AnyXboxX-diffbase\launcher\settings.toml` (apart from the
+//! upstream AnyXboxX launcher's). It keeps the game folder,
 //! the thread count and the Play page's options between runs. A missing or broken
 //! file is not an error: the launcher starts with its defaults.
 
@@ -20,8 +21,12 @@ pub struct Stored {
     /// Keep the launcher open after the game started.
     pub keep_open_after_launch: bool,
     pub always_rewarm: bool,
+    pub warm_before_play: bool,
     pub options: LaunchOptions,
 }
+
+/// The folder of this launcher's files under `%LOCALAPPDATA%`.
+pub const APP_DIR: &str = "AnyXboxX-diffbase";
 
 impl Stored {
     pub fn from_settings(settings: &Settings) -> Self {
@@ -31,6 +36,7 @@ impl Stored {
             skip_process_check: settings.skip_process_check,
             keep_open_after_launch: settings.keep_open_after_launch,
             always_rewarm: settings.always_rewarm,
+            warm_before_play: settings.warm_before_play,
             options: settings.options.clone(),
         }
     }
@@ -43,6 +49,7 @@ impl Stored {
             skip_process_check: self.skip_process_check,
             keep_open_after_launch: self.keep_open_after_launch,
             always_rewarm: self.always_rewarm,
+            warm_before_play: self.warm_before_play,
             options: self.options,
             ..Settings::default()
         }
@@ -53,7 +60,7 @@ impl Stored {
 pub fn path_in(local_app_data: Option<&OsStr>) -> Option<PathBuf> {
     local_app_data.filter(|v| !v.is_empty()).map(|root| {
         PathBuf::from(root)
-            .join("AnyXboxX")
+            .join(APP_DIR)
             .join("launcher")
             .join("settings.toml")
     })
@@ -81,7 +88,8 @@ pub fn save(path: &Path, stored: &Stored) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{Keyboard, Preset, Resolution, WindowMode};
+    use crate::options::{Keyboard, Preset, WindowMode};
+    use crate::output::Output;
 
     fn sample() -> Settings {
         Settings {
@@ -92,7 +100,7 @@ mod tests {
             always_rewarm: true,
             options: LaunchOptions {
                 preset: Preset::Quality,
-                resolution: Resolution::P1080,
+                output: Output::P1080,
                 window: WindowMode::Borderless,
                 keyboard: Keyboard::Azerty,
                 warm_first: true,
@@ -114,6 +122,7 @@ mod tests {
         assert_eq!(settings.game_dir, "D:\\Game");
         assert_eq!(settings.options.keyboard, Keyboard::Azerty);
         assert!(settings.options.warm_first);
+        assert_eq!(settings.options.output, Output::P1080);
     }
 
     #[test]
@@ -159,8 +168,8 @@ mod tests {
     fn the_path_is_under_local_app_data() {
         let path = path_in(Some(OsStr::new("C:\\L"))).expect("path");
         assert!(
-            path.ends_with("AnyXboxX/launcher/settings.toml")
-                || path.ends_with("AnyXboxX\\launcher\\settings.toml")
+            path.ends_with("AnyXboxX-diffbase/launcher/settings.toml")
+                || path.ends_with("AnyXboxX-diffbase\\launcher\\settings.toml")
         );
         assert_eq!(path_in(None), None);
         assert_eq!(path_in(Some(OsStr::new(""))), None);

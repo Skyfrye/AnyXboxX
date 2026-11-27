@@ -64,6 +64,8 @@ pub struct App {
     pub host: Host,
     pub gpu: GpuVendor,
     pub adapter_name: Option<String>,
+    /// The main screen's size in pixels, read at start (`screen`).
+    pub screen: Option<(u32, u32)>,
     adapters: Option<Vec<Adapter>>,
     pub setup: Vec<Item>,
     pub settings: Settings,
@@ -121,6 +123,13 @@ fn read_setup(adapters: Option<&[crate::host::Adapter]>) -> Vec<Item> {
     setup::checklist(&facts)
 }
 
+/// A `victory.exe` in the launcher's own folder (a prebuilt pair): used as is, never rebuilt.
+fn prebuilt_beside_launcher() -> Option<PathBuf> {
+    picker::launcher_dir()
+        .map(|dir| dir.join("victory.exe"))
+        .filter(|exe| exe.is_file())
+}
+
 impl App {
     /// The window's first state: the setup checklist, the GPU and the host are read now.
     pub fn new() -> Result<Self, String> {
@@ -143,11 +152,12 @@ impl App {
             .map(|a| a.name.clone());
         let mut app = App {
             repo: anyxboxx::run::find_repo(None),
-            victory_exe: None,
+            victory_exe: prebuilt_beside_launcher(),
             profiles,
             host,
             gpu,
             adapter_name,
+            screen: crate::screen::primary_size(),
             setup: read_setup(adapters.as_deref()),
             adapters,
             settings,
@@ -204,12 +214,18 @@ impl App {
         self.open_dialog(Pick::GameFolder);
     }
 
+    /// Opens the file dialog for the user's own DLSS model.
+    pub fn pick_dlss_model(&mut self) {
+        self.open_dialog(Pick::DlssModel);
+    }
+
     fn open_dialog(&mut self, kind: Pick) {
         if self.pick_rx.is_some() {
             return;
         }
         let start = match kind {
             Pick::GameFolder => self.settings.game_path(),
+            Pick::DlssModel => None,
         };
         self.pick_rx = Some(picker::open(kind, start));
     }
@@ -241,6 +257,9 @@ impl App {
         };
         match kind {
             Pick::GameFolder => self.set_game_folder(&path),
+            Pick::DlssModel => {
+                self.settings.options.features.dlss_dll = path.display().to_string();
+            }
         }
     }
 
@@ -277,6 +296,14 @@ impl App {
                     .map(|l| PathBuf::from(l).join("victory").join("data"))
             });
         data.map_or("unknown".to_string(), |d| d.display().to_string())
+    }
+
+    /// Where this launch's game log goes (`detached::log_dir`).
+    pub fn log_folder(&self) -> Option<PathBuf> {
+        crate::detached::log_dir(
+            picker::launcher_dir().as_deref(),
+            std::env::var_os("LOCALAPPDATA").as_deref(),
+        )
     }
 
     pub fn is_busy(&self) -> bool {
@@ -338,7 +365,11 @@ impl App {
         let steps: Result<Vec<Step>, anyxboxx::run::RunError> = if precompile_only {
             launch::precompile_steps(&plan)
         } else {
-            launch::play_steps(&plan, self.settings.options.warm_first)
+            launch::play_steps(
+                &plan,
+                self.settings.warm_before_play,
+                self.settings.options.warm_first,
+            )
         };
         match steps {
             Ok(steps) => self.spawn_steps(steps, precompile_only),

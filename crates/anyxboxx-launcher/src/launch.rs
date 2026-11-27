@@ -40,17 +40,18 @@ fn resolve_victory(plan: &Plan) -> Result<Victory, RunError> {
     }
 }
 
-/// The steps of a launch, in order. `warm_first` also runs the shaders.rpf/exe/DLL preload.
+/// The steps of a launch, in order. `warm_before` runs the shader warm of the archives when the
+/// cache is stale; `warm_first` also runs the shaders.rpf/exe/DLL preload.
 ///
 /// When VIctory is built first, a warm that looked unneeded is still listed: it checks the
 /// fingerprint again once the build is over, because a rebuilt `victory.exe` changes it.
-pub fn play_steps(plan: &Plan, warm_first: bool) -> Result<Vec<Step>, RunError> {
+pub fn play_steps(plan: &Plan, warm_before: bool, warm_first: bool) -> Result<Vec<Step>, RunError> {
     let victory = resolve_victory(plan)?;
     anyxboxx::run::game_exe(&plan.game_dir)?;
     let build = build_step(&victory);
     let rebuilds = build.is_some();
     let mut steps: Vec<Step> = build.into_iter().collect();
-    if let Some(warm) = plan.warm.as_ref() {
+    if let Some(warm) = plan.warm.as_ref().filter(|_| warm_before) {
         let step = warm_step(&victory, plan, warm.marker.clone())?;
         if warm.needed {
             steps.push(step);
@@ -214,7 +215,7 @@ mod tests {
     #[test]
     fn play_runs_build_then_game_without_precompile() {
         let (_repo, _game, plan) = fixture();
-        let steps = play_steps(&plan, false).expect("steps");
+        let steps = play_steps(&plan, true, false).expect("steps");
         let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(labels, vec!["Building VIctory", "Running the game"]);
         let game_args = args_of(&steps[1].command);
@@ -237,7 +238,7 @@ mod tests {
         let exe = Victory::locate(&plan.repo, false).expect("victory").exe;
         let archives = warm_archives(&plan.game_dir).expect("archives");
         let check = |plan: &Plan| {
-            let mut steps = play_steps(plan, false).expect("steps");
+            let mut steps = play_steps(plan, true, false).expect("steps");
             let warm = steps
                 .iter_mut()
                 .find(|s| s.label == "Warming the shader cache")
@@ -249,6 +250,25 @@ mod tests {
         warm_state::write_marker(&marker, &fingerprint_now(&exe, &plan.env, &archives))
             .expect("marker");
         assert!(!check(&plan));
+    }
+
+    #[test]
+    fn a_stale_cache_is_warmed_only_when_asked() {
+        let (_repo, _game, mut plan) = fixture();
+        plan.warm = Some(WarmState {
+            needed: true,
+            marker: None,
+            fingerprint: "stale".to_string(),
+        });
+        let labels = |warm_before: bool| -> Vec<String> {
+            play_steps(&plan, warm_before, false)
+                .expect("steps")
+                .iter()
+                .map(|s| s.label.clone())
+                .collect()
+        };
+        assert!(labels(true).iter().any(|l| l == "Warming the shader cache"));
+        assert_eq!(labels(false), vec!["Building VIctory", "Running the game"]);
     }
 
     #[test]
@@ -276,7 +296,7 @@ mod tests {
     fn a_missing_game_exe_refuses_the_launch() {
         let (_repo, _game, mut plan) = fixture();
         plan.game_dir = PathBuf::from("Z:/no/such/game/folder");
-        assert!(play_steps(&plan, true).is_err());
+        assert!(play_steps(&plan, true, true).is_err());
     }
 
     #[test]
@@ -285,7 +305,7 @@ mod tests {
         let empty = tempfile::tempdir().expect("tempdir");
         plan.repo = empty.path().to_path_buf();
         assert!(!has_victory(&plan.repo));
-        assert!(play_steps(&plan, false).is_err());
+        assert!(play_steps(&plan, true, false).is_err());
     }
 
     #[test]
@@ -297,7 +317,7 @@ mod tests {
         plan.repo = PathBuf::new();
         plan.victory_exe = Some(exe.clone());
 
-        let play = play_steps(&plan, false).expect("play steps");
+        let play = play_steps(&plan, true, false).expect("play steps");
         let play_labels: Vec<&str> = play.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(play_labels, vec!["Running the game"]);
         assert_eq!(Path::new(play[0].command.get_program()), exe.as_path());
@@ -313,7 +333,7 @@ mod tests {
         let (_repo, _game, mut plan) = fixture();
         plan.victory_exe = Some(PathBuf::from("Z:/no/such/victory.exe"));
         assert!(matches!(
-            play_steps(&plan, false),
+            play_steps(&plan, true, false),
             Err(RunError::NoVictoryExe(_))
         ));
         assert!(matches!(
