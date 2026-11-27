@@ -350,3 +350,29 @@ fn the_shader_warm_steps_use_victorys_shaders_command() {
     assert_eq!(precompile.get_args().next().unwrap(), "shaders");
     std::fs::remove_dir_all(&game).unwrap();
 }
+
+#[test]
+fn diffbase_is_the_tuned_set_without_card_awake_then_its_additions() {
+    let joined: Vec<_> = TUNED
+        .iter()
+        .filter(|(k, _)| *k != DIFFBASE_DROPS)
+        .chain(DIFFBASE_EXTRA)
+        .copied()
+        .collect();
+    assert_eq!(DIFFBASE, joined.as_slice());
+    assert_eq!(DIFFBASE.len(), TUNED.len() - 1 + DIFFBASE_EXTRA.len());
+    assert!(DIFFBASE_EXTRA.contains(&("VICTORY_CARD_RESERVE_BUDGETS", "1")));
+    assert!(DIFFBASE_EXTRA.contains(&("VICTORY_HELPERS_ABOVE", "1")));
+}
+
+#[test]
+fn the_diffbase_profile_gives_its_set_and_never_card_awake() {
+    let env = settings::base(&parse(&["--game-dir", "G", "--profile", "diffbase"]));
+    assert_eq!(env.len(), HEAD.len() + DIFFBASE.len());
+    assert!(
+        DIFFBASE
+            .iter()
+            .all(|(k, v)| value(&env, k) == Some(OsString::from(v)))
+    );
+    assert_eq!(value(&env, DIFFBASE_DROPS), None);
+}

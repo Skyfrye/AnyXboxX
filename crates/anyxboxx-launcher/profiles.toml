@@ -17,20 +17,21 @@
 # queue, and "always" keeps them awake all the same.
 
 # ---------------------------------------------------------------------------------------------
-# Windows: the set VIctory's own launcher plays with (third_party/victory/scripts/play.ps1, without
-# -Safe and without its VICTORY_D3D12_DRED=light), the one `anyxboxx run` gives VIctory
-# (anyxboxx::run::TUNED; a test checks this table against it). VICTORY_RELAY=2 also makes stage 3
-# of the late waits VIctory's default. Measured by avatarmanz (VIctory-7900XTX README, 2026-11-26):
-# Windows 11, i9-12900K, RX 7900 XTX, Series X profile with renderer patches 1+2, about 19 fps.
-# Not measured on NVIDIA with this base: the NVIDIA profile is the same set, marked unmeasured.
+# Windows + NVIDIA: this line's set (anyxboxx::run::DIFFBASE, `anyxboxx run --profile diffbase`; a
+# test checks this table against it). VIctory's play.ps1 set (anyxboxx::run::TUNED) without
+# VICTORY_CARD_AWAKE (on NVIDIA its loop halved the drawing queue), plus the card budgets with a
+# reservation and RAM relief (Vice-Tay's ports), the placed order, and the submitting thread's
+# helpers above normal on their own core. Measured 2026-11-27 on an RTX 5080, Ryzen 7 9800X3D,
+# 31 GB, first cutscene at 2560x1440 native: 9.9 fps over the scene with TUNED alone, 22.8 with this
+# set (26.7 median second). The output size and the native render scale are the Play page's.
 # ---------------------------------------------------------------------------------------------
 [[profile]]
 id = "windows-nvidia"
-name = "Windows + NVIDIA"
+name = "Windows + NVIDIA (diffbase set)"
 os = "windows"
 gpu = "nvidia"
-status = "unmeasured"
-note = "VIctory's play.ps1 set, measured on an RX 7900 XTX; not measured on NVIDIA with this VIctory base."
+status = "measured"
+note = "Measured on an RTX 5080 (first cutscene, 2560x1440 native): about 10 fps with VIctory's play.ps1 set, about 23 with this one."
 
 [profile.env]
 VICTORY_TEXTURE_NO_WAIT = "1"
@@ -43,13 +44,28 @@ VICTORY_RELAY_COPY = "1"
 VICTORY_CARD_STEPS = "2"
 VICTORY_INDIRECT_BATCH = "2"
 VICTORY_MAP_THREADS = "1"
-VICTORY_CARD_AWAKE = "1"
 VICTORY_SHOW_AFTER = "1"
 VICTORY_AMBIENT = "0.8"
 VICTORY_THIN = "1"
 VICTORY_JOIN_PARTS = "8"
 VICTORY_UPLOAD_AHEAD = "1"
+VICTORY_PLACED_ORDER = "1"
+VICTORY_CARD_RESERVE_BUDGETS = "1"
+VICTORY_CARD_BUFFERS_MB = "1536"
+VICTORY_CARD_WINDOWS_MB = "1024"
+VICTORY_CARD_BUFFERS_MIN_KB = "64"
+VICTORY_RESIDENCY = "1"
+VICTORY_BACKGROUND_CORES = "1"
+VICTORY_LANE_CORE = "1"
+VICTORY_HELPERS_ABOVE = "1"
 
+# ---------------------------------------------------------------------------------------------
+# Windows + AMD: the set VIctory's own launcher plays with (third_party/victory/scripts/play.ps1,
+# without -Safe and without its VICTORY_D3D12_DRED=light), the one `anyxboxx run` gives VIctory by
+# default (anyxboxx::run::TUNED; a test checks this table against it). Measured by avatarmanz
+# (VIctory-7900XTX README, 2026-11-26): Windows 11, i9-12900K, RX 7900 XTX, about 19 fps. This
+# line's additions are not measured on AMD.
+# ---------------------------------------------------------------------------------------------
 [[profile]]
 id = "windows-amd"
 name = "Windows + AMD (measured set)"

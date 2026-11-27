@@ -117,7 +117,7 @@ mod tests {
     use super::*;
     use crate::host::GpuVendor;
     use crate::profile::Profiles;
-    use anyxboxx::run::TUNED;
+    use anyxboxx::run::DIFFBASE;
 
     fn profile(id: &str) -> Profile {
         Profiles::embedded()
@@ -190,10 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn windows_nvidia_env_sets_the_tuned_settings_exactly() {
+    fn windows_nvidia_env_sets_the_diffbase_settings_exactly() {
         let dir = game_folder();
         let env = build_env(dir.path(), &profile("windows-nvidia"), &[]).expect("env");
-        for (key, expected) in TUNED {
+        for (key, expected) in DIFFBASE {
             assert_eq!(value(&env, key).as_deref(), Some(*expected), "{key}");
         }
         assert_eq!(

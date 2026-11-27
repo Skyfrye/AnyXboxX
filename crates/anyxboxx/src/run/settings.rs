@@ -71,6 +71,59 @@ pub const LINUX_AMD: &[(&str, &str)] = &[
     ("VKD3D_CONFIG", "descriptor_heap"),
 ];
 
+/// What this line adds to [`TUNED`] on NVIDIA (`--profile diffbase`, the launcher's NVIDIA profile):
+/// the title's buffers kept on the card with a reservation instead of read by the GPU from the PC's
+/// memory (Vice-Tay's card budgets), RAM relief under pressure, Vice-Tay's placed order, and the
+/// submitting thread's helpers above normal on their own core with the D3D runtime's background
+/// threads on core 0. Measured 2026-11-27 on an RTX 5080, Ryzen 7 9800X3D, 31 GB, first cutscene at
+/// 2560x1440 native (`VICTORY_OUTPUT=2560x1440 VICTORY_RENDER_SCALE=1.0`): 9.9 fps over the scene
+/// with [`TUNED`] alone, 22.8 with this set.
+pub const DIFFBASE_EXTRA: &[(&str, &str)] = &[
+    ("VICTORY_PLACED_ORDER", "1"),
+    ("VICTORY_CARD_RESERVE_BUDGETS", "1"),
+    ("VICTORY_CARD_BUFFERS_MB", "1536"),
+    ("VICTORY_CARD_WINDOWS_MB", "1024"),
+    ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+    ("VICTORY_RESIDENCY", "1"),
+    ("VICTORY_BACKGROUND_CORES", "1"),
+    ("VICTORY_LANE_CORE", "1"),
+    ("VICTORY_HELPERS_ABOVE", "1"),
+];
+
+/// The switch [`DIFFBASE`] leaves out of [`TUNED`]: on NVIDIA the keep-awake loop halved the
+/// drawing queue.
+pub const DIFFBASE_DROPS: &str = "VICTORY_CARD_AWAKE";
+
+/// This line's NVIDIA set: [`TUNED`] without [`DIFFBASE_DROPS`], then [`DIFFBASE_EXTRA`] (a test
+/// checks it is exactly that). Kept in sync with `crates/anyxboxx-launcher/profiles.toml`
+/// (`windows-nvidia`).
+pub const DIFFBASE: &[(&str, &str)] = &[
+    ("VICTORY_TEXTURE_NO_WAIT", "1"),
+    ("VICTORY_RELAY", "2"),
+    ("VICTORY_WIDE_BACK", "1"),
+    ("VICTORY_CARD_REHASH_RUNS", "1"),
+    ("VICTORY_JOIN_COPIES", "1"),
+    ("VICTORY_INDIRECT_WINDOW", "1"),
+    ("VICTORY_RELAY_COPY", "1"),
+    ("VICTORY_CARD_STEPS", "2"),
+    ("VICTORY_INDIRECT_BATCH", "2"),
+    ("VICTORY_MAP_THREADS", "1"),
+    ("VICTORY_SHOW_AFTER", "1"),
+    ("VICTORY_AMBIENT", "0.8"),
+    ("VICTORY_THIN", "1"),
+    ("VICTORY_JOIN_PARTS", "8"),
+    ("VICTORY_UPLOAD_AHEAD", "1"),
+    ("VICTORY_PLACED_ORDER", "1"),
+    ("VICTORY_CARD_RESERVE_BUDGETS", "1"),
+    ("VICTORY_CARD_BUFFERS_MB", "1536"),
+    ("VICTORY_CARD_WINDOWS_MB", "1024"),
+    ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+    ("VICTORY_RESIDENCY", "1"),
+    ("VICTORY_BACKGROUND_CORES", "1"),
+    ("VICTORY_LANE_CORE", "1"),
+    ("VICTORY_HELPERS_ABOVE", "1"),
+];
+
 /// Picture first (`--quality`): applied after the tuned set, before `--override`. Draw-data windows
 /// stay in the PC's memory (read fresh each frame), fewer buffer copies on the card, a smaller
 /// texture staging pool. Not measured on this base.
@@ -117,6 +170,7 @@ pub fn base(args: &RunArgs) -> Vec<(String, OsString)> {
         match args.profile {
             Profile::WindowsNvidia => env.extend(pairs(TUNED)),
             Profile::LinuxAmd => env.extend(pairs(LINUX_AMD)),
+            Profile::Diffbase => env.extend(pairs(DIFFBASE)),
             Profile::Defaults => {}
         }
     }

@@ -71,6 +71,16 @@ def test_the_linux_table_is_the_tuned_set_then_the_linux_additions():
                            "VICTORY_PORT_CONSTANTS": "1", "VKD3D_CONFIG": "descriptor_heap"}
 
 
+def test_the_diffbase_table_is_the_tuned_set_without_card_awake_then_its_additions():
+    extra = rust_table("DIFFBASE_EXTRA")
+    tuned = [(k, v) for k, v in play_settings() if k != "VICTORY_CARD_AWAKE"]
+    assert rust_table("DIFFBASE") == tuned + extra
+    assert dict(extra) == {
+        "VICTORY_PLACED_ORDER": "1", "VICTORY_CARD_RESERVE_BUDGETS": "1", "VICTORY_CARD_BUFFERS_MB": "1536",
+        "VICTORY_CARD_WINDOWS_MB": "1024", "VICTORY_CARD_BUFFERS_MIN_KB": "64", "VICTORY_RESIDENCY": "1",
+        "VICTORY_BACKGROUND_CORES": "1", "VICTORY_LANE_CORE": "1", "VICTORY_HELPERS_ABOVE": "1"}
+
+
 def test_the_quality_set_names_only_switches_of_this_base():
     assert [k for k, _ in rust_table("QUALITY")] == ["VICTORY_CARD_WINDOWS_MB", "VICTORY_CARD_BUFFERS_MB",
                                                       "VICTORY_TEXTURE_STAGE_MB"]

@@ -279,28 +279,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn both_windows_profiles_are_exactly_the_tuned_set() {
-        use anyxboxx::run::TUNED;
-        let mut expected: Vec<(String, String)> = TUNED
+    fn sorted_env(id: &str) -> Vec<(String, String)> {
+        let profile = embedded().by_id(id).expect("profile").clone();
+        assert!(profile.pending.is_empty(), "{id}");
+        let mut actual: Vec<(String, String)> = profile
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        actual.sort();
+        actual
+    }
+
+    fn sorted_table(table: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut expected: Vec<(String, String)> = table
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         expected.sort();
-        for id in ["windows-nvidia", "windows-amd"] {
-            let profile = embedded().by_id(id).expect("profile").clone();
-            let mut actual: Vec<(String, String)> = profile
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            actual.sort();
-            assert_eq!(actual, expected, "{id}");
-            assert!(profile.pending.is_empty());
-        }
-        // Measured on an RX 7900 XTX only: the NVIDIA profile says so.
+        expected
+    }
+
+    #[test]
+    fn windows_amd_is_exactly_the_tuned_set() {
+        assert_eq!(
+            sorted_env("windows-amd"),
+            sorted_table(anyxboxx::run::TUNED)
+        );
+    }
+
+    #[test]
+    fn windows_nvidia_is_exactly_the_cli_diffbase_set_and_measured() {
+        assert_eq!(
+            sorted_env("windows-nvidia"),
+            sorted_table(anyxboxx::run::DIFFBASE)
+        );
         let nvidia = embedded().by_id("windows-nvidia").expect("profile").clone();
-        assert_eq!(nvidia.status, Status::Unmeasured);
+        assert_eq!(nvidia.status, Status::Measured);
+        assert!(!nvidia.env.contains_key(anyxboxx::run::DIFFBASE_DROPS));
     }
 
     #[test]

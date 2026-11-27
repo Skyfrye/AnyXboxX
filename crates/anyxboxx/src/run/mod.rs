@@ -10,7 +10,10 @@ use std::process::Command;
 
 use clap::{Args, ValueEnum};
 
-pub use settings::{LINUX_AMD, LINUX_AMD_EXTRA, QUALITY, TUNED, auto_a_keys};
+pub use settings::{
+    DIFFBASE, DIFFBASE_DROPS, DIFFBASE_EXTRA, LINUX_AMD, LINUX_AMD_EXTRA, QUALITY, TUNED,
+    auto_a_keys,
+};
 pub use steps::{
     Env, GAME_EXE, PRECOMPILED_DLLS, SHADERS, Victory, environment, game_exe, status, warm_archives,
 };
@@ -23,6 +26,9 @@ pub enum Profile {
     /// Linux (Proton) + AMD measured set (`LINUX_AMD`: `TUNED` plus the Linux additions, including
     /// `VKD3D_CONFIG=descriptor_heap`).
     LinuxAmd,
+    /// This line's NVIDIA set (`DIFFBASE`: `TUNED` without `VICTORY_CARD_AWAKE`, plus the card
+    /// budgets, RAM relief and submission-thread switches), measured on an RTX 5080.
+    Diffbase,
     /// VIctory's own defaults (no profile variables).
     Defaults,
 }
