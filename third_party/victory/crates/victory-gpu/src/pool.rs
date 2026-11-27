@@ -53,6 +53,13 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// with the card at 96.6 % of its budget. In a block of small pieces every
 /// free piece fits the next small texture, and a block whose copies were
 /// all replaced or let go empties and goes back to the system.
+///
+/// That holds for the first class at 64 KiB alignment, where each of its
+/// pieces is one 64 KiB unit; not with `VICTORY_POOL_SMALL=1` (4 KiB
+/// alignment), and not in the middle class, whose pieces run from 64 KiB to
+/// 1 MiB: a hole there fits only a piece no larger than the one that left
+/// it (a mean of 72 KB a copy in run nbc-measure means many copies are past
+/// 64 KiB). Those blocks still fragment; compaction would be the cure.
 const CLASS_TOPS: [u64; 2] = [64 << 10, 1 << 20];
 /// How many classes there are.
 pub(crate) const CLASSES: usize = CLASS_TOPS.len() + 1;
