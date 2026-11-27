@@ -1935,7 +1935,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 pub(crate) fn counted_in_use(used: u64) -> u64 {
     let system = crate::vram::system_room();
     let free = if system { 0 } else { crate::pool::texture_room() };
-    crate::vram::queue_count(used, free, crate::shadow::card_room_kept() + targets_room_kept(), system)
+    crate::vram::queue_count(used, free, crate::shadow::card_room_kept().saturating_add(targets_room_kept()), system)
 }
 
 /// [`counted_in_use`] as the sweep ([`let_go_idle`]) counts it: less the
