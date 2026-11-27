@@ -23,6 +23,11 @@
 //! reference holds them) and leaves them, and leaves what the title wrote
 //! over them since.
 //!
+//! What it saves is the landing of the flight read, and only where that
+//! landing runs while the card stands: on a frame bound by the card (run
+//! nbc-measure, the card some 92 % busy) that is little, the wait stays the
+//! card's.
+//!
 //! Why the title memory read is then what it was after the old wait. A byte
 //! of a range read is the title's, or the last of the flights that wrote it
 //! wrote it. Every flight that may write it declared that, and all of them
@@ -61,6 +66,11 @@
 //! drawing queue and a fetch beside it would be new, or with the check of
 //! torn fetches (`VICTORY_FETCH_CHECK=1`, Linux and AMD), which this fetch
 //! does not make; a copy in the PC's memory without its snapshot.
+//!
+//! What is not covered, as before: a submission's refreshes of other host
+//! copies over memory flights write see what title memory holds. A
+//! submission that waited for the landings for its read saw them landed
+//! there too, by chance of the wait; now only what is read is brought back.
 
 use std::sync::Arc;
 
