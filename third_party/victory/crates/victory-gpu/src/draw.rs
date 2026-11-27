@@ -270,18 +270,19 @@ impl BakeServed {
 }
 
 /// What a served pass before a bake covers: its heap (the host heap's
-/// address) and the count of that heap's queue's writes
+/// number, `HostHeap::id`: a heap made later at the same address is another
+/// one) and the count of that heap's queue's writes
 /// ([`crate::descriptor::host::HostHeap::texture_news`]) when the pass
 /// began ([`BakeServed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BakeStamp {
-    heap: usize,
+    heap: u64,
     writes: u64,
 }
 
 impl BakeStamp {
-    fn heap(host: &crate::descriptor::host::HostHeap) -> usize {
-        std::ptr::from_ref(host) as usize
+    fn heap(host: &crate::descriptor::host::HostHeap) -> u64 {
+        host.id()
     }
 
     /// Read before the pass takes the slots due: what is written after this
@@ -5511,6 +5512,31 @@ mod bake_tests {
         assert!(served.covers(&a));
         served.forget();
         assert!(!served.covers(&a), "a pass that was no bake's came since");
+        crate::pagegen::TEST_ON.set(None);
+    }
+
+    /// A heap made where a baked one was (the title let it go and made
+    /// another, at the same address) is another heap: a pass on the old one
+    /// covers no bake on it, whatever the count of its queue's writes.
+    #[test]
+    fn a_heap_made_in_the_place_of_a_baked_one_is_not_covered() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        crate::pagegen::TEST_ON.set(Some(true));
+        let texture = crate::resource::test_texture(3, 4, 4, 1);
+        let Some(mut heap) = crate::descriptor::host::HostHeap::new(false, 16) else { return };
+        let _old = heap.test_write_texture(3, texture);
+        let served = BakeServed::new();
+        BakeStamp::before_pass(&heap).served(&served);
+        assert!(served.covers(&heap));
+        let news = heap.texture_news();
+        let Some(other) = crate::descriptor::host::HostHeap::new(false, 16) else { return };
+        // (The old one let go, the new one in its place.)
+        heap = other;
+        let _new = heap.test_write_texture(3, texture);
+        assert_eq!(heap.texture_news(), news, "the same count of writes, and nothing noted");
+        assert!(!served.covers(&heap), "a heap made in the place of the one the pass was of");
         crate::pagegen::TEST_ON.set(None);
     }
 
