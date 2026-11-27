@@ -60,10 +60,17 @@ pub(crate) struct Unit {
 /// The order in which idle host copies go while the card is short, by what
 /// their going gives back to the system: every copy of a block whose every
 /// piece (`lives`, by block number) is an idle copy, which gives the block
-/// back, and copies with memory of their own; the fewest copies for a byte
-/// given back first, the longest unused first among equals. Copies in a
-/// block that holds one in use stay: their going would give nothing back
-/// (the pieces would be free inside a block the system still counts).
+/// back, and copies with memory of their own; the unit whose newest use is
+/// the oldest first, the fewest copies for a byte given back first among
+/// equals. Copies in a block that holds one in use stay: their going would
+/// give nothing back (the pieces would be free inside a block the system
+/// still counts).
+///
+/// (By copies per byte first, every whole block giving the same 64 MiB, the
+/// blocks of the largest class, few large textures in view, always went
+/// before blocks of small copies idle for minutes, after 1.5 s of rest;
+/// and with no blocks, `VICTORY_TEXTURE_POOL=0`, the largest copy first
+/// rather than the one unused longest. Round 2's review, items 4 and 10.)
 pub(crate) fn plan(idle: &[Idle], lives: &[u32], block_bytes: u64) -> Vec<Unit> {
     let mut by_block: std::collections::HashMap<u32, Vec<&Idle>> = std::collections::HashMap::new();
     // (Each with its newest use.)
@@ -85,7 +92,7 @@ pub(crate) fn plan(idle: &[Idle], lives: &[u32], block_bytes: u64) -> Vec<Unit> 
     units.sort_by(|(a_used, a), (b_used, b)| {
         let a_cost = a.textures.len() as u128 * u128::from(b.gives);
         let b_cost = b.textures.len() as u128 * u128::from(a.gives);
-        a_cost.cmp(&b_cost).then(a_used.cmp(b_used)).then(a.textures.cmp(&b.textures))
+        a_used.cmp(b_used).then(a_cost.cmp(&b_cost)).then(a.textures.cmp(&b.textures))
     });
     units.into_iter().map(|(_, unit)| unit).collect()
 }
@@ -253,9 +260,8 @@ mod tests {
         Idle { at, block, bytes, used }
     }
 
-    /// Only whole blocks and copies of their own go, the cheapest first: a
-    /// block of two copies before one of three, a copy of its own of 64 MiB
-    /// with them; a block with a copy in use is left alone.
+    /// Only whole blocks and copies of their own go, the one whose newest use
+    /// is the oldest first; a block with a copy in use is left alone.
     #[test]
     fn the_sweep_lets_whole_blocks_go_and_leaves_blocks_in_use() {
         let lives = [3, 2, 4];
@@ -277,12 +283,27 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                (vec![40], 64 << 20, None),
-                (vec![20, 21], BLOCK, Some(1)),
-                (vec![10, 11, 12], BLOCK, Some(0)),
                 (vec![41], 16 << 20, None),
+                (vec![40], 64 << 20, None),
+                (vec![10, 11, 12], BLOCK, Some(0)),
+                (vec![20, 21], BLOCK, Some(1)),
             ]
         );
+    }
+
+    /// A block of small copies unused for minutes goes before a block of a
+    /// few large textures that rested a second and a half: by their newest
+    /// use, whatever their count. Of two used last at once, the one of fewer
+    /// copies first. (By the count first, the large textures in view went
+    /// and were uploaded again over and over. Round 2's review, item 4.)
+    #[test]
+    fn the_block_unused_longest_goes_first_whatever_its_count() {
+        let lives = [1000, 2, 3];
+        let mut idle_ones: Vec<Idle> = (0..1000).map(|n| idle(n, Some(0), 64 << 10, 100)).collect();
+        idle_ones.extend([idle(5000, Some(1), 32 << 20, 90_000), idle(5001, Some(1), 32 << 20, 90_000)]);
+        idle_ones.extend([idle(6000, Some(2), 4 << 20, 90_000), idle(6001, Some(2), 4 << 20, 90_000), idle(6002, Some(2), 4 << 20, 1)]);
+        let plan = plan(&idle_ones, &lives, BLOCK);
+        assert_eq!(plan.iter().map(|u| u.block).collect::<Vec<_>>(), vec![Some(0), Some(1), Some(2)]);
     }
 
     /// Of blocks that cost the same, the one unused the longest first.
