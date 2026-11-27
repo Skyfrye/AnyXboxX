@@ -187,6 +187,25 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// The recording of list `this` begins while `frame` frames have been
+/// presented: its work is timed by pipeline if that frame is
+/// (`crate::host::passes`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn pass_arm(this: This, frame: u64) {
+    if let Some(host) = host_list(this) {
+        host.pass_arm(frame);
+    }
+}
+
+/// One of the title's copies, clears or resolves is about to be recorded
+/// into list `this` (`crate::host::passes`).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn pass_copies(this: This) {
+    if let Some(host) = host_list(this) {
+        host.pass_copies();
+    }
+}
+
 /// The host side of a submitted list, taken from it: a queue that waits
 /// for a fence runs it later, and the title may reset the list meanwhile.
 /// With it go the upload memory and the dynamic descriptor slots its
@@ -334,6 +353,9 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     };
+    // The part after the wait is timed by pipeline as the part before.
+    #[cfg(feature = "diagnostics")]
+    let timed = current.pass_timed();
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -345,6 +367,10 @@ fn cut(this: This, wait: ValueWait) {
     }
     // What the title set so far, on the new host list.
     if let Some(host) = list.host.as_ref() {
+        #[cfg(feature = "diagnostics")]
+        if let Some(frame) = timed {
+            host.pass_arm(frame);
+        }
         list.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -690,6 +716,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    // Timed by pipeline if the frame is (`crate::host::passes`; a list of
+    // ours that translates a written-down recording is told that
+    // recording's frame, `thin`).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pass_arm(this, crate::host::passes::frame_now());
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;
@@ -925,6 +956,8 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pass_copies(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -957,6 +990,8 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pass_copies(this);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -1046,6 +1081,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pass_copies(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1384,6 +1421,8 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pass_copies(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1460,6 +1499,8 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pass_copies(this);
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
@@ -1510,6 +1551,8 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pass_copies(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1549,6 +1592,8 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pass_copies(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0

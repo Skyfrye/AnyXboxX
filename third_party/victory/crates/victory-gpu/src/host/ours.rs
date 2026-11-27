@@ -100,7 +100,7 @@ impl Kind {
     }
 
     /// As the line names it.
-    fn text(self) -> &'static str {
+    pub(crate) fn text(self) -> &'static str {
         match self {
             Kind::Submission => "submissions",
             Kind::SendsUp => "sends up to copies in the card's memory",
