@@ -15,11 +15,13 @@
 //! that declared a write over what the steps read, and for the flights
 //! ahead of that one to land, as they do meanwhile. Then what they read, and
 //! only that, is brought back into title memory at once, from the host
-//! copies those flights wrote: a copy in the PC's memory merged as its
-//! landing merges it (`Shadow::relay_merge`), a copy in the card's memory
-//! fetched over a copy queue of its own and merged as its landing merges it
-//! (`Shadow::card_merge_relay`). The landing that comes later finds those
-//! bytes merged already (the copy's reference holds them) and leaves them.
+//! copies that flight wrote, merged as its landing merges them
+//! ([`crate::land`], or `Shadow::relay_merge` and `Shadow::card_merge_relay`
+//! with `VICTORY_LAND=0`): a copy in the PC's memory from its snapshot on, a
+//! copy in the card's memory fetched over a copy queue of its own. The
+//! landing that comes later finds those bytes merged already (the copy's
+//! reference holds them) and leaves them, and leaves what the title wrote
+//! over them since.
 //!
 //! Why the title memory read is then what it was after the old wait. A byte
 //! of a range read is the title's, or the last of the flights that wrote it
@@ -336,6 +338,57 @@ fn plan(items: &[Late], needs: &[(usize, usize)]) -> Result<Option<Plan>, &'stat
     }))
 }
 
+/// `parts` cut where the 64 KiB blocks of title memory end, as a landing
+/// cuts its pieces ([`crate::land::BLOCK`]), in the order of title memory
+/// (no two parts hold the same bytes): the part's number, from, to.
+fn blocks(parts: &[&Part]) -> Vec<(usize, usize, usize)> {
+    let block = crate::land::BLOCK;
+    let mut out = Vec::new();
+    for (i, &&(_, from, to)) in parts.iter().enumerate() {
+        let mut at = from;
+        while at < to {
+            let end = ((at / block + 1) * block).min(to);
+            out.push((i, at, end));
+            at = end;
+        }
+    }
+    out.sort_by_key(|p| p.1);
+    out
+}
+
+/// Parts of copies in the PC's memory go into title memory as their
+/// landing puts them (`RelayBack::merge`): the bytes put.
+fn merge_back(parts: &[&Part]) -> u64 {
+    use crate::land;
+    if parts.is_empty() {
+        return 0;
+    }
+    if !land::on() {
+        let (mut now, mut title) = (Vec::new(), Vec::new());
+        return parts
+            .iter()
+            .map(|(shadow, from, to)| {
+                let start = shadow.span().0 as usize;
+                shadow.relay_merge(from - start, to - from, &mut now, &mut title) as u64
+            })
+            .sum();
+    }
+    let pieces = blocks(parts);
+    let titles: Vec<(usize, usize)> = pieces.iter().map(|&(_, from, to)| (from, to - from)).collect();
+    let jobs = land::jobs(&titles);
+    let put = std::sync::atomic::AtomicU64::new(0);
+    land::each(jobs.len(), &|j| {
+        let mut notes = land::Notes::default();
+        for &(i, from, to) in &pieces[jobs[j].clone()] {
+            let shadow = &parts[i].0;
+            put.fetch_add(shadow.land_back(from - shadow.span().0 as usize, to - from, &mut notes), Ordering::Relaxed);
+        }
+        notes.flush();
+    });
+    land::count(land::stat::JOBS, jobs.len() as u64);
+    put.into_inner()
+}
+
 /// Whether the thread that lands flights may take the first of the line:
 /// something is there, and no read brings bytes back meanwhile.
 pub(super) fn may_land(line: &Line) -> bool {
@@ -558,31 +611,28 @@ impl Host {
     /// The parts of `plan` go into title memory: the bytes read, and the
     /// bytes of them put into title memory.
     fn bring_back(&self, plan: &Plan) -> Result<(u64, u64), &'static str> {
-        let (mut now, mut title) = (Vec::new(), Vec::new());
-        let (mut bytes, mut put) = (0u64, 0u64);
         // (Asked again first: nothing is merged where something is refused.)
         plan.fits()?;
+        let mut put = 0u64;
         let carded: Vec<&Part> = plan.back.iter().filter(|p| p.0.carded()).collect();
         if !carded.is_empty() {
             put += self.fetch_back(&carded, plan.sent)?;
             STATS[7].fetch_add(carded.len() as u64, Ordering::Relaxed);
         }
-        for (shadow, from, to) in plan.back.iter().filter(|p| !p.0.carded()) {
-            let start = shadow.span().0 as usize;
-            put += shadow.relay_merge(from - start, to - from, &mut now, &mut title) as u64;
-            STATS[6].fetch_add(1, Ordering::Relaxed);
-        }
-        for (_, from, to) in &plan.back {
-            bytes += (to - from) as u64;
-        }
+        let others: Vec<&Part> = plan.back.iter().filter(|p| !p.0.carded()).collect();
+        put += merge_back(&others);
+        STATS[6].fetch_add(others.len() as u64, Ordering::Relaxed);
+        let bytes = plan.back.iter().map(|p| (p.2 - p.1) as u64).sum();
         Ok((bytes, put))
     }
 
     /// Parts of copies in the card's memory: fetched over the copy queue
-    /// of [`FETCH`], and merged ([`Shadow::card_merge_relay`]) as having
-    /// run behind send `sent` (title bytes that went up later are left
-    /// out). The bytes put into title memory.
-    fn fetch_back(&self, parts: &[&(Arc<Shadow>, usize, usize)], sent: u64) -> Result<u64, &'static str> {
+    /// of [`FETCH`], and merged as their landing merges them
+    /// (`Host::relay_card_back`), as having run behind send `sent` (title
+    /// bytes that went up later are left out). The bytes put into title
+    /// memory.
+    fn fetch_back(&self, parts: &[&Part], sent: u64) -> Result<u64, &'static str> {
+        use crate::land;
         let total: u64 = parts.iter().map(|p| (p.2 - p.1) as u64).sum();
         let mut fetch = FETCH.lock().unwrap_or_else(|e| e.into_inner());
         if fetch.is_none() {
@@ -603,17 +653,21 @@ impl Host {
         // behind (`crate::shadow::relay_fetched`).
         let after = sent.max(crate::shadow::fetched_so_far());
         let fetching = std::time::Instant::now();
+        // Where each part comes down.
+        let mut at = Vec::with_capacity(parts.len());
+        let mut end = 0usize;
+        for p in parts {
+            at.push(end);
+            end += p.2 - p.1;
+        }
         // SAFETY: the list's last run was waited for (under the lock); live
         // buffers (the plan holds the copies); the parts lie in the copies.
         let ran = unsafe {
             (|| -> windows::core::Result<()> {
                 f.allocator.Reset()?;
                 f.list.Reset(&f.allocator, None)?;
-                let mut at = 0u64;
-                for (shadow, from, to) in parts.iter().map(|p| (&p.0, p.1, p.2)) {
-                    let len = (to - from) as u64;
-                    f.list.CopyBufferRegion(&buffer, at, &shadow.buffer, shadow.offset(from as u64), len);
-                    at += len;
+                for ((shadow, from, to), &at) in parts.iter().map(|p| (&p.0, p.1, p.2)).zip(&at) {
+                    f.list.CopyBufferRegion(&buffer, at as u64, &shadow.buffer, shadow.offset(from as u64), (to - from) as u64);
                 }
                 f.list.Close()?;
                 f.queue.ExecuteCommandLists(&[Some(f.list.cast::<ID3D12CommandList>()?)]);
@@ -629,16 +683,38 @@ impl Host {
         if ran.is_err() {
             return Err("the fetch failed");
         }
-        let mut title = Vec::new();
         let mut put = 0u64;
-        let mut at = 0usize;
-        for (shadow, from, to) in parts.iter().map(|p| (&p.0, p.1, p.2)) {
-            let len = to - from;
-            // SAFETY: the mapping of the fetched bytes, `total` of them; the
-            // copy into it has run, and the next waits for this.
-            let gpu = unsafe { std::slice::from_raw_parts((data + at) as *const u8, len) };
-            put += shadow.card_merge_relay(from - shadow.span().0 as usize, gpu, after, &mut title) as u64;
-            at += len;
+        if land::on() {
+            let pieces = blocks(parts);
+            let titles: Vec<(usize, usize)> = pieces.iter().map(|&(_, from, to)| (from, to - from)).collect();
+            let jobs = land::jobs(&titles);
+            let landed = std::sync::atomic::AtomicU64::new(0);
+            land::each(jobs.len(), &|j| {
+                let mut notes = land::Notes::default();
+                for run in pieces[jobs[j].clone()].chunk_by(|a, b| Arc::ptr_eq(&parts[a.0].0, &parts[b.0].0)) {
+                    let shadow = &parts[run[0].0].0;
+                    let start = shadow.span().0 as usize;
+                    let addressed: Vec<(usize, usize, usize)> =
+                        run.iter().map(|&(i, from, to)| (from - start, to - start, data + at[i] + (from - parts[i].1))).collect();
+                    // SAFETY: the mapping of the fetched bytes, `total` of
+                    // them; the copy into it has run, and the next waits for
+                    // this call (the lock is held).
+                    landed.fetch_add(unsafe { shadow.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                }
+                notes.flush();
+            });
+            land::count(land::stat::JOBS, jobs.len() as u64);
+            put = landed.into_inner();
+        } else {
+            let mut title = Vec::new();
+            for ((shadow, from, to), &at) in parts.iter().map(|p| (&p.0, p.1, p.2)).zip(&at) {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run, and the next waits for this.
+                let gpu = unsafe { std::slice::from_raw_parts((data + at) as *const u8, to - from) };
+                let merged = shadow.card_merge_relay(from - shadow.span().0 as usize, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                put += merged as u64;
+            }
         }
         Ok(put)
     }
@@ -823,6 +899,19 @@ mod tests {
         let line = [flight(5, vec![(a.clone(), vec![(0x10_0000, 0x10_2000)])], Vec::new())];
         let p = plan(&line, &[(0x10_0800, 0x10_0900)]).unwrap().unwrap();
         assert!(!a.snapshot_held() && p.fits().is_err());
+    }
+
+    /// Parts are cut where 64 KiB blocks of title memory end, in the order
+    /// of title memory, whatever copy they are of.
+    #[test]
+    fn parts_are_cut_at_blocks_in_the_order_of_title_memory() {
+        let (a, b) = (copy(0x10_0000, 0x10_0000), copy(0x30_0000, 0x1000));
+        let parts: Vec<Part> = vec![(b.clone(), 0x30_0100, 0x30_0200), (a.clone(), 0x10_ff00, 0x12_0100)];
+        let refs: Vec<&Part> = parts.iter().collect();
+        assert_eq!(
+            blocks(&refs),
+            [(1, 0x10_ff00, 0x11_0000), (1, 0x11_0000, 0x12_0000), (1, 0x12_0000, 0x12_0100), (0, 0x30_0100, 0x30_0200)]
+        );
     }
 
     /// What steps read of what flights write, and the steps that take the
