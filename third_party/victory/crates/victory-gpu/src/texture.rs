@@ -16,6 +16,8 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod clobber;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -599,6 +601,49 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// The order in which sent lists' steps run (`HostList::run_deferred`, on
+/// the thread that submits): each list gets the next number before its
+/// steps ([`list_steps_begin`]), and a host write notes its list's number on
+/// the texture's host copy when that list is sent ([`host_written_in`]).
+static LIST_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A sent list's steps begin: its place in the order of sent lists.
+pub(crate) fn list_steps_begin() -> u64 {
+    LIST_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// `list` writes title texture `resource` on the card (a copy, a resolve, a
+/// library's pass), subresource `sub` of it (`None`: all): [`host_written`],
+/// and when the list is sent its place in the order of sent lists goes on
+/// the host copy with what it wrote (`HostTexture::written`), for
+/// [`late_uploads`].
+pub(crate) fn host_written_in(list: &HostList, resource: This, sub: Option<u32>) {
+    host_written(resource);
+    if let Some(copy) = crate::resource::made_copy(resource) {
+        let mask = match sub {
+            Some(sub) if sub < 64 => 1u64 << sub,
+            _ => u64::MAX,
+        };
+        list.defer_host(move || {
+            let at = LIST_ORDER.load(std::sync::atomic::Ordering::Relaxed);
+            let mut written = copy.written.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(last) = written.last_mut().filter(|last| last.0 == at) {
+                last.1 |= mask;
+                return;
+            }
+            // (The oldest two stand together past 64 lists: a write counts
+            // as later than it was, and is uploaded over once more.)
+            if written.len() >= 64 {
+                let gone = written.remove(0);
+                written[0].1 |= gone.1;
+            }
+            written.push((at, mask));
+        });
+    }
+    #[cfg(feature = "diagnostics")]
+    clobber::note_write(list, resource);
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
@@ -620,6 +665,8 @@ pub(crate) fn host_written(resource: This) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+            #[cfg(feature = "diagnostics")]
+            clobber::placed_before(at as u64, bytes, [words[4], words[6], words[7], words[8]]);
         }
     }
 }
@@ -687,6 +734,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
     }
+    #[cfg(feature = "diagnostics")]
+    clobber::forget(resource);
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
     HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
@@ -888,6 +937,34 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         list.defer_texture(staging);
         return;
     }
+    // A texture's first upload goes in front of the list when it is sent
+    // ([`late_uploads`]), not into it ([`first_upload_in_front`]).
+    if !baking
+        && !staging.uploaded.load(Relaxed)
+        && first_upload_in_front()
+        && late_uploads_on()
+        && !staging.on_demand
+        && copy.tiled.is_none()
+        && copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        if no_wait() && fill_unlocked() {
+            let there = match picking {
+                Some(there) if there != u64::MAX => there,
+                _ => mapped_bytes(staging.memory, staging.read),
+            };
+            staging.expected.store(there, Relaxed);
+        }
+        // (As below for an upload the list records.)
+        if staging.first == staging.level0 && copy.grown.swap(false, Relaxed) {
+            let start = staging.memory as u64;
+            list.defer_host(move || crate::descriptor::host::levels_changed_after(start));
+        }
+        list.note_sampled(staging.clone(), copy.clone(), false);
+        list.defer_texture(staging);
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     if no_wait() && fill_unlocked() {
@@ -898,6 +975,11 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.expected.store(there, Relaxed);
     }
     record_upload(list, resource, &copy, &staging, &staging.buffer, staging.base);
+    #[cfg(feature = "diagnostics")]
+    {
+        let (r, seq, at) = (resource as usize, clobber::next(), std::ptr::from_ref(list) as usize);
+        list.defer_host(move || clobber::upload_submitted(r, seq, at));
+    }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
@@ -972,9 +1054,74 @@ pub(crate) fn late_uploads_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_UPLOADS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a texture's first upload is made in front of the list that
+/// samples it, when the list is sent ([`late_uploads`]), rather than
+/// recorded into the list (`VICTORY_FIRST_UPLOAD_FRONT=1`; off: into it, as
+/// before, and uploads in front of lists leave out nothing). One recorded
+/// into a list was copied from title memory whenever
+/// the list ran: a list recorded before another list's copy into the
+/// texture, and sent after it, put title memory over what the copy wrote.
+/// The title copies its characters' baked decorations into textures that
+/// its draws have sampled already, and title memory holds other textures'
+/// bytes there: coloured specks over the waitress's face and the tattoos
+/// for the rest of the scene (run pic-rec1: 64 such uploads, the first a
+/// frame after the bake, of 256x256 to 2048x2048 BC1, BC3 and BC7
+/// textures). In front of the list, an upload leaves out what lists sent
+/// before it wrote of the texture on the card (`HostTexture::written`).
+///
+/// Off by default: with it on the confetti went (runs pic-fix1, pic-fix2,
+/// pic-fix2rel: the waitress's face clean, against confetti in pic-rec1),
+/// but dark specks covered Lucia's face, a man's arm and her hand in two of
+/// the three runs (from the first uploads left out on), where runs without
+/// it never showed them: the textures those copies wrote hold them, or
+/// something left out was needed. Not settled.
+fn first_upload_in_front() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FIRST_UPLOAD_FRONT").is_some_and(|v| v == "1"))
+}
+
 /// Since the start: textures uploaded in front of their list ([`late_uploads`])
 /// and their bytes.
 static LATE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The subresources lists sent before the one at place `order` wrote on the
+/// card (`HostTexture::written`): a bit each, all bits for all.
+fn written_before(written: &[(u64, u64)], order: u64) -> u64 {
+    written.iter().filter(|(at, _)| *at < order).fold(0, |all, (_, mask)| all | mask)
+}
+
+/// Which of a staging buffer's `parts` (the title's level and array slice of
+/// each, of a texture of `mips` levels) are among the subresources `written`
+/// (a bit each, all bits for all): a bit a part, for the first 64 parts
+/// (the others count as not written).
+fn parts_written(parts: impl Iterator<Item = (u32, u32)>, mips: u32, written: u64) -> u64 {
+    let mut out = 0u64;
+    for (i, (level, slice)) in parts.enumerate().take(64) {
+        let sub = level + slice * mips;
+        let hit = if written == u64::MAX { true } else { sub < 64 && written >> sub & 1 != 0 };
+        if hit {
+            out |= 1 << i;
+        }
+    }
+    out
+}
+
+/// The detiling [`late_uploads`] takes a host copy to hold, and the parts of
+/// the upload to leave out: `held` as it is and none, unless lists sent
+/// before this one wrote parts on the card (`written`, of `parts` parts):
+/// all of them, nothing to upload (`detiled`); some, those left out. One
+/// that the list itself, or a list sent after it, writes is uploaded first
+/// as before.
+fn held_for(held: u64, detiled: u64, written: u64, parts: usize) -> (u64, u64) {
+    let all = if parts >= 64 { u64::MAX } else { (1u64 << parts) - 1 };
+    if written == 0 {
+        (held, 0)
+    } else if written & all == all && parts <= 64 {
+        (detiled, 0)
+    } else {
+        (held, written)
+    }
+}
 
 /// What [`late_uploads`] decides, per list of a submission in order, from
 /// what each samples: (texture, the detiling its host copy holds, the one its
@@ -1005,35 +1152,76 @@ pub(crate) fn plan_late(lists: &[Vec<(usize, u64, u64, bool)>]) -> Vec<Vec<usize
 /// At a submission, once every check of its textures has run: per list, the
 /// textures to upload in front of it ([`late_uploads_on`]). Every texture the
 /// submission samples holds what its staging buffer holds once it has run.
-pub(crate) fn late_uploads(lists: &[Vec<Sampled>]) -> Vec<Vec<(Arc<Staging>, Arc<crate::resource::HostTexture>)>> {
+///
+/// `orders`: each list's place in the order of sent lists
+/// ([`list_steps_begin`]). What lists sent before it wrote of a texture on
+/// the card (`HostTexture::written`) is not uploaded from title memory: the
+/// write never reached title memory, and the upload would put what was
+/// there before over it. Each upload says whether it is the texture's
+/// first, and which of its parts it leaves out.
+pub(crate) fn late_uploads(
+    lists: &[Vec<Sampled>],
+    orders: &[u64],
+) -> Vec<Vec<(Arc<Staging>, Arc<crate::resource::HostTexture>, bool, u64)>> {
     use std::sync::atomic::Ordering::Relaxed;
     if !late_uploads_on() || lists.iter().all(Vec::is_empty) {
         return vec![Vec::new(); lists.len()];
     }
+    // The parts of each upload to leave out, by list.
+    let mut skips: Vec<Vec<u64>> = Vec::with_capacity(lists.len());
     let seen: Vec<Vec<(usize, u64, u64, bool)>> = lists
         .iter()
-        .map(|sampled| {
-            sampled
+        .enumerate()
+        .map(|(i, sampled)| {
+            let mut skip = Vec::with_capacity(sampled.len());
+            let order = orders.get(i).copied().unwrap_or(u64::MAX);
+            let entries: Vec<(usize, u64, u64, bool)> = sampled
                 .iter()
                 .map(|(staging, copy, recorded)| {
                     let detiled = staging.detiles.load(Relaxed);
                     // (A host copy made again since: its own first upload.)
                     let held = if copy.serial == staging.serial { staging.held.load(Relaxed) } else { detiled };
-                    (Arc::as_ptr(staging) as usize, held, detiled, *recorded)
+                    // A first upload ([`first_upload_in_front`]) is made even
+                    // if the check detiled nothing (memory not mapped yet):
+                    // the staging buffer's zeros, as a copy recorded into the
+                    // list put in, not what the host copy's block held.
+                    let held = if staging.uploaded.load(Relaxed) || !first_upload_in_front() { held } else { u64::MAX };
+                    let written = if first_upload_in_front() {
+                        written_before(&copy.written.lock().unwrap_or_else(|e| e.into_inner()), order)
+                    } else {
+                        0
+                    };
+                    let written = if written == 0 {
+                        0
+                    } else {
+                        parts_written((0..staging.footprints.len()).map(|p| staging.part(p)), staging.mips, written)
+                    };
+                    let (kept, left) = held_for(held, detiled, written, staging.footprints.len());
+                    #[cfg(feature = "diagnostics")]
+                    if written != 0 {
+                        clobber::left_out(staging.memory as u64, written, staging.footprints.len(), kept != held, order);
+                    }
+                    skip.push(left);
+                    (Arc::as_ptr(staging) as usize, kept, detiled, *recorded)
                 })
-                .collect()
+                .collect();
+            skips.push(skip);
+            entries
         })
         .collect();
     let plan = plan_late(&seen);
     let mut out = Vec::with_capacity(lists.len());
-    for ((sampled, seen), plan) in lists.iter().zip(&seen).zip(plan) {
+    for (((sampled, seen), plan), skip) in lists.iter().zip(&seen).zip(plan).zip(&skips) {
         for (staging, _, _) in sampled {
             staging.held.fetch_max(staging.detiles.load(Relaxed), Relaxed);
         }
         let mut front = Vec::with_capacity(plan.len());
         for i in plan {
             let (staging, copy, _) = &sampled[i];
+            #[cfg(feature = "diagnostics")]
+            clobber::late(staging.memory as u64);
             staging.dirty.store(false, Relaxed);
+            let first = !staging.uploaded.swap(true, Relaxed);
             staging.note_held();
             let n = LATE[0].fetch_add(1, Relaxed) + 1;
             let bytes = LATE[1].fetch_add(staging.read as u64, Relaxed) + staging.read as u64;
@@ -1041,14 +1229,14 @@ pub(crate) fn late_uploads(lists: &[Vec<Sampled>]) -> Vec<Vec<(Arc<Staging>, Arc
                 tracing::info!(
                     memory = ?staging.memory,
                     bytes = staging.read,
-                    behind = seen[i].2 - seen[i].1,
+                    behind = seen[i].2.saturating_sub(seen[i].1),
                     frame = crate::frame::current(),
                     since_start = n,
                     mb_since_start = bytes >> 20,
                     "a sampled texture found changed at its list's submission, with no upload recorded: uploaded in front of the list (VICTORY_LATE_UPLOADS)"
                 );
             }
-            front.push((staging.clone(), copy.clone()));
+            front.push((staging.clone(), copy.clone(), first, skip[i]));
         }
         out.push(front);
     }
@@ -1057,9 +1245,13 @@ pub(crate) fn late_uploads(lists: &[Vec<Sampled>]) -> Vec<Vec<(Arc<Staging>, Arc
 
 impl Staging {
     /// Records the copies of the staging buffer into `texture`, its host copy
-    /// in the copy-destination state, into `list`.
-    pub(crate) fn record_into(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+    /// in the copy-destination state, into `list`, leaving out the parts in
+    /// `skip` (a bit a part, the first 64).
+    pub(crate) fn record_parts_into(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, skip: u64) {
         for (i, footprint) in self.footprints.iter().enumerate() {
+            if i < 64 && skip >> i & 1 != 0 {
+                continue;
+            }
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -2301,7 +2493,42 @@ mod hash_turn_tests {
 
 #[cfg(test)]
 mod late_upload_tests {
-    use super::plan_late;
+    use super::{held_for, parts_written, plan_late, written_before};
+
+    /// Run pic-rec1: a list that sampled a texture before the title's copy
+    /// into it was recorded, and that was sent after that copy, uploaded
+    /// title memory over what the copy wrote (the characters' baked
+    /// decorations). An upload in front of a list leaves out what lists sent
+    /// before it wrote on the card: all of a texture written whole, the
+    /// written levels of one written in part (run pic-fix1: leaving all of
+    /// those out left their other levels unfilled, dark specks over Lucia's
+    /// face); the list that writes it itself, or one sent after, still has
+    /// it all uploaded first.
+    #[test]
+    fn what_an_earlier_list_wrote_on_the_card_is_not_uploaded_again() {
+        // A fresh texture of 3 levels, one slice: nothing held, detiled once.
+        let (held, detiled, parts) = (u64::MAX, 1, 3);
+        let levels = || (0..3u32).map(|l| (l, 0u32));
+        // Written whole by the list at place 7, its level 1 by the one at 9.
+        let writes = [(7, u64::MAX), (9, 0b10)];
+        let decide = |order| {
+            let written = parts_written(levels(), 3, written_before(&writes, order));
+            held_for(held, detiled, written, parts)
+        };
+        assert_eq!(decide(8), (detiled, 0), "written whole by a list sent before: nothing uploaded");
+        assert_eq!(decide(7), (held, 0), "written by the list itself, after its draws: all uploaded");
+        assert_eq!(decide(6), (held, 0), "written by a list sent after: all uploaded");
+        assert_eq!(plan_late(&[vec![(5, decide(8).0, detiled, false)]]), [Vec::<usize>::new()]);
+        assert_eq!(plan_late(&[vec![(5, decide(6).0, detiled, false)]]), [vec![0]]);
+        // Only its level 1 written before: uploaded, that level left out.
+        let part = [(9, 0b10)];
+        let decide = |order| held_for(held, detiled, parts_written(levels(), 3, written_before(&part, order)), parts);
+        assert_eq!(decide(10), (held, 0b010));
+        assert_eq!(decide(9), (held, 0));
+        // Levels of slice 1 of a texture of 2 levels and 2 slices: subresource 3.
+        let parts2 = (0..4u32).map(|p| (p % 2, p / 2));
+        assert_eq!(parts_written(parts2, 2, 1 << 3), 0b1000);
+    }
 
     /// avatarmanz/VIctory-7900XTX#13: a texture whose host copy is behind its
     /// staging buffer and that a list samples with no upload ahead of it is
