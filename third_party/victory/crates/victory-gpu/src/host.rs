@@ -8369,6 +8369,17 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
 /// each list's part beside the submitting thread (renderer port #6).
 const WIDE_PLAN_STEPS: usize = 4096;
 
+/// Whether [`Batch::refresh_front`] makes each list's part beside the
+/// submitting thread without renderer port #6 too (`VICTORY_WIDE_PLAN=0`: only
+/// with it). The same spans in the same order (`front_tests`); the port's
+/// other changes stay its own. The planning on the submitting thread alone
+/// was 3% of its time (run s2-prof1), most of it the submission a frame that
+/// holds most of the frame's steps.
+fn wide_plan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_PLAN").is_none_or(|v| v != "0"))
+}
+
 /// One list's part of [`front_spans`] (renderer port #6, [`list_front`]).
 #[derive(Default)]
 struct ListFront {
@@ -8758,7 +8769,7 @@ impl Batch {
         // a frame has most of the frame's steps, 3-6 ms of this alone (run
         // guard-4).
         let steps: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
-        if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
+        if (crate::watch::port_guard_plan() || wide_plan()) && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
             #[derive(Clone, Copy)]
             struct Lists(*const *const HostList, usize);
             // SAFETY: the lists outlive the call, which waits for every job.
