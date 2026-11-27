@@ -131,6 +131,8 @@ Each item below is always on, measured by profiling the first cutscene. "ms" is 
 
 **Reads under the card's writes (`eac23533`, `9c1bc45f`).** A submission that reads title memory the card may be writing now waits only for the card's fence behind the last flight that writes there, not for every flight to be landed. While it waits, the thread that lands flights keeps landing the ones ahead.
 
+**Big copies in pieces, bigger pools (`VICTORY_WIDE_COPY=1` with `VICTORY_THIN_THREADS=12`, `VICTORY_UNDER_THREADS=8`, `VICTORY_LAND_THREADS=6`).** A title copy of 8 MiB or more (the per-frame copies are 60-80 MB) is cut into 2 MiB pieces that the kept threads copy side by side (port of upstream AnyXboxX #500), and the translation, refresh and landing pools get more threads (upstream #462). Measured on the open-world walk (RTX 5080, 9800X3D, 1440p native): frames of 150 ms or more 3 and 21 against 29 and 23, of 400 ms or more 0 and 2 against 4 and 8; median fps unchanged within noise (18.1 and 21.3 against 17.9 and 19.5). First scene: long frames 16 against 34-59, same fps. Neither part alone helped (one run each). Off by default; set in the play script.
+
 ## CPU: list translation
 
 These changes reduce the cost of each translated call and the locks the 8 translating threads share. All are always on and give the same results.
