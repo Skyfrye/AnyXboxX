@@ -1,5 +1,6 @@
-//! Our own work on the card, timed by the card (`VICTORY_OUR_CARD_TIMES`; on
-//! by default, `0`: not taken).
+//! Our own work on the card, timed by the card (`VICTORY_OUR_CARD_TIMES=1`;
+//! off by default: the timing costs about as much as what it times, see
+//! below).
 //!
 //! The frame line's "on the GPU" is the time the submitting thread waits for
 //! the card, and the card's clock counts the time something of ours is
@@ -15,12 +16,26 @@
 //!
 //! A timestamp is written when the work recorded before it has finished
 //! (`a_timestamp_waits_for_what_is_recorded_before_it`: on the RTX 5080 a
-//! pair behind a 17 ms pass reads 0.000 ms, one around it 17.5 ms), so a
-//! pair measures from the end of what ran before it to the end of what it
-//! holds: work of ours that overlaps the end of the title's is counted
-//! short, never long. Of the passes recorded into the title's lists (twins,
-//! planes, clamps) a list that runs more than once is counted once. The
-//! pairs cost the card about 0.5 us each (`bench_what_a_thousand_pairs_cost`).
+//! pair behind a pass reads 0.000 ms, one around it the pass, 1.4-1.6 ms in
+//! two runs), so a pair measures from the end of what ran before it to the
+//! end of what it holds: work of ours that overlaps the end of the title's
+//! is counted short, never long. Of the passes recorded into the title's
+//! lists (twins, planes, clamps) a list that runs more than once is counted
+//! once.
+//!
+//! What it costs the card (`bench_what_a_thousand_pairs_cost`, RTX 5080, two
+//! runs: a list of 1,000 short passes 30.7 and 31.2 ms without pairs, 31.1
+//! and 32.0 ms with a pair around each resolved once, 33.9 and 34.9 ms with
+//! each resolved): some 0.5-0.8 us a pair, and some 2.8-2.9 us a resolve,
+//! which waits for what is ahead of it. A
+//! resolve is made per block of pairs per list, not per submission: every
+//! title list with a clamp, a twin or a plane pays one, every prelude with
+//! twins or uploads, the compares', steps' and sends' lists. At the 209
+//! title lists a frame of run nbc-measure that is some 0.6-1.2 ms of the
+//! card's a frame, about as much as all of ours that the bench found (1.5
+//! ms): hence off by default, for runs that measure. The line says how many
+//! resolves a frame were made. Not timed: texture read-backs, fetches on the
+//! copy queue (`VICTORY_RELAY_COPY=1`). Not measured under vkd3d-proton.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -100,10 +115,24 @@ impl Kind {
     }
 }
 
-/// Whether the card's times are taken (`VICTORY_OUR_CARD_TIMES=0`: not).
+/// Whether the card's times are taken (`VICTORY_OUR_CARD_TIMES=1`; off by
+/// default).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_OUR_CARD_TIMES").is_none_or(|v| v != "0"))
+    #[cfg(test)]
+    if TAKEN.load(Ordering::Relaxed) {
+        return true;
+    }
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OUR_CARD_TIMES").is_some_and(|v| v == "1"))
+}
+
+/// Tests and benches: the times are taken whatever the switch says.
+#[cfg(test)]
+static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn take_times() {
+    TAKEN.store(true, Ordering::Relaxed);
 }
 
 /// Pairs for passes of ours, used in turn by blocks of [`BLOCK`]: some
@@ -151,6 +180,9 @@ static ODD: AtomicU64 = AtomicU64::new(0);
 /// overwrote some before they were read.
 static GATHERED: AtomicU32 = AtomicU32::new(0);
 static OVERWRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Since the last line: resolves recorded (one per block of a list, one
+/// per submission).
+static RESOLVES: AtomicU64 = AtomicU64::new(0);
 
 fn clock() -> Option<&'static Clock> {
     if !on() {
@@ -288,6 +320,7 @@ impl Pairs {
             self.0.clear();
             return;
         };
+        RESOLVES.fetch_add(self.0.len() as u64, Ordering::Relaxed);
         for (first, used) in self.0.drain(..) {
             // SAFETY: an open list, our query heap and buffer (its custom
             // heap's buffers take copies in the common state); every query
@@ -324,6 +357,7 @@ pub(crate) fn timing<T>(list: &ID3D12GraphicsCommandList, record: impl FnOnce(&m
 pub(crate) fn whole() -> Option<(ID3D12CommandList, ID3D12CommandList)> {
     let clock = clock()?;
     let i = NEXT_WHOLE.fetch_add(1, Ordering::Relaxed) % WHOLE;
+    RESOLVES.fetch_add(1, Ordering::Relaxed);
     clock.out(PAIRS + i, Kind::Submission);
     let (front, behind) = &clock.ends[i as usize];
     Some((front.clone(), behind.clone()))
@@ -403,9 +437,11 @@ pub(crate) fn line(frames: f64) {
     };
     let ours = ms(&inside);
     tracing::info!(
-        "the card's times per frame, by its timestamps (VICTORY_OUR_CARD_TIMES=0: not taken): {submissions:.1} submissions \
-         ran {whole:.1} ms, the title's lists {:.1} of it and ours {ours:.1} ({}); ours sent apart from them {:.1} ms ({}) \
-         (ms, pairs a frame); {} pairs read out of order, {} taken again before they were read",
+        "the card's times per frame, by its timestamps (VICTORY_OUR_CARD_TIMES=1; the timing costs the card some 0.5-0.8 us \
+         a pair and 2.8-2.9 us a resolve, {:.0} resolves a frame): {submissions:.1} submissions ran {whole:.1} ms, the title's \
+         lists {:.1} of it and ours {ours:.1} ({}); ours sent apart from them {:.1} ms ({}) (ms, pairs a frame); {} pairs \
+         read out of order, {} taken again before they were read",
+        RESOLVES.swap(0, Ordering::Relaxed) as f64 / frames,
         (whole - ours).max(0.0),
         parts(&inside),
         ms(&apart),
@@ -493,6 +529,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// WARP, or `-- --ignored` for the card's times.)
     #[test]
     fn a_pair_times_the_pass_it_is_around() {
+        take_times();
         let Some(host) = host() else {
             return;
         };
@@ -539,6 +576,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     #[test]
     #[ignore = "device test: wants the card (run with --ignored --nocapture)"]
     fn a_timestamp_waits_for_what_is_recorded_before_it() {
+        take_times();
         let Some(host) = host() else {
             return;
         };

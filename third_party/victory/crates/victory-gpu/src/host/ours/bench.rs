@@ -131,6 +131,7 @@ fn texture(host: &Host, format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS, state:
 #[test]
 #[ignore = "benchmark: wants the card (see the module notes)"]
 fn bench_our_passes_of_a_frame() {
+    take_times();
     let Some(host) = host() else {
         return;
     };
@@ -294,6 +295,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 #[test]
 #[ignore = "benchmark: wants the card (see the module notes)"]
 fn bench_card_awake_beside_draws_and_dispatches() {
+    take_times();
     let Some(host) = host() else {
         return;
     };
@@ -508,6 +510,7 @@ fn bench_card_awake_beside_draws_and_dispatches() {
 #[test]
 #[ignore = "benchmark: wants the card (see the module notes)"]
 fn bench_what_a_thousand_pairs_cost() {
+    take_times();
     let Some(host) = host() else {
         return;
     };

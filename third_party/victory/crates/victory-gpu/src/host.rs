@@ -6647,7 +6647,9 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
-        self.timed.lock().unwrap_or_else(|e| e.into_inner()).resolve(&self.list);
+        if ours::on() {
+            self.timed.lock().unwrap_or_else(|e| e.into_inner()).resolve(&self.list);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
