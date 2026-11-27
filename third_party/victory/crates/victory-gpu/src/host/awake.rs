@@ -110,41 +110,44 @@ fn vendor(device: &ID3D12Device) -> Option<u32> {
     }
 }
 
-/// Whether the card of `device` is kept awake, asked for as it is; said once.
-fn kept(device: &ID3D12Device) -> bool {
-    static KEPT: OnceLock<bool> = OnceLock::new();
-    *KEPT.get_or_init(|| {
-        let mode = mode();
-        if mode == Mode::Off {
-            return false;
-        }
-        let vendor = vendor(device);
-        let kept = runs(mode, vendor);
-        if !kept {
-            tracing::info!(
-                "the card is not kept awake (VICTORY_CARD_AWAKE=1): on NVIDIA's cards the drawing queue's work took twice as \
-                 long beside the loop (VICTORY_CARD_AWAKE=always keeps it awake all the same)"
-            );
-        }
-        kept
-    })
+/// Whether the loop runs, asked for as `mode`, on a card of `vendor`; said
+/// if it does not.
+fn keeps(mode: Mode, vendor: Option<u32>) -> bool {
+    let kept = runs(mode, vendor);
+    if !kept && mode != Mode::Off {
+        tracing::info!(
+            "the card is not kept awake (VICTORY_CARD_AWAKE=1): on NVIDIA's cards the drawing queue's work took twice as \
+             long beside the loop (VICTORY_CARD_AWAKE=always keeps it awake all the same)"
+        );
+    }
+    kept
 }
 
 /// A submission of the title's goes to `device`'s drawing queue.
 pub(super) fn sent(device: &ID3D12Device) {
-    if mode() == Mode::Off || !kept(device) {
+    static KEPT: OnceLock<bool> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    noted(mode(), &KEPT, || vendor(device), || {
+        STARTED.call_once(|| {
+            // Runs as long as the process does.
+            std::mem::forget(start(device, wanted));
+        });
+    });
+}
+
+/// [`sent`], asked for as `mode`: whether the loop runs is found once, from
+/// the card's vendor (`vendor`, asked then), and kept in `kept`; if it does,
+/// the submission's moment is noted and `start` is called.
+fn noted(mode: Mode, kept: &OnceLock<bool>, vendor: impl FnOnce() -> Option<u32>, start: impl FnOnce()) {
+    if mode == Mode::Off || !*kept.get_or_init(|| keeps(mode, vendor())) {
         return;
     }
     let now = now_ms();
     let before = LAST.swap(now + 1, Ordering::Relaxed);
-    if mode() == Mode::ByTurns && before.saturating_sub(1) / TURN_MS != now / TURN_MS {
+    if mode == Mode::ByTurns && before.saturating_sub(1) / TURN_MS != now / TURN_MS {
         tracing::info!(on = now / TURN_MS % 2 == 1, "the card is kept awake, by turns");
     }
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        // Runs as long as the process does.
-        std::mem::forget(start(device, wanted));
-    });
+    start();
 }
 
 /// The thread that keeps the card busy; it ends when this is dropped.
@@ -268,31 +271,56 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
 mod tests {
     use super::*;
 
-    /// Asked for with `1`, the loop runs on any card but NVIDIA's; with
-    /// `always` or `turns` on NVIDIA's too; never when not asked for.
-    #[test]
-    fn nvidia_cards_are_kept_awake_only_when_asked_for_whatever_the_card() {
-        let (amd, intel, warp) = (Some(0x1002), Some(0x8086), Some(0x1414));
-        for other in [amd, intel, warp, None] {
-            assert!(runs(Mode::On, other), "{other:?}");
+    /// What three submissions do to the loop, asked for as `mode` on a card
+    /// of `vendor`: how many times it was started (the real start runs
+    /// once), and how many times the vendor was asked.
+    fn three_sent(mode: Mode, vendor: Option<u32>) -> (u32, u32) {
+        let kept = OnceLock::new();
+        let (mut started, mut asked) = (0, 0);
+        for _ in 0..3 {
+            noted(
+                mode,
+                &kept,
+                || {
+                    asked += 1;
+                    vendor
+                },
+                || started += 1,
+            );
         }
-        assert!(!runs(Mode::On, Some(NVIDIA)));
-        for vendor in [Some(NVIDIA), amd, None] {
-            assert!(runs(Mode::Always, vendor) && runs(Mode::ByTurns, vendor));
-            assert!(!runs(Mode::Off, vendor));
+        (started, asked)
+    }
+
+    /// Submissions with `VICTORY_CARD_AWAKE=1` start the loop on any card but
+    /// NVIDIA's, where they never do; with `always` or `turns` on NVIDIA's
+    /// too; without it never, and the card is not asked. The card's vendor
+    /// is asked once. (Before, `1` started it on NVIDIA's cards too.)
+    #[test]
+    fn submissions_start_the_loop_on_nvidia_only_when_asked_to_whatever_the_card() {
+        let (amd, intel, warp) = (Some(0x1002), Some(0x8086), Some(0x1414));
+        assert_eq!(three_sent(Mode::On, Some(NVIDIA)), (0, 1));
+        for other in [amd, intel, warp, None] {
+            assert_eq!(three_sent(Mode::On, other), (3, 1), "{other:x?}");
+        }
+        for vendor in [Some(NVIDIA), amd] {
+            assert_eq!(three_sent(Mode::Always, vendor), (3, 1));
+            assert_eq!(three_sent(Mode::ByTurns, vendor), (3, 1));
+            assert_eq!(three_sent(Mode::Off, vendor), (0, 0));
         }
     }
 
-    /// The host's card is told apart by its vendor: on WARP the loop runs
-    /// as asked, on an NVIDIA card it does not (run with the card too).
+    /// The host's card names its vendor: WARP's on WARP (run with the card
+    /// too: NVIDIA's on the RTX 5080).
     #[test]
-    fn the_hosts_card_is_kept_awake_by_its_vendor() {
+    fn the_hosts_card_names_its_vendor() {
         let Some(host) = crate::host::host() else {
             return;
         };
         let vendor = vendor(&host.device);
         assert!(vendor.is_some());
-        assert_eq!(runs(Mode::On, vendor), vendor != Some(NVIDIA), "{vendor:x?}");
+        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+            assert_eq!(vendor, Some(0x1414), "{vendor:x?}");
+        }
     }
 
     /// Card memory the CPU maps holds what the CPU wrote, with the card kept
