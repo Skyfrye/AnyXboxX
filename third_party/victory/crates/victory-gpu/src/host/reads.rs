@@ -410,11 +410,18 @@ pub(super) fn landing_limit(completed: u64, hold: u64) -> u64 {
 }
 
 /// Tests: the thread that lands flights takes none while this is set (a
-/// landing that is late, or never comes). Never set outside them.
+/// landing that is late, or never comes).
+#[cfg(test)]
 pub(super) static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
 fn held() -> bool {
-    cfg!(test) && HOLD.load(Ordering::Acquire)
+    HOLD.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+fn held() -> bool {
+    false
 }
 
 /// Tests: milliseconds a read sleeps once the card has run what it waited
