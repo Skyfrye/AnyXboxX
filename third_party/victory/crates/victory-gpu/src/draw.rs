@@ -293,7 +293,13 @@ fn bake_by_targets(pixel: Option<&str>) {
     static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
     let n = BAKES_BY_TARGETS.fetch_add(1, Ordering::Relaxed) + 1;
     let pixel = pixel.unwrap_or("none");
-    let new = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(pixel.to_owned());
+    // (Looked up before a name is made: a shader seen already, the common
+    // case and the one of a false match in gameplay, takes no allocation.)
+    let new = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_default();
+        !seen.contains(pixel) && seen.insert(pixel.to_owned())
+    };
     if new {
         tracing::info!(
             pixel_shader = pixel,
