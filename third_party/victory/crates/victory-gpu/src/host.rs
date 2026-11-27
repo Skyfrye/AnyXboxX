@@ -179,7 +179,7 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     let share = |percent: u64| budget / 100 * percent;
     if used < share(LET_GO_FROM) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
+    } else if used < share(LET_GO_ANY_FROM) {
         (IDLE_MS, used - share(LET_GO_TO))
     } else {
         (SHORT_MS, used - share(LET_GO_TO))
@@ -190,6 +190,10 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
 /// lets idle textures go, and down to which.
 pub(crate) const LET_GO_FROM: u64 = 88;
 pub(crate) const LET_GO_TO: u64 = 85;
+/// The share from which they go after a shorter rest, and, by whole blocks
+/// (`crate::vram::system_room`), by age from any block too when whole
+/// blocks do not give enough (`crate::resource::let_go_idle`).
+pub(crate) const LET_GO_ANY_FROM: u64 = 95;
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so

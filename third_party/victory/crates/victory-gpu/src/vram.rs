@@ -129,13 +129,27 @@ pub(crate) fn plan(idle: &[Idle], lives: &[u32], block_bytes: u64) -> Vec<Unit> 
     units.into_iter().map(|(_, unit)| unit).collect()
 }
 
+/// The idle host copies `candidates` (when last used, the title texture,
+/// the block of its copy as read with no lock) that have a copy, the
+/// longest unused first: the sweep's order at 95 % and past for what whole
+/// units did not give (`crate::resource::let_go_idle`).
+pub(crate) fn oldest_first(candidates: &[(u64, usize, u32)]) -> Vec<usize> {
+    let mut by_use: Vec<(u64, usize)> = candidates.iter().filter(|c| c.2 != NO_COPY).map(|c| (c.0, c.1)).collect();
+    by_use.sort_unstable();
+    by_use.into_iter().map(|(_, at)| at).collect()
+}
+
+/// Since the start: copies let go by age at 95 % and past ([`oldest_first`]),
+/// and their bytes.
+pub(crate) static BY_AGE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Since the start: units of [`plan`] let go whole, their bytes given back
 /// (blocks and textures of their own), and units left (a copy in them was
 /// in use again: found so before any went, or, rarely, while they went).
 pub(crate) static LET_GO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// The counts of the last line, to say what changed since.
-static LAST: std::sync::Mutex<[u64; 10]> = std::sync::Mutex::new([0; 10]);
+static LAST: std::sync::Mutex<[u64; 12]> = std::sync::Mutex::new([0; 12]);
 
 /// The memory line: the system's budget and use, what of ours holds the
 /// card's memory, and what the queue and the sweep did since the last line.
@@ -165,10 +179,12 @@ pub(crate) fn line() -> String {
         gave,
         broken,
         emptied,
+        BY_AGE[0].load(Relaxed),
+        BY_AGE[1].load(Relaxed),
     ];
     let since = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        let since: [u64; 10] = std::array::from_fn(|i| now[i].saturating_sub(last[i]));
+        let since: [u64; 12] = std::array::from_fn(|i| now[i].saturating_sub(last[i]));
         *last = now;
         since
     };
@@ -190,7 +206,7 @@ pub(crate) fn line() -> String {
          in them {} MB, resting {} MB, {} empty, {} left to empty, {classes}; host copies the title fills {} alive {} MB, {} MB of \
          them outside blocks; other host textures (targets, depth, unordered access, twins) {} MB; buffer copies' card sides {} MB, \
          their bytes from before {} MB, windows' {} MB. Since the last line: {} copies let go ({} MB), {} blocks let go whole ({} MB \
-         back), {} left (a copy was used again), {} blocks left to empty ({} that did went back once empty), {} back to \
+         back), {} left (a copy was used again), {} let go by age at 95 % and past ({} MB), {} blocks left to empty ({} that did went back once empty), {} back to \
          the system in all, {} made; {} texture passes \
          refused for want of room ({} since the start)",
         u8::from(system),
@@ -227,6 +243,8 @@ pub(crate) fn line() -> String {
         since[6],
         mb(since[7]),
         since[8],
+        since[10],
+        mb(since[11]),
         since[2],
         since[9],
         since[3],
@@ -360,5 +378,25 @@ mod tests {
         let blocks = [0, 1, OWN, 0, 1, NO_COPY, 2, 7];
         assert_eq!(worth_asking(&blocks, &lives), vec![true, false, true, true, false, false, false, false]);
         assert_eq!(worth_asking(&[], &lives), Vec::<bool>::new());
+    }
+
+    /// At 95 % and past, with no block wholly idle, the idle copies still go
+    /// by age, the longest unused first, from blocks with copies in use too;
+    /// textures with no copy are left out. (Nothing went at all. Round 2's
+    /// review, item 3.)
+    #[test]
+    fn with_no_block_wholly_idle_copies_go_by_age() {
+        let lives = [5, 5];
+        let candidates = [(30, 1, 0), (10, 2, 1), (20, 3, NO_COPY), (5, 4, 0), (40, 5, OWN)];
+        let blocks: Vec<u32> = candidates.iter().map(|c| c.2).collect();
+        let idle: Vec<Idle> = candidates
+            .iter()
+            .zip(worth_asking(&blocks, &lives))
+            .filter(|(_, worth)| *worth)
+            .map(|(c, _)| idle(c.1, (c.2 != OWN).then_some(c.2), 64 << 10, c.0))
+            .collect();
+        // Whole units: the copy of its own alone.
+        assert_eq!(plan(&idle, &lives, BLOCK).len(), 1);
+        assert_eq!(oldest_first(&candidates), vec![4, 2, 1, 5]);
     }
 }

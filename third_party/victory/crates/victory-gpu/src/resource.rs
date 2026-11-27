@@ -2325,9 +2325,13 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => crate::host::vram_keep(budget, counted_for_sweep(used)),
-        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+    let (idle_ms, most, short) = match memory {
+        Some([budget, used, ..]) if keep => {
+            let counted = counted_for_sweep(used);
+            let (idle_ms, most) = crate::host::vram_keep(budget, counted);
+            (idle_ms, most, counted >= budget / 100 * crate::host::LET_GO_ANY_FROM)
+        }
+        _ => (crate::host::vram_idle_ms(memory), u64::MAX, false),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
@@ -2452,6 +2456,29 @@ pub(crate) fn let_go_idle() {
             gave += unit.gives;
             crate::vram::LET_GO[0].fetch_add(1, Relaxed);
             crate::vram::LET_GO[1].fetch_add(unit.gives, Relaxed);
+        }
+        // At 95 % and past, what whole units did not give: idle copies by
+        // age, the longest unused first, from any block. That gives the
+        // system nothing at once, but their pieces take the next copies of
+        // their class, and the pool stops growing past the budget.
+        // (With no block wholly idle, which blocks of textures of every age
+        // and copies a slot holds make the common case, nothing went at all
+        // however short the card was. Round 2's review, item 3.)
+        if short && gave < most {
+            let mut freed = 0u64;
+            for at in crate::vram::oldest_first(&candidates).into_iter().filter(|at| !written.contains(at)) {
+                if gave.saturating_add(freed) >= most {
+                    break;
+                }
+                if let Some(b) = let_go(at) {
+                    went += 1;
+                    bytes += b;
+                    freed += b;
+                    first.get_or_insert(at);
+                    crate::vram::BY_AGE[0].fetch_add(1, Relaxed);
+                    crate::vram::BY_AGE[1].fetch_add(b, Relaxed);
+                }
+            }
         }
     }
     // Without one, while textures are kept for minutes, a part of them at
