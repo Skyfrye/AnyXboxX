@@ -62,6 +62,16 @@
 //! A packed structure is gone when title memory has no header of it any more
 //! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
 //!
+//! **A page that will not be had is quiet**: the faults note pages in the
+//! PC's memory, over the bus, once for every access of every lane that finds
+//! no copy. Pages that are not the title's (a pointer of a node test whose
+//! kind needs none, addresses past the directory) and, once [`FAULTS_ALL`]
+//! were taken, every other one, were noted again by every ray in every frame.
+//! Such a page is given the zero page instead ([`Memory::quiet`]): it reads
+//! zeros and drops stores as before, and notes nothing. Until [`FAULTS_ALL`]
+//! were taken they are noted again once every [`QUIET_FRAMES`] frames
+//! (`VICTORY_BVH_QUIET=0`: noted in every frame, as before).
+//!
 //! shortcut: a page held for anything else is kept for the rest of the run.
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
@@ -108,6 +118,15 @@ const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+/// Frames after which quiet pages are noted again, once.
+const QUIET_FRAMES: u64 = 300;
+
+/// Whether pages that will not be had are quiet ([`Memory::quiet`];
+/// `VICTORY_BVH_QUIET=0`: their faults are noted in every frame, as before).
+fn quiet_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUIET").is_none_or(|v| v != "0"))
+}
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -171,6 +190,12 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
+    /// The zero page: a page of an arena never held, all zeros (its copy and
+    /// its byte in that copy); the pages given it ([`Memory::quiet`]), since
+    /// that frame.
+    zero: Option<(usize, u64)>,
+    quiet: std::collections::HashSet<u64>,
+    quiet_since: u64,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -250,6 +275,9 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
+            zero: None,
+            quiet: Default::default(),
+            quiet_since: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -270,7 +298,7 @@ impl Memory {
 
     /// The place in `copies` of the copy that holds `page`, if one does.
     fn copy_of(&self, page: u64) -> Option<usize> {
-        if page >= u64::from(MEMORY_PAGES) {
+        if page >= u64::from(MEMORY_PAGES) || self.quiet.contains(&page) {
             return None;
         }
         // SAFETY: an entry of the directory.
@@ -327,6 +355,7 @@ impl Memory {
         if !self.possible(page) {
             return false;
         }
+        self.unquiet(page);
         let start = page * PAGE;
         if crate::shadow::in_buffer(start, PAGE).is_some() {
             let Some(shadow) = crate::shadow::find(start, PAGE) else {
@@ -343,6 +372,7 @@ impl Memory {
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                    self.unquiet(at / PAGE);
                     let entry = self.entry(at / PAGE);
                     // SAFETY: an entry of the directory.
                     if unsafe { entry.read() } == 0 {
@@ -404,9 +434,46 @@ impl Memory {
 
     /// `page` is held at `at` in the arena that is `copy`.
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
+        self.quiet.remove(&page);
         self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
         self.order.push(page);
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+    }
+
+    /// `page` will not be had: it is given the zero page, read only, so the
+    /// accesses that find it read zeros and drop stores as they did without
+    /// a copy, and note nothing.
+    fn quiet(&mut self, page: u64) {
+        if page >= u64::from(MEMORY_PAGES) || self.quiet.contains(&page) {
+            return;
+        }
+        let Some((copy, base)) = self.zero_page() else { return };
+        close(self.entry(page), copy, base);
+        self.quiet.insert(page);
+    }
+
+    /// The zero page (its copy, its byte in it), made on first use.
+    fn zero_page(&mut self) -> Option<(usize, u64)> {
+        if self.zero.is_none() {
+            if self.free.is_empty() && !self.another() {
+                return None;
+            }
+            let (copy, at) = self.free.pop()?;
+            let base = at as u64 - self.copies[copy].span().0;
+            // An arena's memory is zeros, and a page never held is never
+            // written; its copy on the card is sent once.
+            self.copies[copy].resend(base as usize, (base + PAGE) as usize);
+            self.zero = Some((copy, base));
+        }
+        self.zero
+    }
+
+    /// `page` is not quiet any more: its entry is empty, for a copy.
+    fn unquiet(&mut self, page: u64) {
+        if self.quiet.remove(&page) {
+            // SAFETY: an entry of the directory, under the mutex.
+            unsafe { self.entry(page).write_volatile(0) };
+        }
     }
 
     /// The packed structure at `address` is gone: the pages it alone had are
@@ -657,6 +724,22 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        // Quiet pages are noted once again now and then: memory that was not
+        // the title's may be by now. Not after no more are taken from faults:
+        // none of them could be taken then, and every ray would note all of
+        // them again in one frame.
+        if !self.quiet.is_empty()
+            && self.faulted < FAULTS_ALL
+            && self.frame.wrapping_sub(self.quiet_since) >= QUIET_FRAMES
+        {
+            for page in std::mem::take(&mut self.quiet) {
+                // SAFETY: an entry of the directory, under the mutex.
+                unsafe { self.entry(page).write_volatile(0) };
+            }
+        }
+        if self.quiet.is_empty() {
+            self.quiet_since = self.frame;
+        }
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
@@ -676,10 +759,15 @@ impl Memory {
         pages.sort_unstable();
         let mut made = 0;
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            let tried = made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none();
+            if tried && self.map(page) {
                 made += 1;
                 self.faulted += 1;
                 self.bring(page, page + 1);
+            } else if quiet_on() && self.copy_of(page).is_none() && (tried || self.faulted >= FAULTS_ALL) {
+                // Not the title's, no room, or no more are taken from
+                // faults: it would be noted in vain in every frame.
+                self.quiet(page);
             }
         }
         self.stats.faults += pages.len() as u64;
@@ -765,7 +853,7 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}, {} pages quiet",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -787,7 +875,8 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            self.quiet.len()
         );
         self.stats.from = Some((now, self.frame));
     }
