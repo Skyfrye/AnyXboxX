@@ -31,7 +31,10 @@
 //! or since the last merge), as the landing does, and leaves the title's
 //! other bytes; of a copy in the card's memory it leaves out the title's
 //! bytes that went up behind the last flight waited for, or not at all yet,
-//! as the landing does (the card's side is the older there).
+//! as the landing does (the card's side is the older there). Of a copy in
+//! the card's memory only what that landing lands is brought back: its
+//! plan's ranges, not what `crate::picked` found and does not land
+//! (`VICTORY_PICKED_WRITES=1`).
 //!
 //! And what the title can see stays in the relay's order (a later flight's
 //! results never reach title memory before an earlier flight's): the
@@ -184,6 +187,10 @@ fn needs(written: &[(usize, usize)], runs: &[&HostList]) -> Result<Vec<(usize, u
     Ok(out)
 }
 
+/// A part of a host copy to bring back: the copy, and title memory (from,
+/// to).
+type Part = (Arc<Shadow>, usize, usize);
+
 /// What a read waits for and brings back.
 struct Plan {
     /// The host fence's value behind the last flight in the air that
@@ -192,12 +199,25 @@ struct Plan {
     /// The flights in the air up to that one, it too: those ahead of it
     /// land before anything is brought back.
     flights: usize,
-    /// What is brought back: the host copy, and the title memory (from, to),
-    /// each copy's parts in order and joined.
-    back: Vec<(Arc<Shadow>, usize, usize)>,
+    /// What is brought back, each copy's parts in order and joined.
+    back: Vec<Part>,
     /// The send to copies in the card's memory those flights ran behind
     /// (`CardPlan::sent_as`; 0: none).
     sent: u64,
+}
+
+/// What lies of `[a, b)`, a declared write of `shadow`, in what is read
+/// (`needs`, in order and joined) and in the copy, goes into `back`.
+fn parts_of(shadow: &Arc<Shadow>, (a, b): (usize, usize), needs: &[(usize, usize)], back: &mut Vec<Part>) {
+    let (start, len) = shadow.span();
+    let (start, end) = (start as usize, (start + len) as usize);
+    let first = needs.partition_point(|n| n.1 <= a);
+    for &(na, nb) in needs[first..].iter().take_while(|n| n.0 < b) {
+        let (from, to) = (a.max(na).max(start), b.min(nb).min(end));
+        if from < to {
+            back.push((shadow.clone(), from, to));
+        }
+    }
 }
 
 /// For reads of `needs` (in order and joined), with `items` in the air:
@@ -205,7 +225,7 @@ struct Plan {
 /// a write over them.
 fn plan(items: &[Late], needs: &[(usize, usize)]) -> Result<Option<Plan>, &'static str> {
     let mut last = None;
-    let mut back: Vec<(Arc<Shadow>, usize, usize)> = Vec::new();
+    let mut back: Vec<Part> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let flight = match item {
             Late::Run(flight) => flight,
@@ -228,25 +248,28 @@ fn plan(items: &[Late], needs: &[(usize, usize)]) -> Result<Option<Plan>, &'stat
         if read_back {
             return Err("a flight reads back there");
         }
+        // What it declared it may write is waited for, all of it.
         for (shadow, ranges) in &flight.back {
-            let (start, len) = shadow.span();
-            let (start, end) = (start as usize, (start + len) as usize);
             for &(a, b) in ranges {
                 if !touches(needs, a, b) {
                     continue;
                 }
                 last = Some(i);
-                // In place the card wrote title memory itself.
-                if shadow.in_place() {
-                    continue;
+                // In place the card wrote title memory itself; of a copy in
+                // the card's memory, what its landing lands (below).
+                if !shadow.in_place() && !shadow.carded() {
+                    parts_of(shadow, (a, b), needs, &mut back);
                 }
-                let first = needs.partition_point(|n| n.1 <= a);
-                for &(na, nb) in needs[first..].iter().take_while(|n| n.0 < b) {
-                    let (from, to) = (a.max(na).max(start), b.min(nb).min(end));
-                    if from < to {
-                        back.push((shadow.clone(), from, to));
-                    }
-                }
+            }
+        }
+        // Of copies in the card's memory, what its landing lands: its
+        // plan's ranges (`Host::relay_card_back`), not those `crate::picked`
+        // only looks at, nor, at its first stage, the buffers it found,
+        // which are declared and not landed (`Host::card_before`).
+        for r in flight.card.iter().flat_map(|c| &c.ranges).filter(|r| !r.picked && !r.shadow.in_place()) {
+            if touches(needs, r.declared.0, r.declared.1) {
+                last = Some(i);
+                parts_of(&r.shadow, r.declared, needs, &mut back);
             }
         }
     }
@@ -255,14 +278,14 @@ fn plan(items: &[Late], needs: &[(usize, usize)]) -> Result<Option<Plan>, &'stat
     };
     // Each copy's parts joined; then no two copies over the same bytes.
     back.sort_by_key(|(shadow, from, _)| (Arc::as_ptr(shadow) as usize, *from));
-    let mut joined: Vec<(Arc<Shadow>, usize, usize)> = Vec::with_capacity(back.len());
+    let mut joined: Vec<Part> = Vec::with_capacity(back.len());
     for (shadow, from, to) in back {
         match joined.last_mut() {
             Some((s, _, end)) if Arc::ptr_eq(s, &shadow) && from <= *end => *end = (*end).max(to),
             _ => joined.push((shadow, from, to)),
         }
     }
-    let mut by_address: Vec<&(Arc<Shadow>, usize, usize)> = joined.iter().collect();
+    let mut by_address: Vec<&Part> = joined.iter().collect();
     by_address.sort_by_key(|p| p.1);
     if by_address.windows(2).any(|w| w[1].1 < w[0].2) {
         return Err("flights write it through two host copies");
@@ -603,12 +626,16 @@ mod tests {
     use super::*;
 
     fn flight(fence: u64, back: Vec<Declared>, texture_back_ranges: Vec<(usize, usize)>) -> Late {
+        flight_with(fence, back, None, texture_back_ranges)
+    }
+
+    fn flight_with(fence: u64, back: Vec<Declared>, card: Option<CardPlan>, texture_back_ranges: Vec<(usize, usize)>) -> Late {
         Late::Run(Flight {
             number: fence,
             fence,
             lists: Vec::new(),
             order: Vec::new(),
-            card: None,
+            card,
             back,
             own: None,
             texture_back_ranges,
@@ -618,6 +645,37 @@ mod tests {
     fn copy(start: usize, len: usize) -> Arc<Shadow> {
         // (Never read: the plan looks at spans alone.)
         Shadow::unbacked(start as u64, std::ptr::NonNull::<u8>::dangling().as_ptr(), len as u64, false)
+    }
+
+    /// A copy in the card's memory, as [`copy`].
+    fn carded(start: usize, len: usize) -> Arc<Shadow> {
+        Shadow::unbacked(start as u64, std::ptr::NonNull::<u8>::dangling().as_ptr(), len as u64, true)
+    }
+
+    /// A flight's plan for copies in the card's memory with `ranges`
+    /// (copy, declared range, whether `crate::picked` only looks at it).
+    fn card(ranges: Vec<(Arc<Shadow>, (usize, usize), bool)>) -> CardPlan {
+        CardPlan {
+            ranges: ranges
+                .into_iter()
+                .map(|(shadow, declared, picked)| CardRange {
+                    span: shadow.card_span(declared.0, declared.1).unwrap(),
+                    shadow,
+                    declared,
+                    at: 0,
+                    compared: false,
+                    picked,
+                })
+                .collect(),
+            results: (0, 0),
+            check: None,
+            _synced: Vec::new(),
+            lists: Vec::new(),
+            sent_as: 0,
+            looks: None,
+            sends: None,
+            up: None,
+        }
     }
 
     /// A read waits for the last flight that declared a write over what it
@@ -659,6 +717,31 @@ mod tests {
         assert_eq!((p.fence, p.flights), (6, 2));
         let back: Vec<(usize, usize)> = p.back.iter().map(|p| (p.1, p.2)).collect();
         assert_eq!(back, [(0x10_0800, 0x10_5000)]);
+    }
+
+    /// Of a copy in the card's memory only what its landing lands comes
+    /// back: its plan's ranges. Not a buffer `crate::picked` found, which is
+    /// declared and not landed at its first stage (`VICTORY_PICKED_WRITES=1`:
+    /// the title may have other things there by now), nor what it only
+    /// looks at; a flight that declared what is read is waited for all the
+    /// same.
+    #[test]
+    fn of_a_copy_in_the_cards_memory_only_what_its_landing_lands_comes_back() {
+        let a = carded(0x10_0000, 0x10_0000);
+        // Its shaders' declared writes, and a buffer `picked` found.
+        let back = vec![(a.clone(), vec![(0x10_0000, 0x10_4000), (0x10_8000, 0x10_9000)])];
+        let plan_of = card(vec![(a.clone(), (0x10_0000, 0x10_4000), false), (a.clone(), (0x10_c000, 0x10_d000), true)]);
+        let line = [flight_with(5, back, Some(plan_of), Vec::new())];
+        let p = plan(&line, &[(0x10_3000, 0x10_3100), (0x10_8800, 0x10_8900), (0x10_c800, 0x10_c900)]).unwrap().unwrap();
+        assert_eq!((p.fence, p.flights), (5, 1));
+        let back: Vec<(usize, usize)> = p.back.iter().map(|p| (p.1, p.2)).collect();
+        assert_eq!(back, [(0x10_3000, 0x10_3100)]);
+        // What `picked` found, alone: waited for, nothing brought back.
+        let p = plan(&line, &[(0x10_8800, 0x10_8900)]).unwrap().unwrap();
+        assert_eq!(p.fence, 5);
+        assert!(p.back.is_empty());
+        // What it only looks at is no flight's write.
+        assert!(plan(&line, &[(0x10_c800, 0x10_c900)]).unwrap().is_none());
     }
 
     /// What cannot be brought back from a copy takes the old wait.
