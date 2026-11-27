@@ -3483,6 +3483,16 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.after_dispatch(list, p);
+        #[cfg(feature = "diagnostics")]
+        self.dispatch_dump(list, p, None);
+    }
+
+    /// Our passes after a dispatch of `p`, direct or indirect: the stand-in
+    /// for the indirect light (`crate::ambient`) and the light probe. The
+    /// title dispatches some of the programs they follow indirectly (the
+    /// reflections' resolve, `sr_denoising:CS_TemporalResolve2_Opaque`).
+    fn after_dispatch(&mut self, list: &HostList, p: &HostPipeline) {
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -3493,8 +3503,6 @@ impl State {
         if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
             self.light_probe(list, p, true);
         }
-        #[cfg(feature = "diagnostics")]
-        self.dispatch_dump(list, p, None);
     }
 
     /// `crate::dispatchdump` after a dispatch of `p` (with the arguments
@@ -3559,7 +3567,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, SPECULAR, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3568,18 +3576,19 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Specular => SPECULAR,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Specular => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Specular) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
@@ -4871,6 +4880,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.after_dispatch(list, p);
             #[cfg(feature = "diagnostics")]
             self.dispatch_dump(list, p, Some((&bounded, at)));
         } else {
