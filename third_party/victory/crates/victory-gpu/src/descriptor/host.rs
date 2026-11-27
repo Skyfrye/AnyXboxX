@@ -2931,9 +2931,11 @@ impl HostHeap {
     /// (`VICTORY_TEXTURE_AWAY_MS`; 0: at once, as before).
     ///
     /// `handle`: the title's record the memory was looked up for. A slot
-    /// made from another record (one that goes on showing the texture it
-    /// held while the new one is not there yet, [`HostHeap::keeps`]) is
-    /// left as it is: the memory found away is not that of what it shows.
+    /// made from another record of another texture (one that goes on
+    /// showing the texture it held while the new one is not there yet,
+    /// [`HostHeap::keeps`]) is left as it is: the memory found away is not
+    /// that of what it shows. One made from another view of the same
+    /// texture is let go as one made from this record.
     /// (It was let go all the same, three seconds on, and the slot read
     /// zeros until the new texture's memory came: run nb1 had 56,498 slots
     /// that waited for their memory, 19.6 s on average.)
@@ -2952,7 +2954,13 @@ impl HostHeap {
         let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
             return false;
         };
-        if key != record_key(handle) {
+        // Made from another record of the same texture (rewritten with more
+        // levels, `Kin::Same`: the memory found away is what it shows) it is
+        // let go as its own; of another texture it is left showing that.
+        // (Only its own was let go: a slot kept on another view of its
+        // texture never was, and held the copy while textures streamed.
+        // Round 2's review, item 5.)
+        if key != record_key(handle) && !self.texture_slot_shows_other(index, handle) {
             KEPT_AWAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
@@ -6549,6 +6557,40 @@ mod tests {
         COMPARE_IN_TEST.set(None);
         assert_eq!(heap.made.get(2), Some(record_key(handle)), "made at once");
         assert_eq!(heap.kept_in(2).map(|r| r.as_raw()), Some(copy.texture.as_raw()));
+    }
+
+    /// A slot that goes on showing an earlier view of its texture (the title
+    /// wrote it again with more levels: `Kin::Same`) is let go once that
+    /// texture's memory is found away, as one made from its own record. (A
+    /// keep of any kind left `made` at the old record, so it never was, and
+    /// its copy stayed held while textures streamed. Round 2's review, item
+    /// 5.)
+    #[test]
+    fn a_slot_kept_on_an_earlier_view_of_its_texture_is_let_go_when_that_is_away() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let Some(texture) = make_neutral(Neutral::Flat) else { return };
+        let address = 0x7fee_3318_0000u64;
+        // Three levels, viewed from the smallest, then from the largest.
+        let view = |first: u32| {
+            let mut view = placed_2d(address, 98);
+            if let View::Placed(_, resource, desc) = &mut view {
+                resource[7] = 3 << 16 | 1;
+                (desc[4], desc[5]) = (first, 3 - first);
+            }
+            view
+        };
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, view(2));
+        let shown = record_key(handle);
+        heap.made.set(5, shown);
+        heap.keep(5, Some(texture));
+        write_record(&mut slot, view(0));
+        assert!(heap.mirror(5, handle, false).is_some());
+        assert_eq!(heap.made.get(5), Some(shown), "goes on showing the earlier view");
+        assert!(heap.texture_slot_shows_other(5, handle));
+        // That texture's memory found away past the wait: let go.
+        assert!(heap.gone_after(5, handle, 0));
+        assert!(heap.shows_none(5));
     }
 
     /// A slot that goes on showing another record's texture while its new
