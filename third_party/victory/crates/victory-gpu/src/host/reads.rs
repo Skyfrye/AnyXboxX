@@ -11,10 +11,11 @@
 //! ms there (run nbc-measure: "title memory read 1.0 (... a fill of upload
 //! memory 1.0)", 62-63 ms a frame, the card's steps refusing it).
 //!
-//! Now it waits for the card alone: for the host's fence behind the last
-//! flight that declared a write over what the steps read. Then what they
-//! read, and only that, is brought back into title memory at once, from the
-//! host copies those flights wrote: a copy in the PC's memory merged as its
+//! Now it waits for the card: for the host's fence behind the last flight
+//! that declared a write over what the steps read, and for the flights
+//! ahead of that one to land, as they do meanwhile. Then what they read, and
+//! only that, is brought back into title memory at once, from the host
+//! copies those flights wrote: a copy in the PC's memory merged as its
 //! landing merges it (`Shadow::relay_merge`), a copy in the card's memory
 //! fetched over a copy queue of its own and merged as its landing merges it
 //! (`Shadow::card_merge_relay`). The landing that comes later finds those
@@ -30,12 +31,16 @@
 //! or since the last merge), as the landing does, and leaves the title's
 //! other bytes; of a copy in the card's memory it leaves out the title's
 //! bytes that went up behind the last flight waited for, or not at all yet,
-//! as the landing does (the card's side is the older there). No landing
-//! runs meanwhile: one in its course is waited for, and the thread that
-//! lands takes no new flights until the merge is done (`Line::reading`), so
-//! no fetch made before the card ran the last flight is merged after this.
-//! While the read waits for the card, that thread lands what is ahead of
-//! the flight waited for, and not it ([`landing_limit`]).
+//! as the landing does (the card's side is the older there).
+//!
+//! And what the title can see stays in the relay's order (a later flight's
+//! results never reach title memory before an earlier flight's): the
+//! flights ahead of the one read have landed, whole, before anything of it
+//! is brought back. No landing runs meanwhile: one in its course is waited
+//! for, and the thread that lands takes no new flights until the merge is
+//! done (`Line::reading`), so no fetch made before the card ran the flight
+//! read is merged after this. While the read waits, that thread lands what
+//! is ahead of the flight read, and not it ([`landing_limit`]).
 //!
 //! Where that cannot be said the old wait is taken ([`needs`], [`plan`]): a
 //! step of ours that may read or write anything; a title buffer copy into
@@ -70,8 +75,9 @@ const MOST: usize = 16 << 20;
 /// the air up to the last one waited for; microseconds waiting for the card;
 /// microseconds bringing back; bytes brought back; of them bytes put into
 /// title memory; parts of copies in the PC's memory and in the card's;
-/// reads that took the old wait; microseconds of the fetches.
-static STATS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+/// reads that took the old wait; microseconds of the fetches; microseconds
+/// waiting for landings (of the flights ahead, or one in its course).
+static STATS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// Why reads took the old wait, since the last frame-rate line.
 static REFUSED: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
@@ -97,12 +103,13 @@ pub(super) fn log(frames: f64) {
     let refused: Vec<String> = refused.iter().take(3).map(|(why, n)| format!("{:.2} {why}", *n as f64 / frames)).collect();
     tracing::info!(
         "title memory read under flights, per frame (VICTORY_READ_WAIT=0: until the flights have landed): {:.2} reads waited \
-         for the card's fence alone, behind {:.1} flights each, {:.1} ms for the card, then {:.2} ms bringing back {:.1} KB \
-         ({:.1} KB of it new to title memory; {:.1} parts of copies in the PC's memory, {:.1} fetched from the card's in \
-         {:.2} ms); {:.2} waited for landings{}{}",
+         for the card's fence and the landings ahead of it, behind {:.1} flights each, {:.1} ms for the card, {:.2} ms for \
+         the landings, then {:.2} ms bringing back {:.1} KB ({:.1} KB of it new to title memory; {:.1} parts of copies in the \
+         PC's memory, {:.1} fetched from the card's in {:.2} ms); {:.2} waited for landings{}{}",
         s[0],
         if s[0] > 0.0 { s[1] / s[0] } else { 0.0 },
         s[2] / 1000.0,
+        s[10] / 1000.0,
         s[3] / 1000.0,
         s[4] / 1024.0,
         s[5] / 1024.0,
@@ -182,7 +189,8 @@ struct Plan {
     /// The host fence's value behind the last flight in the air that
     /// declared a write over what is read.
     fence: u64,
-    /// The flights in the air up to that one.
+    /// The flights in the air up to that one, it too: those ahead of it
+    /// land before anything is brought back.
     flights: usize,
     /// What is brought back: the host copy, and the title memory (from, to),
     /// each copy's parts in order and joined.
@@ -325,12 +333,25 @@ unsafe impl Send for Fetch {}
 
 static FETCH: Mutex<Option<Fetch>> = Mutex::new(None);
 
+/// Waits without the line's lock (`held`) until flights have landed once
+/// more, standing as [`relay_wait`] stands; the microseconds go to `us`.
+fn landings(held: std::sync::MutexGuard<'static, Line>, us: &mut u64) -> std::sync::MutexGuard<'static, Line> {
+    let was_working = working(false);
+    let waiting = std::time::Instant::now();
+    let held = LINE_LANDED.wait(held).unwrap_or_else(|e| e.into_inner());
+    stood(waiting);
+    working(was_working);
+    *us += waiting.elapsed().as_micros() as u64;
+    held
+}
+
 impl Host {
     /// [`late_blocked`] said a step of `runs` reads title memory flights in
     /// the air may write, and the card does not do it ([`card_steps`]):
     /// waits for the card to have run the last flight that declared a write
-    /// over what is read, and brings that back into title memory (see the
-    /// file). Whether that was done; if not, the caller waits as before.
+    /// over what is read, and for the flights ahead of it to land, and
+    /// brings that back into title memory (see the file). Whether that was
+    /// done; if not, the caller waits as before.
     /// Under the submission lock (`submitted`), whose event it waits with.
     pub(super) fn read_wait(&self, submitted: &mut u64, runs: &[&HostList]) -> bool {
         let _ = submitted;
@@ -349,20 +370,20 @@ impl Host {
         };
         let began = std::time::Instant::now();
         let _waiting = crate::timeline::span("waiting for the card: title memory read");
-        let mut card_us = 0u64;
-        let mut flights = 0usize;
+        let (mut card_us, mut landing_us, mut flights) = (0u64, 0u64, 0usize);
         // Lets the thread that lands flights take them all again.
         let release = |mut line: std::sync::MutexGuard<'_, Line>| {
             (line.reading, line.hold) = (false, 0);
             drop(line);
             RELAY_MOVED.notify_one();
         };
+        let mut held = line();
         loop {
-            let mut held = line();
             // A landing in its course is waited for: what it fetched may
             // be older than what is brought back here.
-            while held.settling {
-                held = LINE_LANDED.wait(held).unwrap_or_else(|e| e.into_inner());
+            if held.settling {
+                held = landings(held, &mut landing_us);
+                continue;
             }
             let plan = match plan(&held.line, &needs) {
                 Ok(Some(plan)) => plan,
@@ -377,30 +398,26 @@ impl Host {
                 }
             };
             flights = flights.max(plan.flights);
+            // From here on what is ahead of it lands meanwhile, and not it.
+            if held.hold != plan.fence {
+                held.hold = plan.fence;
+                RELAY_MOVED.notify_one();
+            }
             // SAFETY: a plain query.
             if unsafe { self.fence.GetCompletedValue() } < plan.fence {
-                // What is ahead of it lands meanwhile; it waits for this.
-                held.hold = plan.fence;
                 drop(held);
-                let was_working = working(false);
-                let waiting = std::time::Instant::now();
-                // SAFETY: the host's fence; the event is the submission
-                // lock's, which the caller holds.
-                unsafe {
-                    if self.fence.SetEventOnCompletion(plan.fence, self.event).is_ok() {
-                        #[cfg(feature = "diagnostics")]
-                        let _card = crate::timeline::card_wait(Some(plan.fence));
-                        WaitForSingleObject(self.event, INFINITE);
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                }
-                stood(waiting);
-                working(was_working);
-                card_us += waiting.elapsed().as_micros() as u64;
+                card_us += self.card_wait(plan.fence);
+                held = line();
                 continue;
             }
-            // The card has run them: no landing starts until the bytes are in.
+            // The flights ahead of it land first, whole: a later flight's
+            // bytes never reach title memory before an earlier flight's.
+            if plan.flights > 1 {
+                held = landings(held, &mut landing_us);
+                continue;
+            }
+            // The card has run it, and it is the first of the line: no
+            // landing starts until the bytes are in.
             held.reading = true;
             drop(held);
             let bringing = std::time::Instant::now();
@@ -421,6 +438,7 @@ impl Host {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(flights as u64, Ordering::Relaxed);
         STATS[2].fetch_add(card_us, Ordering::Relaxed);
+        STATS[10].fetch_add(landing_us, Ordering::Relaxed);
         // On the settles' line as the wait it replaces was.
         LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
         LATE_STATS[WHY_READ].fetch_add(1, Ordering::Relaxed);
@@ -431,6 +449,28 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         blamed(WHY_READ, us);
         true
+    }
+
+    /// Waits for the host's fence to reach `fence`, standing as
+    /// [`relay_wait`] stands: the microseconds. Under the submission lock,
+    /// whose event it waits with.
+    fn card_wait(&self, fence: u64) -> u64 {
+        let was_working = working(false);
+        let waiting = std::time::Instant::now();
+        // SAFETY: the host's fence; the event is the submission lock's,
+        // which the caller holds.
+        unsafe {
+            if self.fence.SetEventOnCompletion(fence, self.event).is_ok() {
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(Some(fence));
+                WaitForSingleObject(self.event, INFINITE);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        stood(waiting);
+        working(was_working);
+        waiting.elapsed().as_micros() as u64
     }
 
     /// The parts of `plan` go into title memory: the bytes read, and the
