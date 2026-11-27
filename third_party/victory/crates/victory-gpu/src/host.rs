@@ -2129,7 +2129,47 @@ fn trim_spare_chunks() {
     ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
-    drop(freed);
+    let_go_beside(freed);
+}
+
+/// Whether what nothing names any more is let go on a thread of its own
+/// ([`let_go_beside`]; `VICTORY_LET_GO_BESIDE=0`: where it is let go, as
+/// before).
+fn let_go_aside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LET_GO_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// Drops `what` on a thread kept for that, not on this one: things nothing
+/// names any more (no list records into them, none that runs or is recorded
+/// names them), whose release is the kernel's, such as the scratch chunks no
+/// list holds. Under memory pressure those were all let go once a second on
+/// the submitting thread, which stood some 30 ms in their release each
+/// time (2.9% of its time in run s2-prof1's profile, in the opening
+/// cutscene). Here if there is no such thread.
+fn let_go_beside<T: Send + 'static>(what: T) {
+    type Gone = Box<dyn std::any::Any + Send>;
+    static THREAD: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Gone>>>> = OnceLock::new();
+    if !let_go_aside() {
+        drop(what);
+        return;
+    }
+    let thread = THREAD.get_or_init(|| {
+        let (send, gone) = std::sync::mpsc::channel::<Gone>();
+        std::thread::Builder::new()
+            .name("victory-let-go".into())
+            .spawn(move || gone.into_iter().for_each(drop))
+            .ok()
+            .map(|_| Mutex::new(send))
+    });
+    let gone: Gone = Box::new(what);
+    match thread {
+        Some(send) => {
+            // (A thread that is gone hands it back: dropped here.)
+            let _ = send.lock().unwrap_or_else(|e| e.into_inner()).send(gone);
+        }
+        None => drop(gone),
+    }
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -11750,5 +11790,24 @@ mod window_mode_tests {
         assert!(super::is_borderless(" Borderless "));
         assert!(!super::is_borderless("windowed"));
         assert!(!super::is_borderless(""));
+    }
+}
+
+#[cfg(test)]
+mod let_go_tests {
+    /// What is let go beside is dropped on another thread than the one that
+    /// lets it go, and is dropped.
+    #[test]
+    fn what_is_let_go_beside_is_dropped_on_another_thread() {
+        struct Told(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for Told {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+        let (tell, told) = std::sync::mpsc::channel();
+        super::let_go_beside(Told(tell));
+        let by = told.recv_timeout(std::time::Duration::from_secs(10)).expect("dropped");
+        assert_ne!(by, std::thread::current().id(), "dropped where it was let go");
     }
 }
