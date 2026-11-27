@@ -76,25 +76,33 @@ const DRAIN_MS: u64 = 10_000;
 
 /// Blocks left to empty since the start ([`drain`]).
 static DRAINED: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones that emptied and went back to the system.
+static EMPTIED_BACK: AtomicU64 = AtomicU64::new(0);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// With the system's count of room on ([`crate::vram::system_room`]): as
-/// many as lie under that line ([`kept_spares`]), and the empty blocks past
+/// many as lie under that line ([`kept_spares`]) by the count the texture
+/// queue and the sweep use (`crate::resource::counted_in_use`: with what is
+/// kept for targets and buffer copies to come), and the empty blocks past
 /// them go back to the system now, not at the pool's next texture.
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let system = crate::vram::system_room();
     let tick = now();
+    // (Before the pool's lock: the count asks the pool too.)
+    let counted = memory.map(|[budget, used, ..]| [budget, crate::resource::counted_in_use(used)]);
     if !crate::residency::on() {
         if !system {
             SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
             return;
         }
         if let Ok(mut pool) = TEXTURES.try_lock() {
-            let limit = kept_spares(memory, crate::host::keep_freed(), pool.empty());
+            // The empty blocks as they are once the pieces that rested are back.
+            let any = pool.rest(tick);
+            let limit = kept_spares(counted, crate::host::keep_freed(), pool.empty());
             SPARES.store(limit, Ordering::Relaxed);
-            pool.reclaim(tick, limit, false);
+            pool.release(limit, any);
         }
         return;
     }
@@ -108,11 +116,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         SPARES.store(limit, Ordering::Relaxed);
     }
     if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.rest(tick);
         if system {
-            limit = kept_spares(memory, keep, pool.empty());
+            limit = kept_spares(counted, keep, pool.empty());
             SPARES.store(limit, Ordering::Relaxed);
         }
-        pool.reclaim(tick, limit, true);
+        pool.release(limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
@@ -133,15 +142,21 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     }
 }
 
-/// The empty blocks kept, `empty` of them there now, as the system counts
-/// the card's memory: those that lie under 85 % of its budget (the empty
-/// ones count as used), between [`SPARE`] and [`SPARE_KEPT`]. The rule of
-/// [`spares`] jumps from 64 to 2 at the line: right where the sweep lets
-/// textures go down to ([`crate::host::vram_keep`]), 62 blocks would go
-/// back and be made again ahead ([`ahead`]) each time the use crossed it.
-fn kept_spares(memory: Option<[u64; 4]>, keep: bool, empty: usize) -> usize {
-    match memory {
-        Some([budget, used, ..]) if keep && budget > 0 => {
+/// The empty blocks kept, `empty` of them there now, by `counted` (the
+/// card's budget and its memory in use as the queue and the sweep count it,
+/// the empty blocks in it): those that lie under 85 % of the budget, between
+/// [`SPARE`] and [`SPARE_KEPT`]. The rule of [`spares`] jumps from 64 to 2 at
+/// the line: right where the sweep lets textures go down to
+/// ([`crate::host::vram_keep`]), 62 blocks would go back and be made again
+/// ahead ([`ahead`]) each time the use crossed it.
+///
+/// (By the system's figure alone, without what is kept for targets and
+/// buffer copies to come, the spares were 0.8-3.4 GB more than the sweep's
+/// count let be: a block the sweep emptied stayed as a spare, the system's
+/// count never fell, and the sweep let another block go at its next look.)
+fn kept_spares(counted: Option<[u64; 2]>, keep: bool, empty: usize) -> usize {
+    match counted {
+        Some([budget, used]) if keep && budget > 0 => {
             let line = i128::from(budget / 100 * 85);
             let fit = (line - i128::from(used)).div_euclid(i128::from(BLOCK));
             (empty as i128 + fit).clamp(SPARE as i128, SPARE_KEPT as i128) as usize
@@ -275,6 +290,10 @@ struct Block<B> {
     live: u32,
     /// Until when it is left to empty ([`DRAIN_MS`]); 0: it is not.
     draining: u64,
+    /// Left to empty, and empty now: it goes back to the system at the next
+    /// look at the empty blocks, whatever spares are kept (the sweep let its
+    /// textures go for that).
+    emptied: bool,
 }
 
 impl<B> Block<B> {
@@ -417,6 +436,7 @@ impl<B: Clone> Pool<B> {
         block.live += 1;
         // (Only a block left to empty for want of another gets here so.)
         block.draining = 0;
+        block.emptied = false;
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
@@ -451,6 +471,7 @@ impl<B: Clone> Pool<B> {
             class: None,
             live: 0,
             draining: 0,
+            emptied: false,
         });
         self.made += 1;
         i
@@ -517,6 +538,13 @@ impl<B: Clone> Pool<B> {
     /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
     /// empty blocks are looked at even if no piece came back.
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
+        let any = self.rest(now);
+        self.release(limit, sweep || any);
+    }
+
+    /// Makes the pieces that rested long enough free; whether a block
+    /// emptied.
+    fn rest(&mut self, now: u64) -> bool {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
@@ -526,25 +554,39 @@ impl<B: Clone> Pool<B> {
                 block.free.give(piece.start, piece.len);
                 if block.free.whole(BLOCK) {
                     // Empty: any class may take it, and it is not left to
-                    // empty any more.
+                    // empty any more; left to empty, it goes back.
                     block.class = None;
+                    block.emptied = block.draining != 0;
                     block.draining = 0;
                     any = true;
                 }
             }
         }
-        // (Without a piece given back too, once there is less room.)
+        any
+    }
+
+    /// Lets go of the empty blocks the sweep left to empty, and of those
+    /// past `limit` others; `look`: whether to look at all (otherwise only
+    /// once there is less room than at the last look).
+    fn release(&mut self, limit: usize, look: bool) {
         let most = limit.min(self.most);
         let previous = std::mem::replace(&mut self.spare, most);
-        if sweep || any || most < previous {
+        if look || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
-                    spare += 1;
-                    if spare > most {
-                        *block = None;
-                        self.released += 1;
-                    }
+                let Some(b) = block.as_ref().filter(|b| b.free.whole(BLOCK)) else {
+                    continue;
+                };
+                if b.emptied {
+                    *block = None;
+                    self.released += 1;
+                    EMPTIED_BACK.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                spare += 1;
+                if spare > most {
+                    *block = None;
+                    self.released += 1;
                 }
             }
         }
@@ -594,9 +636,10 @@ pub(crate) fn staging_census() -> Census {
     lock(&STAGING).census(now())
 }
 
-/// Blocks left to empty since the start.
-pub(crate) fn drained() -> u64 {
-    DRAINED.load(Ordering::Relaxed)
+/// Blocks left to empty since the start, and of those the ones that went
+/// back to the system once empty.
+pub(crate) fn drained() -> [u64; 2] {
+    [DRAINED.load(Ordering::Relaxed), EMPTIED_BACK.load(Ordering::Relaxed)]
 }
 
 /// The pieces taken of each texture block, by its number.
@@ -1068,13 +1111,13 @@ mod tests {
     #[test]
     fn empty_blocks_kept_are_those_under_the_line() {
         let budget = 100 * BLOCK;
-        assert_eq!(kept_spares(Some([budget, 70 * BLOCK, 0, 0]), true, 3), (3 + 15).min(SPARE_KEPT));
-        assert_eq!(kept_spares(Some([budget, 85 * BLOCK, 0, 0]), true, 12), 12);
-        assert_eq!(kept_spares(Some([budget, 85 * BLOCK + 1, 0, 0]), true, 12), 11);
-        assert_eq!(kept_spares(Some([budget, 90 * BLOCK, 0, 0]), true, 12), 7);
-        assert_eq!(kept_spares(Some([budget, 99 * BLOCK, 0, 0]), true, 12), SPARE);
-        assert_eq!(kept_spares(Some([budget, 10 * BLOCK, 0, 0]), true, 12), SPARE_KEPT);
-        assert_eq!(kept_spares(Some([budget, 10 * BLOCK, 0, 0]), false, 12), SPARE);
+        assert_eq!(kept_spares(Some([budget, 70 * BLOCK]), true, 3), (3 + 15).min(SPARE_KEPT));
+        assert_eq!(kept_spares(Some([budget, 85 * BLOCK]), true, 12), 12);
+        assert_eq!(kept_spares(Some([budget, 85 * BLOCK + 1]), true, 12), 11);
+        assert_eq!(kept_spares(Some([budget, 90 * BLOCK]), true, 12), 7);
+        assert_eq!(kept_spares(Some([budget, 99 * BLOCK]), true, 12), SPARE);
+        assert_eq!(kept_spares(Some([budget, 10 * BLOCK]), true, 12), SPARE_KEPT);
+        assert_eq!(kept_spares(Some([budget, 10 * BLOCK]), false, 12), SPARE);
         assert_eq!(kept_spares(None, true, 12), SPARE);
     }
 
@@ -1191,6 +1234,33 @@ mod tests {
         let p = pool.take_ripe(64 << 10, 65536, 4 * REST + DRAIN_MS + 1, Ripe::ALL, Some(0), || None).unwrap().0;
         assert_eq!(p.block, 1);
         assert_eq!(pool.giving_back(4 * REST + DRAIN_MS + 1), 0, "taken again, it does not go back");
+    }
+
+    /// A block the sweep left to empty goes back once it is empty, however
+    /// many empty blocks are kept: it is not kept as a spare. Another empty
+    /// block is. (Kept as one, the system's count never fell, and the sweep
+    /// let another block go at its next look. Round 2's review, item 1.)
+    #[test]
+    fn a_block_left_to_empty_goes_back_with_spares_to_keep() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let take = |pool: &mut Pool<u32>, class| pool.take_ripe(64 << 10, 65536, 0, Ripe::ALL, Some(class), make).unwrap().0;
+        let drained: Vec<Piece> = (0..4).map(|_| take(&mut pool, 0)).collect();
+        let other = take(&mut pool, 1);
+        assert_eq!((drained[0].block, other.block), (0, 1));
+        assert!(pool.drain(0, 0));
+        for p in drained.into_iter().chain([other]) {
+            pool.give(p, 1);
+        }
+        let back = EMPTIED_BACK.load(Ordering::Relaxed);
+        pool.reclaim(1 + REST, SPARE_KEPT, false);
+        assert!(pool.blocks[0].is_none(), "the block left to empty went back");
+        assert!(pool.blocks[1].is_some(), "the other empty one is a spare");
+        assert!(EMPTIED_BACK.load(Ordering::Relaxed) > back);
     }
 
     /// For the memory line: what the blocks hold, by class, free, resting,

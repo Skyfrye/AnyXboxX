@@ -90,7 +90,7 @@ pub(crate) fn plan(idle: &[Idle], lives: &[u32], block_bytes: u64) -> Vec<Unit> 
 pub(crate) static LET_GO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// The counts of the last line, to say what changed since.
-static LAST: std::sync::Mutex<[u64; 9]> = std::sync::Mutex::new([0; 9]);
+static LAST: std::sync::Mutex<[u64; 10]> = std::sync::Mutex::new([0; 10]);
 
 /// The memory line: the system's budget and use, what of ours holds the
 /// card's memory, and what the queue and the sweep did since the last line.
@@ -108,20 +108,22 @@ pub(crate) fn line() -> String {
     let kinds: [u64; 7] = std::array::from_fn(|i| crate::resource::KINDS[i].load(Relaxed));
     let (sides, before, windows) = crate::shadow::card_bytes();
     let [whole, gave, broken] = [0, 1, 2].map(|i| LET_GO[i].load(Relaxed));
+    let [drained, emptied] = crate::pool::drained();
     let now = [
         kinds[2],
         kinds[3],
-        crate::pool::drained(),
+        drained,
         blocks.released,
         blocks.made,
         crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
         whole,
         gave,
         broken,
+        emptied,
     ];
     let since = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        let since: [u64; 9] = std::array::from_fn(|i| now[i].saturating_sub(last[i]));
+        let since: [u64; 10] = std::array::from_fn(|i| now[i].saturating_sub(last[i]));
         *last = now;
         since
     };
@@ -143,7 +145,8 @@ pub(crate) fn line() -> String {
          in them {} MB, resting {} MB, {} empty, {} left to empty, {classes}; host copies the title fills {} alive {} MB, {} MB of \
          them outside blocks; other host textures (targets, depth, unordered access, twins) {} MB; buffer copies' card sides {} MB, \
          their bytes from before {} MB, windows' {} MB. Since the last line: {} copies let go ({} MB), {} blocks let go whole ({} MB \
-         back), {} begun and left (a copy was used again), {} blocks left to empty, {} back to the system, {} made; {} texture passes \
+         back), {} begun and left (a copy was used again), {} blocks left to empty ({} that did went back once empty), {} back to \
+         the system in all, {} made; {} texture passes \
          refused for want of room ({} since the start)",
         u8::from(system),
         if system { "free bytes in blocks count as used" } else { "free bytes in blocks count as room" },
@@ -180,6 +183,7 @@ pub(crate) fn line() -> String {
         mb(since[7]),
         since[8],
         since[2],
+        since[9],
         since[3],
         since[4],
         since[5],
