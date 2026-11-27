@@ -420,10 +420,9 @@ fn let_go(pages: &[Page]) {
 /// fault of a title store through another view of them was dropped (one at
 /// this address is told at the address too, as its guard comes off), and
 /// that view, opened by it, took the next stores with no fault. Then the
-/// pages shown now are
-/// held and armed again, with a tick of their own, up to [`REWATCHES`]
-/// times; still moving after that, the slot is read again at the next pass
-/// ([`Kept::Open`]).
+/// pages shown now are held and armed again, with a tick of their own, up
+/// to [`REWATCHES`] times; still moving after that, the slot is read again
+/// at the next pass ([`Kept::Open`]).
 pub(crate) fn watch(slot: u32, at: usize, len: usize, mut with: impl FnMut(&mut dyn FnMut(&mut Watchers))) -> Kept {
     let mut pages = pages_of(at, len);
     let mut tries = 0;
@@ -940,7 +939,6 @@ mod tests {
     fn a_write_between_the_tick_and_the_watch_is_not_lost() {
         TEST_ON.set(Some(true));
         const SIZE: usize = PAGE;
-        TEST_ON.set(Some(true));
         let (_, one, two) = kept_views(SIZE);
         let mut watchers = Watchers::default();
         // What the texture pass does, with the title's write where the
@@ -1151,7 +1149,6 @@ mod tests {
     fn a_slot_whose_alias_rests_open_is_read_again() {
         TEST_ON.set(Some(true));
         const SIZE: usize = PAGE;
-        TEST_ON.set(Some(true));
         let (_, one, two) = kept_views(SIZE);
         let mut watchers = Watchers::default();
         assert_eq!(watch(&mut watchers, 1, one, SIZE), Kept::Told);
