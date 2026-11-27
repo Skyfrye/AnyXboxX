@@ -406,10 +406,15 @@ impl<B: Clone> Pool<B> {
                     let i = self.add(memory, ripe.started);
                     (i, self.blocks[i].as_mut()?.free.take(len, align)?)
                 }
-                // None to be had: one left to empty, all the same.
-                None => self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
-                    let b = b.as_mut().filter(|b| b.takes(class, u64::MAX))?;
-                    Some((i, b.free.take(len, align)?))
+                // None to be had: one left to empty, all the same; then a
+                // block of another class with room, rather than memory of
+                // the texture's own (an allocation, ~310 us each on AMD, and
+                // more memory). Its class stays the block's.
+                None => [class, None].into_iter().find_map(|class| {
+                    self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
+                        let b = b.as_mut().filter(|b| b.takes(class, u64::MAX))?;
+                        Some((i, b.free.take(len, align)?))
+                    })
                 })?,
             },
         };
@@ -430,7 +435,9 @@ impl<B: Clone> Pool<B> {
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
-        if class.is_some() {
+        // (An empty block takes the piece's class; one of another class, for
+        // want of any other, keeps its own.)
+        if block.class.is_none() {
             block.class = class;
         }
         block.live += 1;
@@ -1298,6 +1305,25 @@ mod tests {
         pool.give(b, 2);
         pool.reclaim(2 + REST, SPARE_KEPT, false);
         assert!(pool.blocks[0].is_some(), "kept as a spare");
+    }
+
+    /// With no block to be had (one was refused less than 500 ms ago), a
+    /// texture goes into a block of another class that has room rather
+    /// than into memory of its own; that block keeps its class. (Those were
+    /// skipped: a committed resource each, ~310 us on AMD. Round 2's review,
+    /// item 13.)
+    #[test]
+    fn with_no_block_to_be_had_another_class_takes_the_piece() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let small = pool.take_ripe(64 << 10, 65536, 0, Ripe::ALL, Some(0), || Some(1)).unwrap().0;
+        // A block is refused: the large texture goes in with the small ones.
+        let large = pool.take_ripe(4 << 20, 65536, 1, Ripe::ALL, Some(2), || None);
+        let large = large.expect("into the small ones' block").0;
+        assert_eq!(large.block, small.block);
+        assert_eq!(pool.blocks[0].as_ref().unwrap().class, Some(0), "its class stays");
+        // And meanwhile, with no block asked for again.
+        let more = pool.take_ripe(4 << 20, 65536, 2, Ripe::ALL, Some(2), || panic!("not asked again yet"));
+        assert_eq!(more.expect("there too").0.block, small.block);
     }
 
     /// For the memory line: what the blocks hold, by class, free, resting,
