@@ -901,9 +901,20 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // The video decoder cycles CPU-written linear plane buffers. Keep a
     // dedicated per-list upload buffer through the list's GPU fence so
     // concurrent frames never overwrite each other or stall on staging hashes
-    // (`VICTORY_MOVIE_PLANES=1`, [`movie_planes`]).
-    if movie_planes() && staging.movie_plane() {
+    // (`VICTORY_MOVIE_PLANES=1`, [`movie_planes`]). Every linear R8 texture the
+    // title fills takes this path (32,458 in run v1's first scene, none written
+    // by the card), and every list that sampled one filled a copy of its own:
+    // some 160 a second, the cutscene's cuts stalled on them. A plane already
+    // uploaded in this frame is not uploaded again for a later list of the
+    // frame: the title's decoder writes a plane at most once a frame, and the
+    // card has it from the frame's first upload (`VICTORY_PLANE_ONCE=0`: each
+    // list its own, as before).
+    if movie_planes() && staging.movie_plane() && note_plane(crate::resource::title_fills(resource)) {
         let (at, len) = staging.memory();
+        let again = plane_uploaded_this_frame(at);
+        if again && staging.uploaded.load(Relaxed) {
+            return;
+        }
         let footprint = staging.footprints[0].Footprint;
         let pitch = footprint.RowPitch as usize;
         let bytes = pitch * staging.rows[0] as usize;
@@ -1377,6 +1388,53 @@ fn record_upload(
 fn movie_planes() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MOVIE_PLANES").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: linear R8 textures [`movie_planes`] looked at that the
+/// title fills, that the card writes, and of the first those not uploaded
+/// again in a frame ([`plane_uploaded_this_frame`]); the last line's time.
+static PLANES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Counts the linear R8 textures [`movie_planes`] looks at, filled by the
+/// title (taken as planes) or written by the card (left to the staging path),
+/// and says so every 5 s; returns `title_fills`.
+fn note_plane(title_fills: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    PLANES[usize::from(!title_fills)].fetch_add(1, Relaxed);
+    let now = crate::host::now_us();
+    let last = PLANES[3].load(Relaxed);
+    if now.saturating_sub(last) >= 5_000_000 && PLANES[3].compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+        tracing::info!(
+            "linear R8 textures sampled (VICTORY_MOVIE_PLANES), since the start: {} filled by the title, taken as planes, {} of them not uploaded again in their frame (VICTORY_PLANE_ONCE); {} written by the card, left to the staging path",
+            PLANES[0].load(Relaxed),
+            PLANES[2].load(Relaxed),
+            PLANES[1].load(Relaxed)
+        );
+    }
+    title_fills
+}
+
+/// Whether the plane at title address `at` was uploaded already in this frame
+/// (`crate::frame::current`); if not, notes that it is now. Off with
+/// `VICTORY_PLANE_ONCE=0`.
+fn plane_uploaded_this_frame(at: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_ONCE").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    static LAST: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+    let frame = crate::frame::current();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let map = last.get_or_insert_with(std::collections::HashMap::new);
+    if map.len() > 4096 {
+        map.retain(|_, f| *f + 2 >= frame);
+    }
+    if map.insert(at, frame) == Some(frame) {
+        PLANES[2].fetch_add(1, Relaxed);
+        return true;
+    }
+    false
 }
 
 fn fill_plane(

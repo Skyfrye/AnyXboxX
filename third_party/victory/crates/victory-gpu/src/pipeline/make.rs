@@ -78,6 +78,17 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    // The title's ray-traced sun shadows trace tiles of the picture; without the
+    // builder the rays find nothing and every traced tile comes out lit (blocks
+    // of light along shadow edges). `VICTORY_RT_SHADOW_TRACE=0`: left out then.
+    static SKIP_SHADOW_TRACE: OnceLock<bool> = OnceLock::new();
+    let skip_shadow = *SKIP_SHADOW_TRACE.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os("VICTORY_RT_SHADOW_TRACE").is_some_and(|v| v == "0")
+    });
+    if skip_shadow && named(shaders, b"CS_RTShadowTrace") {
+        return Some("ray-traced sun shadow trace without BVH, left out");
+    }
     None
 }
 
