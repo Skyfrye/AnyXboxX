@@ -417,6 +417,19 @@ fn held() -> bool {
     cfg!(test) && HOLD.load(Ordering::Acquire)
 }
 
+/// Tests: milliseconds a read sleeps once the card has run what it waited
+/// for, before it looks at the line again (the thread that lands flights,
+/// woken by the same fence, has long taken what it may by then).
+#[cfg(test)]
+static LOOK_LATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tests: called once a read has brought its bytes back, before the thread
+/// that lands flights may take the flight read.
+#[cfg(test)]
+type Brought = Mutex<Option<Box<dyn FnMut() + Send>>>;
+#[cfg(test)]
+static BROUGHT: Brought = Mutex::new(None);
+
 /// What reads fetch parts of copies in the card's memory with: a copy queue
 /// of their own (whatever was sent to the drawing queue meanwhile, the fetch
 /// does not wait for it), a list, a fence, an event and the memory the parts
@@ -541,6 +554,8 @@ impl Host {
                 drop(held);
                 card_us += self.card_wait(plan.fence);
                 waited = true;
+                #[cfg(test)]
+                std::thread::sleep(std::time::Duration::from_millis(LOOK_LATE_MS.load(Ordering::Relaxed)));
                 held = line();
                 continue;
             }
@@ -558,6 +573,10 @@ impl Host {
             let bringing = std::time::Instant::now();
             let brought = self.bring_back(&plan);
             STATS[3].fetch_add(bringing.elapsed().as_micros() as u64, Ordering::Relaxed);
+            #[cfg(test)]
+            if let Some(brought) = BROUGHT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                brought();
+            }
             release(line());
             match brought {
                 Ok((bytes, put)) => {
@@ -963,6 +982,7 @@ mod tests {
             return;
         };
         assert!(relay_exact() && relay_copy(), "set VICTORY_RELAY=2 VICTORY_RELAY_COPY=1");
+        settle_now(WHY_SYNC);
         let (title, start) = {
             // SAFETY: memory of our own, never freed.
             let base = unsafe { VirtualAlloc(std::ptr::null(), BIG + SMALL, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE) }
@@ -1054,6 +1074,241 @@ mod tests {
         }
         assert_eq!(host.log_messages(), None);
         drop((a, c));
+    }
+
+    /// Of [`two_flights`]: a buffer whose copy is in the card's memory, two
+    /// whose copies are in the PC's.
+    const BIG: usize = 2 << 20;
+    const SMALL: usize = 512 << 10;
+    /// Where the three buffers lie in title memory, from the first.
+    const BASES: [usize; 3] = [0, BIG, BIG + SMALL];
+    /// What a title thread writes over what was read, once it was brought
+    /// back (of each of the first two buffers).
+    const TITLE_WRITES: std::ops::Range<usize> = 4600..4616;
+
+    /// Title memory's bytes before anything is written.
+    fn seed(i: usize) -> u8 {
+        (i * 7 + i / 251) as u8
+    }
+
+    /// What a flight's "shaders" write: 300 bytes at 4500 of a buffer, then
+    /// 100 at 9000.
+    fn wrote(i: usize) -> u8 {
+        0x80 | (i * 31 + 5) as u8
+    }
+
+    /// Title memory once everything has landed (offset `i` from the first
+    /// buffer): what flights wrote, and over it what the title wrote.
+    fn landed(i: usize) -> u8 {
+        let base = BASES.iter().rposition(|&b| b <= i).unwrap();
+        let at = i - BASES[base];
+        match at {
+            _ if base < 2 && TITLE_WRITES.contains(&at) => 0x5a,
+            4500..4800 => wrote(at - 4500),
+            9000..9100 => wrote(300 + at - 9000),
+            _ => seed(i),
+        }
+    }
+
+    /// A list whose "shaders" write, in each copy (with the title memory of
+    /// its whole range, declared), 300 bytes of `upload` at 4500 and the
+    /// next 100 at 9000.
+    fn writes(host: &Host, upload: &ID3D12Resource, copies: &[(&Arc<Shadow>, usize, usize)]) -> HostList {
+        let list = host.new_list().unwrap();
+        for &(copy, at, len) in copies {
+            copy.refresh(&list, at as u64, len as u64);
+            copy.gpu_writes(&list, at as u64, len as u64);
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                list.list.CopyBufferRegion(&copy.buffer, copy.offset(at as u64 + 4500), upload, 0, 300);
+                list.list.CopyBufferRegion(&copy.buffer, copy.offset(at as u64 + 9000), upload, 300, 100);
+                list.list.ResourceBarrier(&[transition(&copy.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            }
+        }
+        list.keep(upload);
+        list.close();
+        list
+    }
+
+    /// A fence the card's queue waits for, opened from another thread.
+    struct Gate(ID3D12Fence);
+    // SAFETY: a fence (free-threaded).
+    unsafe impl Send for Gate {}
+
+    /// What a read saw once it had brought its bytes back: how far flights
+    /// had landed, whether the first flight's bytes were in title memory,
+    /// and whether the second's that were not read were not. Then a title
+    /// thread writes over what was read ([`TITLE_WRITES`]).
+    type Seen = Option<(u64, bool, bool)>;
+
+    /// Two flights in the air, and a submission whose fills read 600 bytes
+    /// of each of the first two buffers ([`BASES`], from `ids`, from 4400 on;
+    /// fills the card's steps cannot do) of what the second flight alone
+    /// declared: the first writes the third buffer, the second the first two
+    /// ([`writes`]). The read goes on once it has brought back what it read
+    /// ([`Seen`]); the test checks what was filled, and title memory once
+    /// everything has landed ([`landed`]).
+    ///
+    /// `held`: the thread that lands flights takes none ([`HOLD`]) until the
+    /// read has waited 2 s, else none for good. Else it lands beside the read
+    /// as it does in a run: the card stands at a gate until the read waits
+    /// for it, and the read, woken by the card, looks at the line only once
+    /// that thread has taken what it may.
+    ///
+    /// The numbers of the two flights, what the read saw, and whether the
+    /// landing was let come late.
+    fn two_flights(host: &Host, ids: [usize; 3], held: bool) -> (u64, u64, Seen, bool) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        assert!(relay_exact() && relay_copy(), "set VICTORY_RELAY=2 VICTORY_RELAY_COPY=1");
+        settle_now(WHY_SYNC);
+        let all = BIG + 2 * SMALL;
+        // SAFETY: memory of our own, never freed, read and written by
+        // address from here on (as the title's threads do).
+        let start = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), all, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for i in 0..all {
+                base.add(i).write(seed(i));
+            }
+            base as usize
+        };
+        // SAFETY: title memory of the test's own.
+        let at = move |i: usize| unsafe { ((start + i) as *const u8).read_volatile() };
+        let lens = [BIG, SMALL, SMALL];
+        for k in 0..3 {
+            crate::shadow::register(ids[k], (start + BASES[k]) as u64, lens[k] as u64);
+        }
+        let copies: [Arc<Shadow>; 3] = std::array::from_fn(|k| crate::shadow::find((start + BASES[k]) as u64, 64).unwrap());
+        assert!(copies[0].carded(), "set VICTORY_CARD_BUFFERS_MIN_KB=1024");
+        assert!(!copies[1].carded() && !copies[2].carded());
+        let range = |k: usize| (&copies[k], start + BASES[k], lens[k]);
+        let (upload, data) = host.upload_buffer(4096).unwrap();
+        for i in 0..400 {
+            // SAFETY: inside the mapping.
+            unsafe { data.add(i).write(wrote(i)) };
+        }
+        let gate = (!held).then(|| {
+            // SAFETY: plain object creation; the queue's wait for it.
+            unsafe {
+                let gate: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                host.queue.Wait(&gate, 1).unwrap();
+                Gate(gate)
+            }
+        });
+        HOLD.store(held, Ordering::Release);
+        let a = writes(host, &upload, &[range(2)]);
+        let first = host.execute_own(&a);
+        let b = writes(host, &upload, &[range(0), range(1)]);
+        let second = host.execute_own(&b);
+        assert!(first > 0 && second > first);
+        let (filled, into) = host.upload_buffer(4096).unwrap();
+        let c = host.new_list().unwrap();
+        // SAFETY: inside the mapping.
+        unsafe {
+            c.defer_fill(into, (start + 4400) as *const u8, 600);
+            c.defer_fill(into.add(1024), (start + BIG + 4400) as *const u8, 600);
+        }
+        c.keep(&filled);
+        c.close();
+        let seen = Arc::new(Mutex::new(None));
+        let saw = seen.clone();
+        *BROUGHT.lock().unwrap() = Some(Box::new(move || {
+            let finished = FINISHED.load(Ordering::Acquire);
+            let ahead = (4500..4800).all(|i| at(BASES[2] + i) == wrote(i - 4500));
+            let rest = [0, BIG].iter().all(|&b| (9000..9100).all(|i| at(b + i) == seed(b + i)));
+            for b in [0, BIG] {
+                for i in TITLE_WRITES {
+                    // SAFETY: title memory of the test's own.
+                    unsafe { ((start + b + i) as *mut u8).write_volatile(0x5a) };
+                }
+            }
+            *saw.lock().unwrap() = Some((finished, ahead, rest));
+        }));
+        let (went, told) = std::sync::mpsc::channel::<()>();
+        let late = std::thread::spawn(move || {
+            match gate {
+                Some(gate) => {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    // SAFETY: a plain signal.
+                    unsafe { gate.0.Signal(1) }.unwrap();
+                    false
+                }
+                None => {
+                    let late = told.recv_timeout(std::time::Duration::from_secs(2)).is_err();
+                    HOLD.store(false, Ordering::Release);
+                    RELAY_MOVED.notify_all();
+                    late
+                }
+            }
+        });
+        LOOK_LATE_MS.store(if held { 0 } else { 250 }, Ordering::Relaxed);
+        let sent = host.execute_own(&c);
+        LOOK_LATE_MS.store(0, Ordering::Relaxed);
+        let _ = went.send(());
+        let late = late.join().unwrap();
+        *BROUGHT.lock().unwrap() = None;
+        let seen = seen.lock().unwrap().take();
+        // What was filled: title memory once it was brought back.
+        // SAFETY: inside the mapping, filled when the submission was prepared.
+        let (one, two) = unsafe { (std::slice::from_raw_parts(into, 600), std::slice::from_raw_parts(into.add(1024), 600)) };
+        if seen.is_some() {
+            assert!(one.iter().zip(4400..).all(|(&b, i)| b == landed(i)), "the fill from the copy in the card's memory");
+            assert!(two.iter().zip(BIG + 4400..).all(|(&b, i)| b == landed(i)), "the fill from the copy in the PC's memory");
+        }
+        settle_now(WHY_SYNC);
+        assert!(FINISHED.load(Ordering::Acquire) >= sent);
+        if seen.is_some() {
+            for i in 0..all {
+                assert_eq!(at(i), landed(i), "title memory at {i:#x} once everything landed");
+            }
+        }
+        assert_eq!(host.log_messages(), None);
+        drop((a, b, c, upload, filled));
+        (first, second, seen, late)
+    }
+
+    /// [`two_flights`] with the thread that lands flights at work beside
+    /// the read, as in a run (`VICTORY_RELAY=2 VICTORY_RELAY_COPY=1
+    /// VICTORY_CARD_STEPS=2 VICTORY_CARD_BUFFERS_MIN_KB=1024`, a process of
+    /// its own). The card runs both flights at once, and the read and that
+    /// thread wake together: it lands the first, and not the second until
+    /// the read has brought its bytes back. A title thread's write over them
+    /// then outlives the second's landing.
+    ///
+    /// Without [`landing_limit`] that thread lands both while the read
+    /// looks, and the read brings nothing back: it waited for the landing.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_KB=1024 and a process of its own"]
+    fn a_read_goes_on_before_the_flight_it_reads_lands_while_the_ones_ahead_land() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (first, second, seen, _) = two_flights(host, [0x5353, 0x5454, 0x5555], false);
+        let (finished, ahead, rest) = seen.expect("the read waited for the landing of the flight it reads: it brought nothing back");
+        assert!(finished < second, "the flight read had landed when the read brought its bytes back");
+        assert!(finished >= first && ahead, "the flight ahead had not landed when the read brought bytes back");
+        assert!(rest, "brought back more than was read");
+    }
+
+    /// [`two_flights`] with the thread that lands flights held until the
+    /// read has waited a while (`HOLD`; switches as above). The card has run
+    /// both flights, and the read waits for the first to land before it
+    /// brings anything of the second back: the second's bytes never reach
+    /// title memory before the first's.
+    ///
+    /// Without the wait for the flights ahead the read brings its bytes back
+    /// at once, with the first flight still in the line.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_KB=1024 and a process of its own"]
+    fn a_read_brings_bytes_back_only_once_the_flights_ahead_have_landed() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (first, second, seen, late) = two_flights(host, [0x5656, 0x5757, 0x5858], true);
+        let (finished, ahead, rest) = seen.expect("the read brought nothing back");
+        assert!(finished >= first && ahead, "bytes of a flight were brought back before the flight ahead of it had landed");
+        assert!(late, "the read went on before the flight ahead had landed");
+        assert!(finished < second && rest);
     }
 
     /// The thread that lands flights takes none while a read brings bytes
