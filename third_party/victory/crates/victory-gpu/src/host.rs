@@ -565,7 +565,7 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     crate::ram::tick();
-    if crate::residency::pressured() {
+    if crate::residency::pressured() && !(keep_scratch() && !crate::residency::critical_commit()) {
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -845,7 +845,9 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
-    let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    // (The counters only grow: the book of frames reads them too.)
+    static LAST: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+    let [idle, behind, stood] = crate::framebook::grown(&CARD_CLOCK_US, &LAST).map(|n| n as f64 / 1000.0 / frames);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
@@ -2149,6 +2151,8 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
+    CHUNKS_MADE[0].fetch_add(1, Ordering::Relaxed);
+    CHUNKS_MADE[1].fetch_add(size, Ordering::Relaxed);
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
@@ -2184,8 +2188,31 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
 }
 
+/// Whether the scratch chunks kept idle stay when the PC is short of free
+/// memory, and go only when it is short of commit
+/// (`VICTORY_SCRATCH_KEEP=1`; off: they go at every sweep under pressure,
+/// as before).
+///
+/// They are at most [`SPARE_MOST`] (128 MiB) where memory is short, and
+/// lists take them again within a frame or two: let go at the sweep of
+/// every second, they were made again by the threads that translate the
+/// title's lists, at the first scratch a list asked for. In the first
+/// cutscene the PC had 1.4 GB free from the scene's start on, every sweep
+/// let them go, and making them was 12-18% of those threads' translating
+/// (`CreateCommittedResource` and the mapping, profile s2-f1); the lists
+/// the line of submissions waits for were translated that much later.
+fn keep_scratch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SCRATCH_KEEP"))
+}
+
+/// Scratch chunks made, and their bytes, since the start (the book of
+/// frames, [`crate::framebook`]).
+pub(crate) static CHUNKS_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Lets go of the scratch chunks kept idle, when the system is short of
-/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
+/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]; with
+/// [`keep_scratch`] only when it is short of commit).
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -3595,6 +3622,106 @@ pub(crate) fn settle_for_present() {
 }
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
+}
+
+/// Whether a list that finds no free dynamic descriptor slots waits for
+/// the flights in the air to land, one landing at a time and without the
+/// submission lock, until it finds them or nothing is in the air
+/// (`VICTORY_SLOT_WAIT=1`, with the relay; off: it settles every flight
+/// under the submission lock, [`settle_for_fence`], as before).
+///
+/// In the open world the title binds twice the tables of the first
+/// cutscene, and the dynamic slots (2^18 on NVIDIA, whose heaps hold a
+/// million views) ran out in every frame: the thread that translated the
+/// list took the submission lock and waited until the card had run all
+/// that was in the air, the submitting thread could send nothing
+/// meanwhile, and the other translating threads queued at that lock. They
+/// were 21 % of each translating thread's time in profile wp0 (save
+/// "mandy", standing), and the settles 9 to 17 ms of waiting for the card
+/// a frame. The slots come back when the flight that holds them lands
+/// (`crate::list::Detached::release_tables`); the first landing that
+/// frees enough of them is enough. What is drawn is the same: the table
+/// is made, in other slots (or, as before, not made if none come free by
+/// the time nothing is in the air).
+pub(crate) fn slot_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SLOT_WAIT"))
+}
+
+/// Waits for dynamic slots for [`slot_wait`] (since the last line of the
+/// log: the waits, and their microseconds).
+static SLOT_WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`SLOT_WAITS`] so far (for the line of the translating threads).
+pub(crate) fn slot_waits() -> [u64; 2] {
+    std::array::from_fn(|i| SLOT_WAITS[i].load(Ordering::Relaxed))
+}
+
+/// Dynamic descriptor slots as `take` gives them; if it gives none, after
+/// flights have landed ([`slot_wait`]) or after a settle
+/// ([`settle_for_fence`]), as it gives them then. Not from inside a
+/// submission.
+pub(crate) fn slots_or_wait(mut take: impl FnMut() -> Option<u32>) -> Option<u32> {
+    if let Some(first) = take() {
+        return Some(first);
+    }
+    if !(slot_wait() && late() && relay()) {
+        settle_for_fence();
+        return take();
+    }
+    let waiting = std::time::Instant::now();
+    let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+    let found = loop {
+        let landed = FINISHED.load(Ordering::Acquire);
+        if let Some(first) = take() {
+            break Some(first);
+        }
+        let mut line = line();
+        loop {
+            // (The landing that frees slots gives them back before it sets
+            // FINISHED and takes the line's lock to say so.)
+            if FINISHED.load(Ordering::Acquire) != landed {
+                break;
+            }
+            if line.line.is_empty() && !line.settling {
+                drop(line);
+                // As after a settle: nothing in the air holds slots now.
+                let first = take();
+                SLOT_WAITS[0].fetch_add(1, Ordering::Relaxed);
+                SLOT_WAITS[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                return first;
+            }
+            line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
+        }
+    };
+    SLOT_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    SLOT_WAITS[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+#[cfg(test)]
+mod slot_wait_tests {
+    /// Slots there are taken at once; without them, asked again once after
+    /// what frees them (here, with nothing in the air, nothing waits).
+    #[test]
+    fn slots_are_asked_again_after_what_frees_them() {
+        let mut asked = 0;
+        assert_eq!(
+            super::slots_or_wait(|| {
+                asked += 1;
+                Some(7)
+            }),
+            Some(7)
+        );
+        assert_eq!(asked, 1);
+        let mut asked = 0;
+        let got = super::slots_or_wait(|| {
+            asked += 1;
+            (asked > 1).then_some(9)
+        });
+        assert_eq!((got, asked), (Some(9), 2));
+        assert_eq!(super::slots_or_wait(|| None), None);
+    }
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -8284,7 +8411,29 @@ impl std::hash::Hasher for AddressHash {
 /// end, the wait for the heaps' records. Of the lists' steps: the textures
 /// the lists sample looked at for uploads in front of them, and the lists'
 /// preludes.
+///
+/// They only grow: the frame-rate line takes what they grew by
+/// ([`split_grown`]), and the book of frames reads them at every present
+/// ([`book_counters`]).
 static SPLIT: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+
+/// What [`SPLIT`] grew by since the last frame-rate line.
+fn split_grown() -> [u64; 18] {
+    static LAST: Mutex<[u64; 18]> = Mutex::new([0; 18]);
+    crate::framebook::grown(&SPLIT, &LAST)
+}
+
+/// For the book of frames ([`crate::framebook`]), as they are now (they only
+/// grow): the split of the preparing ([`SPLIT`], nanoseconds), the card's
+/// clock ([`CARD_CLOCK_US`]) and the copying back's microseconds
+/// ([`COPY_BACK`]).
+pub(crate) fn book_counters() -> ([u64; 18], [u64; 3], u64) {
+    (
+        SPLIT.each_ref().map(|n| n.load(Ordering::Relaxed)),
+        CARD_CLOCK_US.each_ref().map(|n| n.load(Ordering::Relaxed)),
+        COPY_BACK[0].load(Ordering::Relaxed),
+    )
+}
 
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
@@ -8316,7 +8465,7 @@ impl Split {
 /// does not hold it up.
 #[cfg(not(feature = "diagnostics"))]
 fn split_line(frames: f64) {
-    let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    let ms: Vec<f64> = split_grown().iter().map(|&n| n as f64 / 1e6 / frames).collect();
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "preparing per frame, the submitting thread: {:.1} ms asking the write watch, {:.1} putting the title's bytes under \
@@ -8350,7 +8499,7 @@ fn split_line(frames: f64) {
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
-    let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    let ms: Vec<f64> = split_grown().iter().map(|&n| n as f64 / 1e6 / frames).collect();
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
@@ -9919,9 +10068,12 @@ impl Meter {
                 let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
                 PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
             });
-            let [back_ms, back_mb] = [0, 1].map(|i| {
-                COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-            });
+            // (The counters only grow: the book of frames reads them too.)
+            static BACK_LAST: Mutex<[u64; 2]> = Mutex::new([0; 2]);
+            let [back_ms, back_mb] = {
+                let [ms, bytes] = crate::framebook::grown(&COPY_BACK, &BACK_LAST);
+                [ms as f64 / 1e3 / frames, bytes as f64 / 1e6 / frames]
+            };
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -9992,8 +10144,13 @@ impl Meter {
             }
             // Passes over the heap's buffer views for shaders that pick them by index.
             let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
-            let picked_ms =
-                crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            let picked_ms = {
+                // (It only grows: the book of frames reads it too.)
+                static LAST: Mutex<u64> = Mutex::new(0);
+                let now = crate::draw::HEAP_BUFFER_MICROS.load(Ordering::Relaxed);
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                now.wrapping_sub(std::mem::replace(&mut *last, now)) as f64 / 1e3 / frames
+            };
             // Copies between depth textures and their colour twins, each way.
             let [twin_to_depth, twin_to_colour] =
                 [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

@@ -1927,7 +1927,12 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
-                        match self.heap_buffers(list) {
+                        let began = crate::list::thin::times_on().then(std::time::Instant::now);
+                        let buffers = self.heap_buffers(list);
+                        if let Some(began) = began {
+                            crate::list::thin::timed_part(0, began.elapsed().as_nanos() as u64);
+                        }
+                        match buffers {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
@@ -2117,10 +2122,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = crate::host::slots_or_wait(|| host.dynamic(1)) else {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -2191,10 +2193,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = crate::host::slots_or_wait(|| host.dynamic(1)) else {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -4243,10 +4242,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = crate::host::slots_or_wait(|| host.dynamic(n)) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -4278,10 +4274,18 @@ impl State {
                 let index = first + k;
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
-                if list_views
+                let timing = crate::list::thin::times_on().then(std::time::Instant::now);
+                let listed = if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
+                    host.make_listed(recording, words, index).map(|listed| (words, listed))
+                } else {
+                    None
+                };
+                if let Some(began) = timing {
+                    crate::list::thin::timed_part(1, began.elapsed().as_nanos() as u64);
+                }
+                if let Some((words, mut listed)) = listed {
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
@@ -5189,13 +5193,47 @@ impl RecordHash {
     }
 }
 
+/// [`readable`]'s calls, and those of buffer views, of all threads (each
+/// thread adds its own every 1,024 calls).
+static READABLE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+thread_local! {
+    static READABLE_HERE: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// See [`READABLE`] (for the line of the translating threads).
+pub(crate) fn readable_counts() -> [u64; 2] {
+    [READABLE[0].load(Ordering::Relaxed), READABLE[1].load(Ordering::Relaxed)]
+}
+
+fn readable_count(buffer: bool) {
+    let mut c = READABLE_HERE.get();
+    c[0] += 1;
+    c[1] += u32::from(buffer);
+    if c[0] >= 1024 {
+        READABLE[0].fetch_add(u64::from(c[0]), Ordering::Relaxed);
+        READABLE[1].fetch_add(u64::from(c[1]), Ordering::Relaxed);
+        c = [0; 2];
+    }
+    READABLE_HERE.set(c);
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    let timing = crate::list::thin::times_on().then(std::time::Instant::now);
+    readable_untimed(list, kind, view);
+    if let Some(began) = timing {
+        crate::list::thin::timed_part(2, began.elapsed().as_nanos() as u64);
+    }
+}
+
+fn readable_untimed(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
+    let copy = crate::descriptor::host::buffer_copy(view);
+    readable_count(copy.is_some());
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    if let Some((shadow, address, len)) = copy {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as

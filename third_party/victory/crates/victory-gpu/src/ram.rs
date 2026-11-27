@@ -246,7 +246,9 @@ fn system_memory() -> (u64, u64) {
 }
 
 /// The process heap's bytes in blocks and committed: ours (every Rust
-/// allocation), the graphics runtime's and the driver's C++ alike.
+/// allocation), the graphics runtime's and the driver's C++ alike. (The
+/// summary walks the heap under its lock: every thread that allocates waits
+/// for it meanwhile.)
 fn process_heap() -> (u64, u64) {
     use windows_sys::Win32::System::Memory::{GetProcessHeap, HEAP_SUMMARY, HeapSummary};
     let mut s = HEAP_SUMMARY { cb: size_of::<HEAP_SUMMARY>() as u32, ..Default::default() };
@@ -255,6 +257,18 @@ fn process_heap() -> (u64, u64) {
         return (0, 0);
     }
     (s.cbAllocated as u64, s.cbCommitted as u64)
+}
+
+/// Whether the line sums the process heap (`VICTORY_RAM_HEAP=1`; off: it does
+/// not, and the rest holds it). The summary walks the heap under its lock, 300
+/// to 460 ms each time in the first cutscene and the open world, and every
+/// thread that allocates meanwhile waits: the thread that serves the line of
+/// submissions stood that long every 10 s, the line made in its sweep or not
+/// (runs tp1 and wp0 with the line made there; run cl with it made on a thread
+/// of its own: 12 such frames of 316-382 ms in 145 s).
+fn heap_summed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_RAM_HEAP"))
 }
 
 /// Every how many seconds the owner line is logged (`VICTORY_RAM_LINE`, 10
@@ -289,8 +303,19 @@ pub(crate) fn tick() {
         }
         now >= was + every * 1000 && last.compare_exchange(was, now, Relaxed, Relaxed).is_ok()
     };
-    if due(&LINE, line_every()) {
-        tracing::info!("{}", line());
+    // On a thread of its own, as the walk: the sweep is the thread that
+    // serves the line of submissions, which the line's heap summary
+    // ([`heap_summed`]) held 300 to 460 ms every 10 s (20 to 24 % of its
+    // time in profiles tp1 and wp0).
+    static LINING: AtomicBool = AtomicBool::new(false);
+    if due(&LINE, line_every()) && !LINING.swap(true, Relaxed) {
+        let made = std::thread::Builder::new().name("victory-ram-line".into()).spawn(|| {
+            tracing::info!("{}", line());
+            LINING.store(false, Relaxed);
+        });
+        if made.is_err() {
+            LINING.store(false, Relaxed);
+        }
     }
     if due(&MAP, map_every()) && !WALKING.swap(true, Relaxed) {
         let walk = std::thread::Builder::new().name("victory-ram-map".into()).spawn(|| {
@@ -323,7 +348,16 @@ fn rest(p: Parts) -> i64 {
 fn line() -> String {
     let (private, working) = process_memory();
     let (free, left) = system_memory();
-    let (heap_blocks, heap_committed) = process_heap();
+    let (heap_blocks, heap_committed) = if heap_summed() { process_heap() } else { (0, 0) };
+    let heap = if heap_summed() {
+        format!(
+            "the process heap {:.0} MB committed, {:.0} MB in blocks (ours, the runtime's, the driver's)",
+            heap_committed as f64 / MB,
+            heap_blocks as f64 / MB
+        )
+    } else {
+        "the process heap not summed (VICTORY_RAM_HEAP=1)".to_string()
+    };
     let title = title_private();
     let from_ours = FROM_OURS.load(Relaxed);
     let buffers: [[u64; 2]; 3] = std::array::from_fn(|h| [BUFFERS[h][0].load(Relaxed), BUFFERS[h][1].load(Relaxed)]);
@@ -347,8 +381,7 @@ fn line() -> String {
          kept {} {:.0} MB, texture staging {} {:.0} MB, staging blocks {} MB, lists' scratch {:.0} MB ({:.0} MB \
          spare), lists' other uploads {:.0} MB, sends kept {:.0} MB; host lists {} alive ({} idle), {} made and {} \
          preludes since the start ({} on their list's allocator), their longest \
-         recordings {:.0}k calls in all, the longest {:.0}k; the process \
-         heap {:.0} MB committed, {:.0} MB in blocks (ours, the runtime's, the driver's); the card counts {:.0} MB \
+         recordings {:.0}k calls in all, the longest {:.0}k; {}; the card counts {:.0} MB \
          of the PC's memory as its own; the rest {:.0} MB: of it about {:.0} MB the card's own memory in use, which \
          the driver backs with as much of ours, committed and not in memory, and {:.0} MB beside (the driver's \
          arenas: command allocators, pipelines, objects; the programs')",
@@ -384,8 +417,7 @@ fn line() -> String {
         crate::host::SHARED_PRELUDES.load(Relaxed),
         recorded[0] as f64 / 1e3,
         recorded[1] as f64 / 1e3,
-        mb(heap_committed),
-        mb(heap_blocks),
+        heap,
         mb(shared),
         left_over as f64 / MB,
         mb(card),

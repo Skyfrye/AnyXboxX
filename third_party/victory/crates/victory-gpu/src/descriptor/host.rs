@@ -3716,13 +3716,18 @@ impl HostHeap {
                 *views = Some(ListViews::new()?);
             }
             let views = views.as_mut()?;
+            views.counts[0] += 1;
             if views.recording != recording {
                 views.recording = recording;
                 views.made.clear();
+                for (n, c) in views.counts.iter_mut().enumerate() {
+                    LISTED_COUNTS[n].fetch_add(std::mem::take(c), std::sync::atomic::Ordering::Relaxed);
+                }
             }
             let twins = self.twins.get(index as usize).is_some();
             if !views.made.contains_key(&words) {
                 let view = super::view_at(words[1], words[2])?;
+                views.counts[1] += 1;
                 let at = 2 * views.made.len() as u32;
                 // (A constant buffer's bytes are copied for each draw.)
                 if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
@@ -3753,7 +3758,7 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -3812,6 +3817,15 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep_ref(index, resource.as_ref());
+    }
+
+    /// [`HostHeap::keep`] of a resource held elsewhere: taken (a reference
+    /// more) only if the slot did not hold it already. A slot a list makes
+    /// again from the same record, draw after draw, held it: the reference
+    /// taken and given back at once each time were two locked additions on
+    /// a counter all threads that name the resource share.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3819,10 +3833,10 @@ impl HostHeap {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
                 return;
             }
-            std::mem::replace(&mut *slot, resource)
+            std::mem::replace(&mut *slot, resource.cloned())
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -3879,7 +3893,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3925,7 +3939,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -4016,7 +4030,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -4065,7 +4079,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
@@ -7901,6 +7915,19 @@ struct ListViews {
     step: usize,
     start: usize,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Of this recording so far: views asked for, and made (the others
+    /// were copied), added to [`LISTED_COUNTS`] at the next recording.
+    counts: [u64; 2],
+}
+
+/// [`ListViews::counts`] of all threads, as they went on to another
+/// recording.
+static LISTED_COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Views of lists asked for so far, and made (for the line of the
+/// translating threads, `crate::list::thin`).
+pub(crate) fn listed_counts() -> [u64; 2] {
+    std::array::from_fn(|i| LISTED_COUNTS[i].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 impl ListViews {
@@ -7920,7 +7947,7 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            Some(ListViews { recording: 0, heap, step, start, made: Default::default(), counts: [0; 2] })
         }
     }
 
