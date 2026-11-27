@@ -2197,6 +2197,25 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// How long [`let_go_idle`] leaves an idle host copy and how many bytes of
+/// them go at most, from whether the PC is short of memory (`pressured`),
+/// the card's memory, `VICTORY_TEXTURE_KEEP` and what counts as in use of
+/// the card (`in_use`, from what the card says).
+///
+/// The card's room says nothing of the PC's: the card's memory is charged
+/// to the system's commit too, and what the card spills goes to the PC's
+/// memory. Short of it ([`crate::residency::pressured`], only ever with
+/// `VICTORY_RESIDENCY=1`), idle copies go after five seconds, not the ten
+/// minutes room on the card keeps them.
+#[cfg(windows)]
+fn idle_limits(pressured: bool, memory: Option<[u64; 4]>, keep: bool, in_use: impl FnOnce(u64) -> u64) -> (u64, u64) {
+    match memory {
+        _ if pressured => (5_000, u64::MAX),
+        Some([budget, used, ..]) if keep => crate::host::vram_keep(budget, in_use(used)),
+        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+    }
+}
+
 /// The textures of `all` [`let_go_idle`] looks at in a part of its sweep:
 /// at most `limit` of them from the address `from` on, or from the first
 /// if none is left at or past `from`.
@@ -2269,16 +2288,11 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used
-                .saturating_sub(crate::pool::texture_room())
-                .saturating_add(crate::shadow::card_room_kept())
-                .saturating_add(targets_room_kept());
-            crate::host::vram_keep(budget, used)
-        }
-        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
-    };
+    let (idle_ms, most) = idle_limits(crate::residency::pressured(), memory, keep, |used| {
+        used.saturating_sub(crate::pool::texture_room())
+            .saturating_add(crate::shadow::card_room_kept())
+            .saturating_add(targets_room_kept())
+    });
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -4919,6 +4933,23 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// With room on the card idle copies stay ten minutes; with the PC short
+    /// of memory five seconds, whatever the card's room (before: ten
+    /// minutes there too).
+    #[test]
+    #[cfg(windows)]
+    fn under_pc_memory_pressure_idle_copies_go_after_five_seconds() {
+        const GIB: u64 = 1 << 30;
+        let card = Some([16 * GIB, 2 * GIB, 0, 0]);
+        assert_eq!(idle_limits(false, card, true, |used| used), (600_000, u64::MAX));
+        assert_eq!(idle_limits(true, card, true, |used| used), (5_000, u64::MAX));
+        assert_eq!(idle_limits(true, None, false, |used| used), (5_000, u64::MAX));
+        // The card's own line still stands without pressure: past 88 % of
+        // its budget, down to 85 %.
+        let full = Some([100 * GIB, 90 * GIB, 0, 0]);
+        assert_eq!(idle_limits(false, full, true, |used| used), (5_000, 5 * GIB));
     }
 
     /// A part that ends at the last texture leaves the cursor past it; the
