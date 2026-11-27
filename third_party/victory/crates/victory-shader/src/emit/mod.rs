@@ -157,6 +157,15 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether a loop's iteration limit leaves a program that is no pixel shader through the loop's
+/// own exit instead of returning, where the loop has one (`bitcode::Module::one_loop_exit`): the
+/// lanes then come together after the loop for its wave operations, as the console's do. On
+/// unless `VICTORY_LOOP_ONE_EXIT=0`. Part of the translation: the shader cache keys on it.
+pub fn loop_one_exit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_ONE_EXIT").is_none_or(|v| v != "0"))
+}
+
 /// Whether a pixel shader's helper lane reads its own value where the console reads the first
 /// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
 /// the shader cache keys on it.
@@ -496,6 +505,13 @@ pub fn emit(
     if why && r.is_ok() && wave64_on_32 && meetings > 0 {
         eprintln!("WAVE64-MEETINGS {meetings} in {:?}", WAVE_FORM.get().unwrap_or(WaveForm::HALVES).0);
     }
+    // A program the host asked to have paired whatever its meetings ([`force_paired`]).
+    if r.is_ok() && wave64_on_32 && exact_halves && FORCE_PAIRED.get() {
+        if let Ok((shader, _)) = paired(c, native, p, io, res) {
+            WAVE_FORM.set(Some(WaveForm::PAIRED));
+            return Ok(shader);
+        }
+    }
     if r.is_ok() && wave64_on_32 && exact_halves && meetings >= MEETINGS_FOR_PAIRS && pairs_on() {
         let again = paired(c, native, p, io, res);
         let paired_meetings = MEETINGS.get();
@@ -535,6 +551,13 @@ pub fn emit(
     r
 }
 
+/// Has this thread's translations of console wave64 compute programs on a host of 32-lane waves
+/// take the paired form where the exact form in two host waves would be taken, whatever their
+/// meetings (the host asks it for programs it names: `VICTORY_WAVE_PAIRED`).
+pub fn force_paired(on: bool) {
+    FORCE_PAIRED.set(on);
+}
+
 /// The form a console wave64 compute program took on a host of 32-lane waves ([`emit`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaveForm(pub &'static str);
@@ -554,6 +577,9 @@ impl WaveForm {
 }
 
 thread_local! {
+    /// Whether this thread's next translations take the paired form where an exact one in two
+    /// host waves would be taken ([`force_paired`]).
+    static FORCE_PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`take_wave_form`].
     static WAVE_FORM: std::cell::Cell<Option<WaveForm>> = const { std::cell::Cell::new(None) };
     /// The group barriers where host waves meet of the last program [`emit_program`] translated

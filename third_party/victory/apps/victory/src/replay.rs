@@ -466,8 +466,18 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    // The host the translations are for: AMD's 64-lane waves, unless
+    // `VICTORY_RETRANSLATE_WAVE=32` asks for NVIDIA's (32 lanes, no RDNA forms).
+    let wave = std::env::var("VICTORY_RETRANSLATE_WAVE").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(64);
+    victory_shader::emit::set_host_max_wave(wave);
+    victory_shader::emit::set_host_rdna(wave == 64);
+    // `VICTORY_WAVE_PAIRED=<hash>,...`: these take the paired form, as in a run.
+    let paired: Vec<String> = std::env::var("VICTORY_WAVE_PAIRED")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| h.len() == 16)
+        .collect();
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();
@@ -478,7 +488,10 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
             s.spawn(|| {
                 while let Some((stage, hash)) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else { continue };
-                    match victory_shader::emit::translate(&bytes) {
+                    victory_shader::emit::force_paired(paired.iter().any(|p| p == hash));
+                    let translated = victory_shader::emit::translate(&bytes);
+                    victory_shader::emit::force_paired(false);
+                    match translated {
                         Ok(t) => {
                             if std::fs::write(into.join(format!("{hash}.dxil")), &t.dxil).is_ok() {
                                 done.fetch_add(1, Ordering::Relaxed);

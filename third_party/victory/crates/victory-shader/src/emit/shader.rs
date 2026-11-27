@@ -592,6 +592,11 @@ impl Shader {
         }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // A loop stopped by its iteration limit leaves through its own exit (a pixel shader's
+        // lane discards instead), so the lanes meet after the loop.
+        if !self.pixel && super::loop_one_exit() {
+            self.m.one_loop_exit();
+        }
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).

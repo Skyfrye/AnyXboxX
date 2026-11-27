@@ -162,6 +162,10 @@ impl Pending {
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
+            // Translated in another form than the cache's ([`crate::shader_cache::forced_paired`]).
+            if crate::shader_cache::paired_by_hash(&s.hash) {
+                key.update(b"+paired");
+            }
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         let scene_input = scene_inputs() && scene_input(&shaders) || one_shot(&shaders);
