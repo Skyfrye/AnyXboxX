@@ -199,8 +199,8 @@ pub(crate) fn sent(taken: Taken, flown: u64, frame: u64) {
         flown,
         ms: crate::host::now_ms(),
         causes: crate::descriptor::host::pop_causes(),
-        phase: usize::from(crate::ab::pick("VICTORY_KEEP_SHOWN").unwrap_or(false))
-            + 2 * usize::from(crate::ab::pick("VICTORY_UPLOAD_AHEAD").unwrap_or(false)),
+        // (The first two switches `VICTORY_AB` changes, whichever they are.)
+        phase: usize::from(crate::ab::on(0)) + 2 * usize::from(crate::ab::on(1)),
     };
     let _ = to.send(job);
 }
@@ -380,8 +380,10 @@ fn watch(from: &mpsc::Receiver<Job>) {
             told = crate::host::now_ms();
             for (n, s) in seen.iter().enumerate().filter(|(_, s)| s.frames > 0) {
                 tracing::info!(
-                    "pop watch, since the start, A/B VICTORY_KEEP_SHOWN {} VICTORY_UPLOAD_AHEAD {}: {} frames, blips in {} of them ({} blocks of 16x16), {} frames whose picture stood still with {} blocks stepped, lone blocks in {} frames ({} blocks)",
+                    "pop watch, since the start, A/B {} {} {} {}: {} frames, blips in {} of them ({} blocks of 16x16), {} frames whose picture stood still with {} blocks stepped, lone blocks in {} frames ({} blocks)",
+                    crate::ab::name(0).unwrap_or("-"),
                     n & 1,
+                    crate::ab::name(1).unwrap_or("-"),
                     n >> 1,
                     s.frames,
                     s.blip_frames,

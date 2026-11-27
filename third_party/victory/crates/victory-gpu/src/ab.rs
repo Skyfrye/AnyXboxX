@@ -44,6 +44,11 @@ pub(crate) fn on(bit: u32) -> bool {
     BITS.load(Relaxed) >> bit & 1 != 0
 }
 
+/// The name of the switch of that number, if one changes.
+pub(crate) fn name(bit: u32) -> Option<&'static str> {
+    asked()?.switches.get(bit as usize).map(String::as_str)
+}
+
 /// What the run has seen of the phase under way.
 struct Phase {
     started: std::time::Instant,

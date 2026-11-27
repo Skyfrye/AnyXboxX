@@ -163,7 +163,16 @@ pub(crate) struct HostHeap {
     copied: Mutex<Vec<u8>>,
     /// New ones of them that wait for a draw ([`HostHeap::copied_wait`]),
     /// by the frame they were found in.
-    waiting: Mutex<std::collections::VecDeque<(u64, Vec<u32>)>>,
+    /// (With the time they were found, `crate::host::now_ms`.)
+    waiting: Mutex<std::collections::VecDeque<(u64, u64, Vec<u32>)>>,
+    /// New ones left to a draw's table, by the frame and time they were
+    /// found in ([`HostHeap::copied_left`]).
+    left: Mutex<std::collections::VecDeque<(u64, u64, Vec<u32>)>>,
+    /// Slots that go on showing another texture's host copy until their own
+    /// is made ([`HostHeap::keeps`]), by that title texture: the slot, the
+    /// record it shows, and the frame it was kept in
+    /// ([`HostHeap::kept_elsewhere`]).
+    kept_on: Mutex<std::collections::HashMap<usize, Vec<(u32, u64, u64)>>>,
     /// The slots made from a texture whose memory was found away, with what
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
@@ -1284,11 +1293,34 @@ pub(crate) const TABLED_GRACE: u64 = 8;
 
 /// Frames for which a record copied into a slot a draw read through a
 /// table is left to such a draw ([`HostHeap::copied_tabled`]).
-const COPIED_FRAMES: u32 = 8;
+pub(crate) const COPIED_FRAMES: u32 = 8;
 
 /// Frames a record copied into any other slot waits for one, before it is
 /// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
 const COPIED_GRACE: u64 = 4;
+
+thread_local! {
+    /// When the record a slot is made from now was found, for a record made
+    /// some frames after it was found ([`HostHeap::mirror_found`]; 0: now),
+    /// and whether it waited for a draw's table long enough already.
+    static FOUND: std::cell::Cell<(u64, bool)> = const { std::cell::Cell::new((0, false)) };
+}
+
+/// [`TABLED_GRACE`], or `VICTORY_TABLED_GRACE` frames (at least one).
+fn tabled_grace() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TABLED_GRACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(TABLED_GRACE).max(1)
+    })
+}
+
+/// [`COPIED_GRACE`], or `VICTORY_COPIED_GRACE` frames (at least one).
+fn copied_grace() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_COPIED_GRACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(COPIED_GRACE).max(1)
+    })
+}
 
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
@@ -2214,6 +2246,8 @@ impl HostHeap {
             quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
+            left: Mutex::default(),
+            kept_on: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
@@ -3466,6 +3500,109 @@ impl HostHeap {
         tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
     }
 
+    /// Counts title slot `index` made from another record ([`RECYCLED`]) if
+    /// a draw read it through a table in this frame or the one before.
+    fn note_recycled(&self, index: u32, for_draw: bool) {
+        let stamp = self.tabled_stamp(index);
+        let now = (crate::frame::current() as u32).wrapping_add(1) & !TABLED_READ;
+        if stamp & TABLED_READ != 0 && now.wrapping_sub(stamp & !TABLED_READ) & !TABLED_READ <= 1 {
+            RECYCLED[usize::from(!for_draw)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Diagnostics: the first slots made to wait for their upload showing
+    /// the stand-in or null (`stand_in`), said one by one: what they view,
+    /// whether a table read them lately, and what they showed before.
+    #[cfg(feature = "diagnostics")]
+    fn say_waiting(&self, index: u32, view: &View, stand_in: bool, shown: u64) {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n >= 400 {
+            return;
+        }
+        let stamp = self.tabled_stamp(index);
+        let now = (crate::frame::current() as u32).wrapping_add(1) & !TABLED_READ;
+        let table_age = (stamp != 0).then(|| now.wrapping_sub(stamp & !TABLED_READ) & !TABLED_READ);
+        let (kind, words) = match view {
+            View::Placed(_, resource, desc) => (
+                if crate::resource::placed_fills(resource) { "placed, title fills" } else { "placed, host renders to" },
+                format!("resource {:x?} view {:x?}", &resource[..8], &desc[..6]),
+            ),
+            View::Shader(r, desc) => (
+                if crate::resource::title_fills(*r as crate::object::This) { "object, title fills" } else { "object, host renders to" },
+                format!("view {:x?}", desc.map(|d| d[..6].to_vec())),
+            ),
+            _ => ("other", String::new()),
+        };
+        tracing::info!(
+            n,
+            slot = index,
+            stand_in,
+            kind,
+            format = view_format(view),
+            dimension = view_dimension(view),
+            integer = integer_view(view),
+            table_frames_ago = ?table_age,
+            showed_before = shown != 0,
+            words,
+            "a texture slot made to wait for its upload"
+        );
+    }
+
+    /// Slot `index` goes on showing record `shown`, a view of placed texture
+    /// `old`, though the title wrote another texture's view there
+    /// ([`HostHeap::keeps`]): noted by that title texture.
+    fn note_kept_on(&self, index: u32, shown: u64, old: &View) {
+        let View::Placed(false, resource, desc) = old else {
+            return;
+        };
+        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        let Some(texture) = crate::resource::placed_known(address, resource) else {
+            return;
+        };
+        let frame = crate::frame::current();
+        let mut kept = self.kept_on.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = kept.entry(texture as usize).or_default();
+        slots.retain(|&(slot, _, _)| slot != index);
+        slots.push((index, shown, frame));
+    }
+
+    /// Whether a slot other than `index` goes on showing the host copy of
+    /// title texture `texture` for another texture's view written there
+    /// ([`HostHeap::note_kept_on`]), kept within [`KEPT_ON_FRAMES`] frames
+    /// before `frame` and still made from the record it kept. The title
+    /// places textures of one description at the address another left (a
+    /// texture moved elsewhere, another streamed in where it was), and both
+    /// are the same title texture here, with one host copy: an upload of the
+    /// newcomer's bytes into it is shown by the slot kept on the one that
+    /// moved, another picture (or bytes not all there yet: noise) until that
+    /// slot's own copy comes (run stP0, frame 2071: the sheets on a cell
+    /// wall).
+    pub(crate) fn kept_elsewhere(&self, texture: usize, index: u32, frame: u64) -> bool {
+        let live = |&(slot, key, at): &(u32, u64, u64)| frame.saturating_sub(at) <= KEPT_ON_FRAMES && self.made.get(slot) == Some(key);
+        let mut kept = self.kept_on.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.is_empty() {
+            return false;
+        }
+        // (Now and then all of them, so that entries of textures not
+        // uploaded again go.)
+        if kept.len() > 4096 {
+            kept.retain(|_, slots| {
+                slots.retain(live);
+                !slots.is_empty()
+            });
+        }
+        let Some(slots) = kept.get_mut(&texture) else {
+            return false;
+        };
+        slots.retain(live);
+        let any = slots.iter().any(|&(slot, _, _)| slot != index);
+        if slots.is_empty() {
+            kept.remove(&texture);
+        }
+        any
+    }
+
     /// What `tabled` holds for title slot `index`; 0: never a table's.
     fn tabled_stamp(&self, index: u32) -> u32 {
         self.tabled
@@ -3489,15 +3626,23 @@ impl HostHeap {
         if !(texture && !read_now) && !self.queued.may(index) {
             return;
         }
+        let (found, waited) = FOUND.get();
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
-            let due = if lately && !seen {
+            let due = if lately && !seen && !waited {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                frame + TABLED_GRACE
+                frame + tabled_grace()
             } else {
                 0
             };
             textures.written(index, frame, due, seen);
+            // Found some frames ago and made only now: its wait began then.
+            if found != 0
+                && let Some(w) = textures.slots.get_mut(&index)
+                && w.checked.2 == 0
+            {
+                w.since = w.since.min(found);
+            }
         } else {
             textures.remove(index);
         }
@@ -4177,21 +4322,82 @@ impl HostHeap {
     /// New records the title copied into slots `slots` in `frame` wait for
     /// the draw that may read them through a table.
     pub(crate) fn copied_wait(&self, frame: u64, slots: Vec<u32>) {
-        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, slots));
+        let now = crate::host::now_ms();
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, now, slots));
     }
 
     /// The slots that have waited long enough at `frame`
-    /// ([`HostHeap::copied_wait`]), each once.
-    pub(crate) fn copied_before(&self, frame: u64) -> Vec<u32> {
+    /// ([`HostHeap::copied_wait`]), each once, with the time their record
+    /// was first found (the earliest, of one found twice).
+    pub(crate) fn copied_before(&self, frame: u64) -> Vec<(u32, u64)> {
         let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
-        while waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame) {
-            out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
+        while waiting.front().is_some_and(|(written, _, _)| written + copied_grace() <= frame) {
+            out.extend(waiting.pop_front().into_iter().flat_map(|(_, at, slots)| slots.into_iter().map(move |s| (s, at))));
         }
         drop(waiting);
         out.sort_unstable();
-        out.dedup();
+        out.dedup_by_key(|(index, _)| *index);
         out
+    }
+
+    /// [`HostHeap::mirror`] of title slot `index` (not for a draw) for a
+    /// record found at `found` (`crate::host::now_ms`) and made only now: the
+    /// queue of textures picked by index counts its wait from then
+    /// (`crate::texlate`). `waited`: it waited for a draw's table long enough
+    /// already, and is due at once rather than after [`TABLED_GRACE`] more.
+    pub(crate) fn mirror_found(&self, index: u32, handle: u64, found: u64, waited: bool) {
+        FOUND.set((found, waited));
+        let _ = self.mirror(index, handle, false);
+        FOUND.set((0, false));
+    }
+
+    /// Whether title slot `index` was a table's within [`TABLED_FRAMES`]
+    /// frames before `frame` (a draw read it or made a table it lies in).
+    pub(crate) fn tabled_within(&self, index: u32, frame: u64) -> bool {
+        let stamp = self.tabled_stamp(index) & !TABLED_READ;
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        stamp != 0 && u64::from(now.wrapping_sub(stamp) & !TABLED_READ) <= TABLED_FRAMES
+    }
+
+    /// Records the title copied into slots `slots` in `frame` that were left
+    /// to a draw's table ([`HostHeap::copied_tabled`]): looked at again
+    /// [`COPIED_FRAMES`] frames on ([`HostHeap::copied_orphans`]).
+    pub(crate) fn copied_left(&self, frame: u64, slots: Vec<u32>) {
+        if slots.is_empty() {
+            return;
+        }
+        let now = crate::host::now_ms();
+        self.left.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, now, slots));
+    }
+
+    /// Of the records [`HostHeap::copied_left`] took [`COPIED_FRAMES`] frames
+    /// or more before `frame`, the slots no draw made or read through a table
+    /// since their record was written, each once: nothing made their host
+    /// slot from it (a slot left to a draw is not looked at again when no
+    /// draw comes, and went on showing what it showed before, another
+    /// texture, for as long as nothing else wrote it).
+    pub(crate) fn copied_orphans(&self, frame: u64) -> Vec<(u32, u64)> {
+        let mut left = self.left.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        while let Some((written, _, _)) = left.front()
+            && written + u64::from(COPIED_FRAMES) <= frame
+        {
+            let Some((written, at, slots)) = left.pop_front() else { break };
+            out.extend(slots.into_iter().filter(|&index| !self.tabled_since(index, written, frame)).map(|index| (index, at)));
+        }
+        drop(left);
+        out.sort_unstable();
+        out.dedup_by_key(|(index, _)| *index);
+        out
+    }
+
+    /// Whether a draw made or read title slot `index` through a table in
+    /// frame `written` or later (it is now `frame`).
+    fn tabled_since(&self, index: u32, written: u64, frame: u64) -> bool {
+        let stamp = self.tabled_stamp(index) & !TABLED_READ;
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        stamp != 0 && u64::from(now.wrapping_sub(stamp) & !TABLED_READ) <= frame.saturating_sub(written)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -4246,6 +4452,9 @@ impl HostHeap {
             return None;
         };
         if shown != key {
+            if shown != 0 && is_texture_view(&view) {
+                self.note_recycled(index, for_draw);
+            }
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -4290,6 +4499,7 @@ impl HostHeap {
                     let kept = self.keeps(index, kin);
                     rewritten(kin, kept, is_texture_view(&view));
                     if kept {
+                        self.note_kept_on(index, shown, &old);
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
@@ -4342,6 +4552,10 @@ impl HostHeap {
             // memory came later (run nb1: black surfaces, and hair and
             // decals gone with their alpha).
             let stand_in = later && !self.sampler && is_texture_view(&view) && stands_in(&view);
+            #[cfg(feature = "diagnostics")]
+            if later && !self.sampler && is_texture_view(&view) {
+                self.say_waiting(index, &view, stand_in, shown);
+            }
             #[cfg(feature = "diagnostics")]
             if !self.sampler && is_texture_view(&view) {
                 note_before(index, shown, if stand_in { "stand-in, waits" } else if later { "null, waits" } else { "at once" });
@@ -5609,6 +5823,21 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
     }
     t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
 }
+
+/// Since the start: host slots made from another record (of a texture view)
+/// while a draw had read them through a table in this frame or the one
+/// before, whose lists may not have run yet and then read the new record:
+/// by a draw's table, and by anything else ([`HostHeap::note_recycled`]).
+pub(crate) static RECYCLED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Frames for which a slot kept on another texture's host copy
+/// ([`HostHeap::kept_elsewhere`]) holds back uploads into that copy.
+const KEPT_ON_FRAMES: u64 = 8;
+
+/// Since the start: uploads by the texture pass into a host copy that a
+/// slot kept showing for another texture's view ([`HostHeap::kept_elsewhere`]),
+/// and of them those held back (`VICTORY_KEPT_FIRST=1`).
+pub(crate) static KEPT_OVERWRITES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Writes of a slot with another view of the placed texture it showed,
 /// since the start: the slot kept showing the old view.
@@ -7706,6 +7935,56 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A record left to a draw's table that no draw made or read in the
+    /// frames after it was written is found once, [`COPIED_FRAMES`] frames
+    /// on; one a draw read since is not.
+    #[test]
+    fn records_left_to_tables_that_no_draw_made_are_found() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let frame = 1000;
+        // Slots 1 and 2 were tables' in the frame before the write.
+        heap.tabled_in(1, true, frame - 1);
+        heap.tabled_in(2, true, frame - 1);
+        assert!(heap.copied_tabled(1, frame) && heap.copied_tabled(2, frame));
+        heap.copied_left(frame, vec![2, 1]);
+        // A draw reads slot 1 in the frame of the write.
+        heap.tabled_in(1, true, frame);
+        let after = frame + u64::from(COPIED_FRAMES);
+        assert!(heap.copied_orphans(after - 1).is_empty());
+        assert_eq!(heap.copied_orphans(after).iter().map(|o| o.0).collect::<Vec<_>>(), [2]);
+        assert!(heap.copied_orphans(after + 100).is_empty());
+        // Slot 3 was a table's long ago, slot 4 never.
+        heap.tabled_in(3, false, frame - 1 - TABLED_FRAMES);
+        assert!(heap.tabled_within(1, frame + 10));
+        assert!(!heap.tabled_within(1, frame + 1 + TABLED_FRAMES));
+        assert!(!heap.tabled_within(3, frame));
+        assert!(!heap.tabled_within(4, frame));
+    }
+
+    /// A texture record made only after it waited for a draw's table (an
+    /// orphan, [`HostHeap::copied_orphans`]) is due at once, not after
+    /// [`TABLED_GRACE`] more frames, and its wait counts from when it was
+    /// found.
+    #[test]
+    fn a_record_that_waited_for_its_table_is_due_at_once() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let frame = 500;
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, u64::MAX, 8).0.into_iter().map(|d| d.0).collect() };
+        heap.tabled_in(2, true, frame - 10);
+        heap.queue_texture(2, true, false, frame);
+        assert!(slots(frame).is_empty());
+        assert_eq!(slots(frame + TABLED_GRACE), [2]);
+        FOUND.set((1, true));
+        heap.queue_texture(2, true, false, frame);
+        FOUND.set((0, false));
+        assert_eq!(slots(frame), [2]);
+        assert_eq!(heap.textures.lock().unwrap().since(2).map(|s| s.0), Some(1));
     }
 
     /// Slots given back with another heap's number stay taken; with their

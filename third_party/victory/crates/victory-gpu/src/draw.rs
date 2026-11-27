@@ -198,6 +198,19 @@ fn bake_exact() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_EXACT").is_none_or(|v| v != "0"))
 }
 
+/// Whether the texture pass holds back an upload into a host copy that
+/// another slot goes on showing for a texture that moved away
+/// (`crate::descriptor::host::HostHeap::kept_elsewhere`;
+/// `VICTORY_KEPT_FIRST=1`; off: uploaded, and counted).
+fn kept_first() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_KEPT_FIRST") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEPT_FIRST").is_some_and(|v| v != "0"))
+}
+
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
 /// before).
@@ -3226,6 +3239,18 @@ impl State {
                     None => host.texture_slot_done(index, write, again),
                 }
                 continue;
+            }
+            // Bytes into a host copy that another slot goes on showing for a
+            // texture that moved away from here: that slot would show them
+            // (`HostHeap::kept_elsewhere`). Held back until its own copy has
+            // come (`VICTORY_KEPT_FIRST=1`); the slot stays due.
+            if !tabled && host.kept_elsewhere(resource as usize, index, frame) {
+                use crate::descriptor::host::KEPT_OVERWRITES;
+                KEPT_OVERWRITES[0].fetch_add(1, Ordering::Relaxed);
+                if kept_first() && !baking && sync.is_none() {
+                    KEPT_OVERWRITES[1].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
             // The first upload of a texture no list has used: on a queue of
             // its own, and the slot shows it as soon as that has run.
