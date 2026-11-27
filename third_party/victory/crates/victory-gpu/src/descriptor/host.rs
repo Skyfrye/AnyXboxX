@@ -6389,6 +6389,69 @@ mod tests {
         assert_eq!(heap.kept_in(2).map(|r| r.as_raw()), Some(stand_in.as_raw()));
     }
 
+    /// A placed BC7 texture of `size` texels a side and `levels` levels, the
+    /// title's, in memory of the test's own, with a host copy whose last
+    /// upload took all of it (as the texture pass notes it,
+    /// `crate::texture::unchanged`) from bytes `fill`, made over a second
+    /// ago (not `crate::pool::fresh`); its view from level `first` on, and
+    /// the copy. `None` without a host GPU.
+    fn filled_placed(size: u32, levels: u32, first: u32, fill: u8) -> Option<(View, crate::object::This, std::sync::Arc<crate::resource::HostTexture>)> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        host()?;
+        // SAFETY: memory of our own, never freed: the title texture made at
+        // its address stays in the table of placed textures.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), 4 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(memory, 0);
+        let mut view = placed_2d(memory as u64, 98);
+        if let View::Placed(_, resource, desc) = &mut view {
+            (resource[4], resource[6], resource[7]) = (size, size, levels << 16 | 1);
+            // The default component mapping, levels `first` on.
+            (desc[2], desc[4], desc[5]) = (5768, first, levels - first);
+        }
+        let View::Placed(_, resource, _) = &view else { unreachable!() };
+        let texture = crate::resource::texture_at(memory as u64, resource).expect("a title texture");
+        let (at, bytes) = crate::texture::title_span(texture, 0)?;
+        assert!(bytes <= 4 << 20);
+        // SAFETY: the memory above.
+        let held = unsafe {
+            std::ptr::write_bytes(at as *mut u8, fill, bytes as usize);
+            crate::texture::digest(std::slice::from_raw_parts(at as *const u8, bytes as usize))
+        };
+        let copy = crate::resource::host_copy(texture)?;
+        *copy.holds.lock().unwrap() = Some((0, held));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(!crate::pool::fresh(&copy.texture));
+        Some((view, texture, copy))
+    }
+
+    /// A slot written with a view of a placed texture the title fills, whose
+    /// host copy's last upload took the bytes its memory holds now, shows that
+    /// copy at once; once the memory changed, a slot written with it waits
+    /// for the pass behind the stand-in. (Before, every such slot waited, a
+    /// grey quad for half a second; the round-1 test covered only a render
+    /// target and a copy with no upload. Round 2's review, item 4.)
+    #[test]
+    fn a_placed_texture_whose_memory_its_copy_holds_is_made_at_once() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let Some((view, texture, copy)) = filled_placed(64, 1, 0, 0x3c) else { return };
+        let mut slot = [0u32; 4];
+        let handle = write_record(&mut slot, view.clone());
+        assert!(heap.mirror(1, handle, false).is_some());
+        assert_eq!(heap.made.get(1), Some(record_key(handle)), "made at once");
+        assert_eq!(heap.kept_in(1).map(|r| r.as_raw()), Some(copy.texture.as_raw()));
+        // The title writes its memory: what the copy holds is not what it shows.
+        let (at, _) = crate::texture::title_span(texture, 0).unwrap();
+        // SAFETY: the texture's memory, the test's own.
+        unsafe { (at as *mut u8).add(100).write_volatile(0x3d) };
+        let mut again = [0u32; 4];
+        let handle = write_record(&mut again, view);
+        assert!(heap.mirror(2, handle, false).is_some());
+        assert!(heap.shows_none(2), "waits for its pass");
+        let stand_in = neutral(Neutral::Flat).unwrap();
+        assert_eq!(heap.kept_in(2).map(|r| r.as_raw()), Some(stand_in.as_raw()));
+    }
+
     /// A slot that goes on showing another record's texture while its new
     /// one is not there yet is not let go when the new texture's memory is
     /// found away, however often and long that lasts (it was let go, three
